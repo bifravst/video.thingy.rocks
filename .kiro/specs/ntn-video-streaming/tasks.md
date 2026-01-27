@@ -14,29 +14,34 @@ integration.
   - [x] 1.1 Create CDK TypeScript project
     - Run `mkdir ntn-video-streaming && cd ntn-video-streaming`
     - Use `fnm use 24` to switch to Node.js 24.
+    - Update the `package.json`, set the `type` to `module`
     - Run `npx cdk init app --language typescript`
     - Update the `package.json` engines to required Node.js v24 and NPM v11.
     - Add test script to package.json:
       `"test": "node --no-warnings --experimental-transform-types --test \"!(node_modules)/**/*.spec.ts\""`
     - _Requirements: 7.1_
 
-  - [ ] 1.2 Create backend service directory structure
+  - [x] 1.2 Create backend service directory structure
     - Create `backend/` directory for UDP listener and transcoding services
     - Create `backend/src/` for source code
     - Create `backend/tests/` for tests
     - Initialize Node.js project: `cd backend && npm init -y`
+    - Update the `package.json`, set the `type` to `module`
+    - Update the `package.json` engines to required Node.js v24 and NPM v11.
     - Install dependencies:
       `npm install @aws-sdk/client-s3 @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb @aws-sdk/client-cloudwatch`
-    - Install dev dependencies:
-      `npm install --save-dev typescript @types/node fast-check`
+    - Install dev dependencies: `npm install --save-dev typescript @types/node`
     - Add test script to package.json:
       `"test": "node --no-warnings --experimental-transform-types --test \"!(node_modules)/**/*.spec.ts\""`
     - _Requirements: 1.1, 2.1_
 
-  - [ ] 1.3 Create frontend directory structure
+  - [x] 1.3 Create frontend directory structure
     - Create `frontend/` directory
     - Initialize React app:
       `npx create-react-app frontend --template typescript`
+    - Update the `package.json`, set the `type` to `module`
+    - Update the `package.json` engines to required Node.js v24 and NPM v11.
+    - Update all dependencies to their latest version.
     - Install dependencies:
       `npm install @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb @aws-sdk/credential-providers hls.js @types/hls.js react-router-dom`
     - _Requirements: 4.1_

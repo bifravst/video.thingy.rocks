@@ -1,0 +1,23 @@
+{
+  "name": "video.thingy.rocks-backend",
+  "version": "0.0.0-development",
+  "description": "NTN Video Streaming Backend - UDP listener and transcoding services",
+  "type": "module",
+  "scripts": {
+    "test": "node --no-warnings --experimental-transform-types --test \"!(node_modules)/**/*.spec.ts\""
+  },
+  "engines": {
+    "node": ">=24.0.0",
+    "npm": ">=11.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cloudwatch": "3.975.0",
+    "@aws-sdk/client-dynamodb": "3.975.0",
+    "@aws-sdk/client-s3": "3.975.0",
+    "@aws-sdk/lib-dynamodb": "3.975.0"
+  },
+  "devDependencies": {
+    "@types/node": "25.0.10",
+    "typescript": "5.9.3"
+  }
+}

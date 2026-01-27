@@ -1,0 +1,18 @@
+#
+# This `.gitignore` file must only cover the artifacts created by the
+# source code in this project.
+#
+# This is explained in detail here: 
+# https://github.com/coderbyheart/first-principles/issues/30
+#
+# Artifacts caused by the personal choice of editor the environment of a
+# developer can easily be ignored using the developer's personal global
+# `.gitignore` file:
+# https://docs.github.com/en/get-started/git-basics/ignoring-files#configuring-ignored-files-for-all-repositories-on-your-computer
+# 
+node_modules/
+build/
+cdk.out/
+static/flags/
+test-results/
+db/

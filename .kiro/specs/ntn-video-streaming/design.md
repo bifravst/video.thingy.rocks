@@ -832,44 +832,6 @@ Both approaches are complementary and necessary. Unit tests catch concrete bugs
 in specific scenarios, while property tests verify general correctness across
 the input space.
 
-### Property-Based Testing Configuration
-
-**Library**: fast-check (for TypeScript/JavaScript components)
-
-**Configuration**:
-
-- Minimum 100 iterations per property test
-- Each test tagged with: **Feature: ntn-video-streaming, Property {number}:
-  {property_text}**
-- Generators for: UDP packets, port numbers (5000-5009), video segments, stream
-  metadata
-- Shrinking enabled to find minimal failing examples
-
-**Example Property Test Structure**:
-
-```typescript
-import fc from "fast-check";
-
-// Feature: ntn-video-streaming, Property 1: Packet Buffering and Forwarding
-test("UDP packets are buffered and forwarded with correct port identifier", () => {
-  fc.assert(
-    fc.property(
-      fc.integer({ min: 5000, max: 5009 }), // port
-      fc.uint8Array({ minLength: 100, maxLength: 1500 }), // packet data
-      (port, packetData) => {
-        const listener = new UDPListener(config);
-        const result = listener.handlePacket(port, packetData);
-
-        expect(result.buffered).toBe(true);
-        expect(result.streamIdentifier).toBe(port);
-        expect(result.forwardedData).toEqual(packetData);
-      },
-    ),
-    { numRuns: 100 },
-  );
-});
-```
-
 ### Unit Testing Focus Areas
 
 **UDP Ingestion**:
