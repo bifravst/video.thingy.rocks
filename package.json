@@ -1,0 +1,73 @@
+{
+  "name": "video.thingy.rocks",
+  "version": "0.0.0-development",
+  "type": "module",
+  "scripts": {
+    "test": "node --no-warnings --experimental-transform-types --test \"!(node_modules)/**/*.spec.ts\"",
+    "test:watch": "node --no-warnings --experimental-transform-types --test --watch \"!(node_modules)/**/*.spec.ts\"",
+    "prepare": "husky && check-node-version --package",
+    "cdk:bootstrap": "node --experimental-transform-types --no-warnings ./cdk/bootstrap.ts",
+    "cdk:prod:deploy": "node --experimental-transform-types --no-warnings ./cdk/deploy-to-production.ts",
+    "cdk:prod:diff": "node --experimental-transform-types --no-warnings ./cdk/deploy-to-production.ts --diff"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bifravst/thingy-rocks-cloud-ntn-video.git"
+  },
+  "devDependencies": {
+    "@aws-cdk/toolkit-lib": "^1.14.1",
+    "@aws-sdk/client-iam": "^3.975.0",
+    "@bifravst/ci": "^2.1.1",
+    "@bifravst/eslint-config-typescript": "6.4.4",
+    "@bifravst/from-env": "^3.0.2",
+    "@bifravst/prettier-config": "1.1.17",
+    "@commitlint/config-conventional": "20.3.1",
+    "@types/command-line-args": "^5.2.3",
+    "@types/node": "^25.0.10",
+    "@typescript/native-preview": "7.0.0-dev.20260127.1",
+    "aws-cdk-lib": "2.236.0",
+    "check-node-version": "4.2.1",
+    "command-line-args": "^6.0.1",
+    "commitlint": "20.3.1",
+    "eslint": "8.57.1",
+    "husky": "9.1.7",
+    "lint-staged": "16.2.7",
+    "prettier": "3.8.1",
+    "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "constructs": "10.4.5"
+  },
+  "engines": {
+    "node": ">=24",
+    "npm": ">=11"
+  },
+  "lint-staged": {
+    "*.{md,json,yaml,yml}": [
+      "prettier --write"
+    ],
+    "*.{ts,tsx}": [
+      "prettier --write",
+      "eslint"
+    ]
+  },
+  "prettier": "@bifravst/prettier-config",
+  "release": {
+    "branches": [
+      "main"
+    ],
+    "remoteTags": true,
+    "plugins": [
+      "@semantic-release/commit-analyzer",
+      "@semantic-release/release-notes-generator",
+      "@semantic-release/npm",
+      [
+        "@semantic-release/github",
+        {
+          "successCommentCondition": false,
+          "failTitle": false
+        }
+      ]
+    ]
+  }
+}
