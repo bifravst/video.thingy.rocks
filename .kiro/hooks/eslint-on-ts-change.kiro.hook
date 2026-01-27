@@ -1,0 +1,17 @@
+{
+  "enabled": true,
+  "name": "ESLint on TypeScript Changes",
+  "description": "Automatically runs ESLint whenever TypeScript files are modified to ensure code quality and catch linting issues early",
+  "version": "1",
+  "when": {
+    "type": "fileEdited",
+    "patterns": [
+      "**/*.ts",
+      "**/*.tsx"
+    ]
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "Run `npx eslint ./` and fix any errors found in the code. Focus only on the errors, not warnings unless they're critical."
+  }
+}

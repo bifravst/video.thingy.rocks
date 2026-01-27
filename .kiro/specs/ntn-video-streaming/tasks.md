@@ -10,7 +10,7 @@ integration.
 
 ## Tasks
 
-- [ ] 1. Initialize project structure
+- [x] 1. Initialize project structure
   - [x] 1.1 Create CDK TypeScript project
     - Run `mkdir ntn-video-streaming && cd ntn-video-streaming`
     - Use `fnm use 24` to switch to Node.js 24.
@@ -85,15 +85,15 @@ integration.
     - Test DynamoDB table schema
     - _Requirements: 7.1_
 
-- [ ] 3. Implement UDP listener service
-  - [ ] 3.1 Create UDPListener class
+- [x] 3. Implement UDP listener service
+  - [x] 3.1 Create UDPListener class
     - Implement class with port range configuration (5000-5009)
     - Create UDP sockets using dgram module for each port
     - Implement packet reception handler
     - Add basic logging for received packets
     - _Requirements: 1.1, 1.2, 1.4_
 
-  - [ ] 3.2 Implement packet buffering
+  - [x] 3.2 Implement packet buffering
     - Create buffer with configurable size and flush interval
     - Buffer incoming packets in memory
     - Flush buffer to local disk as MPEG-TS files when size or time threshold
@@ -104,14 +104,14 @@ integration.
     - **Property 1: Packet Buffering and Forwarding**
     - **Validates: Requirements 1.2, 1.4, 1.5**
 
-  - [ ] 3.4 Implement stream state tracking
+  - [x] 3.4 Implement stream state tracking
     - Track active streams by port number in memory
     - Detect stream start (first packet on a port)
     - Detect stream stop (no packets for 1 minute using timeout)
     - Create StreamStateManager class
     - _Requirements: 1.5, 6.2, 6.5, 11.4_
 
-  - [ ] 3.5 Integrate DynamoDB for stream metadata
+  - [x] 3.5 Integrate DynamoDB for stream metadata
     - Create StreamMetadataService class
     - Implement updateStreamStatus() to write to DynamoDB
     - Implement updateLastPacketTime() to update timestamps
@@ -130,7 +130,7 @@ integration.
     - **Property 14: Active Stream Count Accuracy**
     - **Validates: Requirements 6.5**
 
-  - [ ] 3.9 Implement error handling for UDP ingestion
+  - [x] 3.9 Implement error handling for UDP ingestion
     - Handle malformed packets (validate and discard)
     - Handle buffer overflow (drop oldest packets with FIFO)
     - Handle port binding failures (retry with exponential backoff)
@@ -141,7 +141,7 @@ integration.
     - **Property 17: Malformed Packet Handling**
     - **Validates: Requirements 9.1**
 
-  - [ ] 3.11 Write unit tests for UDP listener
+  - [x] 3.11 Write unit tests for UDP listener
     - Test port binding on startup
     - Test packet reception and buffering
     - Test stream state transitions
@@ -294,45 +294,56 @@ integration.
     - Test CloudFront distribution setup
     - _Requirements: 7.1_
 
-- [ ] 7. Implement React web frontend
-  - [ ] 7.1 Create DynamoDB client service
-    - Implement StreamDynamoDBClient class
-    - Configure AWS SDK with Cognito Identity Pool credentials
+- [ ] 7. Implement web frontend for stream viewing
+  - [ ] 7.1 Install required frontend dependencies
+    - Install AWS SDK packages:
+      `npm install @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb`
+    - Install HLS player: `npm install hls.js`
+    - Install types: `npm install --save-dev @types/hls.js`
+    - _Requirements: 4.1_
+
+  - [ ] 7.2 Create TypeScript interfaces for data models
+    - Define StreamMetadata interface matching DynamoDB schema
+    - Define StreamSummary interface for list view
+    - Define StreamDetailResponse interface for player view
+    - Create types.d.ts file in frontend/src/
+    - _Requirements: 4.1_
+
+  - [ ] 7.3 Create DynamoDB client service
+    - Implement StreamDynamoDBClient class in frontend/src/utils/
+    - Use existing AWS credentials from Auth context
     - Implement listStreams() method using DynamoDB scan
     - Implement getStreamDetail() method using DynamoDB getItem
     - Implement getStreamStatus() method with projection expression
     - Add error handling for DynamoDB operations
     - _Requirements: 4.1, 8.5_
 
-  - [ ] 7.2 Create TypeScript interfaces for data models
-    - Define StreamMetadata interface
-    - Define StreamSummary interface
-    - Define StreamDetailResponse interface
-    - Define VideoSegment interface
-    - _Requirements: 4.1_
-
-  - [ ] 7.3 Implement StreamList component
+  - [ ] 7.4 Implement StreamList component
+    - Create StreamList component in frontend/src/page/
     - Display grid layout of all streams
     - Show stream port number, status badge (active/inactive), and thumbnail
     - Implement polling mechanism (query DynamoDB every 5 seconds)
     - Handle loading state with skeleton UI
     - Handle error state with retry button
     - Add click handler to navigate to stream player
+    - Replace placeholder in Cameras.tsx with StreamList
     - _Requirements: 4.1, 4.5_
 
-  - [ ]\* 7.4 Write property test for stream list display
+  - [ ]\* 7.5 Write property test for stream list display
     - **Property 9: Stream List Display**
     - **Validates: Requirements 4.1, 4.5**
 
-  - [ ] 7.5 Implement StreamPlayer component
+  - [ ] 7.6 Implement StreamPlayer component
+    - Create StreamPlayer component in frontend/src/page/
     - Create video player container with hls.js integration
     - Add toggle switch for raw vs adaptive bitrate mode
     - Display stream metadata panel (port, status, timestamp, current bitrate)
     - Implement video element with HLS source
     - Handle stream URL construction from CloudFront domain
+    - Add route for /stream/:port in App.tsx
     - _Requirements: 4.2, 4.3, 4.4, 4.6_
 
-  - [ ] 7.6 Implement adaptive bitrate functionality
+  - [ ] 7.7 Implement adaptive bitrate functionality
     - Configure hls.js for automatic quality switching
     - Add manual quality selection dropdown
     - Display current active bitrate and resolution
@@ -340,11 +351,11 @@ integration.
     - Maintain playback continuity during switches
     - _Requirements: 5.1, 5.2, 5.3, 5.5_
 
-  - [ ]\* 7.7 Write property test for adaptive bitrate switching
+  - [ ]\* 7.8 Write property test for adaptive bitrate switching
     - **Property 10: Adaptive Bitrate Quality Switching**
     - **Validates: Requirements 4.4, 5.2, 5.3**
 
-  - [ ] 7.8 Implement offline stream handling
+  - [ ] 7.9 Implement offline stream handling
     - Detect inactive stream status from DynamoDB
     - Display last frame snapshot image when stream is offline
     - Show "Offline" indicator badge
@@ -353,11 +364,11 @@ integration.
     - Poll stream status every 5 seconds to detect resumption
     - _Requirements: 11.5, 11.6, 11.7_
 
-  - [ ]\* 7.9 Write property test for stream resumption
+  - [ ]\* 7.10 Write property test for stream resumption
     - **Property 13: Stream Resumption**
     - **Validates: Requirements 11.2, 11.7**
 
-  - [ ] 7.10 Implement frontend error handling
+  - [ ] 7.11 Implement frontend error handling
     - Handle stream not found errors (show user-friendly message)
     - Handle playback errors (retry, fallback to lower quality)
     - Handle network interruptions (auto-reconnect with exponential backoff)
@@ -365,7 +376,7 @@ integration.
     - Display error messages with retry actions
     - _Requirements: 9.4_
 
-  - [ ] 7.11 Write unit tests for frontend components
+  - [ ] 7.12 Write unit tests for frontend components
     - Test StreamList rendering and polling
     - Test StreamPlayer initialization
     - Test adaptive bitrate controls
@@ -373,38 +384,48 @@ integration.
     - Test error handling
     - _Requirements: 4.1, 4.2_
 
-- [ ] 8. Deploy frontend to S3 and CloudFront
-  - [ ] 8.1 Create build configuration
+- [ ] 8. Deploy frontend and configure CDK outputs
+  - [ ] 8.1 Create frontend S3 bucket in CDK
+    - Add S3 bucket for frontend static hosting to StreamingStack
+    - Configure bucket for static website hosting
+    - Enable encryption at rest
+    - _Requirements: 7.7, 10.4_
+
+  - [ ] 8.2 Create CloudFront distribution for frontend
+    - Create CloudFront distribution for frontend with S3 origin
+    - Set up Origin Access Control for frontend bucket
+    - Configure HTTPS enforcement
+    - Add cache behaviors for static assets
+    - _Requirements: 7.7, 10.1_
+
+  - [ ] 8.3 Add S3 bucket deployment to CDK
+    - Add BucketDeployment construct to upload frontend build files
+    - Configure deployment to invalidate CloudFront cache
+    - Set up build script to run before deployment
+    - _Requirements: 7.7_
+
+  - [ ] 8.4 Create build configuration for frontend
     - Configure environment variables for production build
     - Create script to inject CDK outputs (Identity Pool ID, DynamoDB table,
       CloudFront URL)
     - Optimize bundle size (code splitting, tree shaking)
-    - Run production build: `npm run build`
+    - Add build command to frontend package.json
     - _Requirements: 4.1_
 
-  - [ ] 8.2 Add frontend deployment to CDK stack
-    - Create S3 bucket for frontend static hosting
-    - Configure bucket for static website hosting
-    - Create CloudFront distribution for frontend with S3 origin
-    - Set up Origin Access Identity for frontend bucket
-    - Configure HTTPS enforcement
-    - Add bucket deployment construct to upload build files
-    - _Requirements: 7.7, 10.1_
-
-  - [ ] 8.3 Configure CORS and security policies
-    - Set CORS headers on video S3 bucket for frontend access
-    - Configure Content Security Policy headers
-    - Enable S3 encryption at rest for both buckets
-    - Verify TLS for all AWS service communication
-    - _Requirements: 10.2, 10.3, 10.4, 10.5_
-
-  - [ ] 8.4 Add CDK outputs for frontend configuration
+  - [ ] 8.5 Add CDK outputs for frontend configuration
     - Output Cognito Identity Pool ID
     - Output DynamoDB table name
     - Output CloudFront video distribution URL
     - Output CloudFront frontend distribution URL
     - Create script to inject outputs into frontend build
     - _Requirements: 4.1, 7.7_
+
+  - [ ] 8.6 Configure CORS and security policies
+    - Update CORS headers on video S3 bucket for frontend access
+    - Configure Content Security Policy headers in CloudFront
+    - Verify S3 encryption at rest for both buckets
+    - Verify TLS for all AWS service communication
+    - _Requirements: 10.2, 10.3, 10.4, 10.5_
 
 - [ ] 9. Integration and end-to-end testing
   - [ ] 9.1 Set up test environment
