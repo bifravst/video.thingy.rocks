@@ -294,13 +294,13 @@ integration.
     - _Requirements: 7.1_
 
 - [ ] 7. Integration and end-to-end testing
-  - [ ] 7.1 Set up test environment
+  - [x] 7.1 Set up test environment
     - Deploy CDK stack to test AWS account
     - Configure test UDP packet generator
     - Set up test data and fixtures
     - _Requirements: 1.1, 7.1_
 
-  - [ ] 7.2 Test UDP to S3 storage flow
+  - [x] 7.2 Test UDP to S3 storage flow
     - Send test UDP packets to port 5000
     - Verify HLS segments appear in S3 within expected time
     - Verify raw segments are stored in correct S3 paths
@@ -313,7 +313,7 @@ integration.
     - **Property 7: Concurrent Viewer Support**
     - **Validates: Requirements 3.3**
 
-  - [ ] 7.4 Test offline/online transitions
+  - [x] 7.4 Test offline/online transitions
     - Send UDP packets to establish active stream
     - Stop sending packets and wait for timeout (1 minute)
     - Verify stream marked as inactive in DynamoDB
@@ -324,7 +324,7 @@ integration.
     - Verify new HLS segments are generated
     - _Requirements: 11.1, 11.2, 11.4, 11.5_
 
-  - [ ] 7.5 Test error scenarios
+  - [~] 7.5 Test error scenarios
     - Send malformed UDP packets and verify graceful handling
     - Simulate S3 failures (using IAM policy changes) and verify buffering
     - Kill FFmpeg process and verify automatic restart
@@ -332,7 +332,7 @@ integration.
     - Check error logs for appropriate severity levels
     - _Requirements: 9.1, 9.2, 9.3_
 
-  - [ ] 7.6 Test security configurations
+  - [~] 7.6 Test security configurations
     - Verify CloudFront enforces HTTPS (HTTP redirects to HTTPS)
     - Verify CORS policies on S3 bucket
     - Verify security group rules (only UDP 5000-5009 allowed)
@@ -342,7 +342,7 @@ integration.
       read)
     - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5_
 
-  - [ ] 7.7 Load testing
+  - [~] 7.7 Load testing
     - Test 10 concurrent streams for 15 minutes
     - Measure packet loss rate per stream
     - Measure end-to-end latency from UDP to S3
@@ -351,7 +351,7 @@ integration.
     - Verify no stream interference
     - _Requirements: 6.1, 6.4_
 
-  - [ ] 7.8 Verify HLS playback compatibility
+  - [~] 7.8 Verify HLS playback compatibility
     - Download HLS manifest and segments from CloudFront
     - Validate manifest format using HLS validation tools
     - Test playback using command-line tools (ffplay, vlc)
@@ -359,7 +359,7 @@ integration.
     - Verify segment continuity and timestamps
     - _Requirements: 2.4, 3.1_
 
-  - [ ] 7.9 Create deployment documentation
+  - [~] 7.9 Create deployment documentation
     - Document CDK deployment steps
     - Document required AWS permissions
     - Document environment variables and configuration
@@ -368,21 +368,21 @@ integration.
     - _Requirements: 7.1_
 
 - [ ] 8. Implement web frontend for stream viewing
-  - [ ] 8.1 Install required frontend dependencies
+  - [~] 8.1 Install required frontend dependencies
     - Install AWS SDK packages:
       `npm install @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb`
     - Install HLS player: `npm install hls.js`
     - Install types: `npm install --save-dev @types/hls.js`
     - _Requirements: 4.1_
 
-  - [ ] 8.2 Create TypeScript interfaces for data models
+  - [~] 8.2 Create TypeScript interfaces for data models
     - Define StreamMetadata interface matching DynamoDB schema
     - Define StreamSummary interface for list view
     - Define StreamDetailResponse interface for player view
     - Create types.d.ts file in frontend/src/
     - _Requirements: 4.1_
 
-  - [ ] 8.3 Create DynamoDB client service
+  - [~] 8.3 Create DynamoDB client service
     - Implement StreamDynamoDBClient class in frontend/src/utils/
     - Use existing AWS credentials from Auth context
     - Implement listStreams() method using DynamoDB scan
@@ -391,7 +391,7 @@ integration.
     - Add error handling for DynamoDB operations
     - _Requirements: 4.1, 8.5_
 
-  - [ ] 8.4 Implement StreamList component
+  - [~] 8.4 Implement StreamList component
     - Create StreamList component in frontend/src/page/
     - Display grid layout of all streams
     - Show stream port number, status badge (active/inactive), and thumbnail
@@ -406,7 +406,7 @@ integration.
     - **Property 9: Stream List Display**
     - **Validates: Requirements 4.1, 4.5**
 
-  - [ ] 8.6 Implement StreamPlayer component
+  - [~] 8.6 Implement StreamPlayer component
     - Create StreamPlayer component in frontend/src/page/
     - Create video player container with hls.js integration
     - Add toggle switch for raw vs adaptive bitrate mode
@@ -416,7 +416,7 @@ integration.
     - Add route for /stream/:port in App.tsx
     - _Requirements: 4.2, 4.3, 4.4, 4.6_
 
-  - [ ] 8.7 Implement adaptive bitrate functionality
+  - [~] 8.7 Implement adaptive bitrate functionality
     - Configure hls.js for automatic quality switching
     - Add manual quality selection dropdown
     - Display current active bitrate and resolution
@@ -428,7 +428,7 @@ integration.
     - **Property 10: Adaptive Bitrate Quality Switching**
     - **Validates: Requirements 4.4, 5.2, 5.3**
 
-  - [ ] 8.9 Implement offline stream handling
+  - [~] 8.9 Implement offline stream handling
     - Detect inactive stream status from DynamoDB
     - Display last frame snapshot image when stream is offline
     - Show "Offline" indicator badge
@@ -441,7 +441,7 @@ integration.
     - **Property 13: Stream Resumption**
     - **Validates: Requirements 11.2, 11.7**
 
-  - [ ] 8.11 Implement frontend error handling
+  - [~] 8.11 Implement frontend error handling
     - Handle stream not found errors (show user-friendly message)
     - Handle playback errors (retry, fallback to lower quality)
     - Handle network interruptions (auto-reconnect with exponential backoff)
@@ -449,7 +449,7 @@ integration.
     - Display error messages with retry actions
     - _Requirements: 9.4_
 
-  - [ ] 8.12 Write unit tests for frontend components
+  - [~] 8.12 Write unit tests for frontend components
     - Test StreamList rendering and polling
     - Test StreamPlayer initialization
     - Test adaptive bitrate controls
@@ -458,26 +458,26 @@ integration.
     - _Requirements: 4.1, 4.2_
 
 - [ ] 9. Deploy frontend and configure CDK outputs
-  - [ ] 9.1 Create frontend S3 bucket in CDK
+  - [~] 9.1 Create frontend S3 bucket in CDK
     - Add S3 bucket for frontend static hosting to StreamingStack
     - Configure bucket for static website hosting
     - Enable encryption at rest
     - _Requirements: 7.7, 10.4_
 
-  - [ ] 9.2 Create CloudFront distribution for frontend
+  - [~] 9.2 Create CloudFront distribution for frontend
     - Create CloudFront distribution for frontend with S3 origin
     - Set up Origin Access Control for frontend bucket
     - Configure HTTPS enforcement
     - Add cache behaviors for static assets
     - _Requirements: 7.7, 10.1_
 
-  - [ ] 9.3 Add S3 bucket deployment to CDK
+  - [~] 9.3 Add S3 bucket deployment to CDK
     - Add BucketDeployment construct to upload frontend build files
     - Configure deployment to invalidate CloudFront cache
     - Set up build script to run before deployment
     - _Requirements: 7.7_
 
-  - [ ] 9.4 Create build configuration for frontend
+  - [~] 9.4 Create build configuration for frontend
     - Configure environment variables for production build
     - Create script to inject CDK outputs (Identity Pool ID, DynamoDB table,
       CloudFront URL)
@@ -485,7 +485,7 @@ integration.
     - Add build command to frontend package.json
     - _Requirements: 4.1_
 
-  - [ ] 9.5 Add CDK outputs for frontend configuration
+  - [~] 9.5 Add CDK outputs for frontend configuration
     - Output Cognito Identity Pool ID
     - Output DynamoDB table name
     - Output CloudFront video distribution URL
@@ -493,7 +493,7 @@ integration.
     - Create script to inject outputs into frontend build
     - _Requirements: 4.1, 7.7_
 
-  - [ ] 9.6 Configure CORS and security policies
+  - [~] 9.6 Configure CORS and security policies
     - Update CORS headers on video S3 bucket for frontend access
     - Configure Content Security Policy headers in CloudFront
     - Verify S3 encryption at rest for both buckets

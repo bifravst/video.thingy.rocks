@@ -12,6 +12,6 @@
   },
   "then": {
     "type": "askAgent",
-    "prompt": "Run `npx eslint ./` and fix any errors found in the code. Focus only on the errors, not warnings unless they're critical."
+    "prompt": "Run `npx eslint ./` and fix any errors found in the code. Focus only on the errors, not warnings unless they're critical. Do not disable any rules."
   }
 }

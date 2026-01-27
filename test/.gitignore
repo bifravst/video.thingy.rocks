@@ -1,0 +1,12 @@
+# Generated test data
+fixtures/video-samples/*.mp4
+fixtures/video-samples/*.ts
+fixtures/video-samples/*.mkv
+
+# Test results
+results/
+*.log
+
+# Temporary files
+tmp/
+temp/

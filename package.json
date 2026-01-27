@@ -5,6 +5,12 @@
   "scripts": {
     "test": "node --no-warnings --experimental-transform-types --test \"!(node_modules)/**/*.spec.ts\"",
     "test:watch": "node --no-warnings --experimental-transform-types --test --watch \"!(node_modules)/**/*.spec.ts\"",
+    "test:quick-start": "node --experimental-transform-types --no-warnings ./test/quick-start.ts",
+    "test:deploy": "node --experimental-transform-types --no-warnings ./test/deploy-test-stack.ts",
+    "test:generate-packets": "node --experimental-transform-types --no-warnings ./test/udp-packet-generator.ts",
+    "test:integration": "node --experimental-transform-types --no-warnings ./test/integration/test-udp-to-s3.ts",
+    "test:task-7.2": "node --experimental-transform-types --no-warnings ./test/integration/udp-to-s3-flow.spec.ts",
+    "test:task-7.4": "node --experimental-transform-types --no-warnings ./test/integration/offline-online-transitions.spec.ts",
     "prepare": "husky && check-node-version --package",
     "cdk:bootstrap": "node --experimental-transform-types --no-warnings ./cdk/bootstrap.ts",
     "cdk:prod:deploy": "node --experimental-transform-types --no-warnings ./cdk/deploy-to-production.ts",
@@ -16,8 +22,10 @@
   },
   "devDependencies": {
     "@aws-cdk/toolkit-lib": "^1.14.1",
+    "@aws-sdk/client-dynamodb": "3.975.0",
     "@aws-sdk/client-ec2": "3.976.0",
     "@aws-sdk/client-iam": "^3.975.0",
+    "@aws-sdk/lib-dynamodb": "3.975.0",
     "@bifravst/ci": "^2.1.1",
     "@bifravst/eslint-config-typescript": "6.4.4",
     "@bifravst/from-env": "^3.0.2",

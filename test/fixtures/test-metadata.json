@@ -1,0 +1,86 @@
+{
+  "streams": [
+    {
+      "port": 5000,
+      "status": "active",
+      "lastPacketTime": "2024-01-15T10:30:00.000Z",
+      "lastFramePath": "s3://test-bucket/snapshots/5000/last_frame.jpg",
+      "hlsManifestPath": "s3://test-bucket/hls/5000/master.m3u8",
+      "rawStreamPath": "s3://test-bucket/raw/5000/",
+      "createdAt": "2024-01-15T10:00:00.000Z",
+      "updatedAt": "2024-01-15T10:30:00.000Z"
+    },
+    {
+      "port": 5001,
+      "status": "inactive",
+      "lastPacketTime": "2024-01-15T09:45:00.000Z",
+      "lastFramePath": "s3://test-bucket/snapshots/5001/last_frame.jpg",
+      "hlsManifestPath": "s3://test-bucket/hls/5001/master.m3u8",
+      "rawStreamPath": "s3://test-bucket/raw/5001/",
+      "createdAt": "2024-01-15T09:00:00.000Z",
+      "updatedAt": "2024-01-15T09:45:00.000Z"
+    },
+    {
+      "port": 5002,
+      "status": "active",
+      "lastPacketTime": "2024-01-15T10:29:30.000Z",
+      "lastFramePath": "s3://test-bucket/snapshots/5002/last_frame.jpg",
+      "hlsManifestPath": "s3://test-bucket/hls/5002/master.m3u8",
+      "rawStreamPath": "s3://test-bucket/raw/5002/",
+      "createdAt": "2024-01-15T08:00:00.000Z",
+      "updatedAt": "2024-01-15T10:29:30.000Z"
+    }
+  ],
+  "testScenarios": {
+    "newStream": {
+      "description": "A new stream that just started",
+      "port": 5003,
+      "expectedStatus": "active",
+      "packetCount": 100
+    },
+    "stoppedStream": {
+      "description": "A stream that stopped 2 minutes ago",
+      "port": 5004,
+      "expectedStatus": "inactive",
+      "lastPacketTime": "2024-01-15T10:28:00.000Z"
+    },
+    "intermittentStream": {
+      "description": "A stream with intermittent connectivity",
+      "port": 5005,
+      "expectedStatus": "active",
+      "packetPattern": "burst",
+      "burstDuration": 30,
+      "pauseDuration": 60
+    }
+  },
+  "expectedOutputs": {
+    "hlsProfiles": [
+      {
+        "name": "1080p",
+        "resolution": "1920x1080",
+        "videoBitrate": "5000k",
+        "audioBitrate": "128k"
+      },
+      {
+        "name": "720p",
+        "resolution": "1280x720",
+        "videoBitrate": "3000k",
+        "audioBitrate": "128k"
+      },
+      {
+        "name": "480p",
+        "resolution": "854x480",
+        "videoBitrate": "1500k",
+        "audioBitrate": "128k"
+      },
+      {
+        "name": "360p",
+        "resolution": "640x360",
+        "videoBitrate": "800k",
+        "audioBitrate": "128k"
+      }
+    ],
+    "segmentDuration": 6,
+    "manifestUpdateInterval": 2
+  }
+}
