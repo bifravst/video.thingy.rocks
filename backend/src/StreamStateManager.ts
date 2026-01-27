@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events'
+import { Logger } from './Logger.ts'
 
 export type StreamStatus = 'active' | 'inactive'
 
@@ -18,10 +19,12 @@ export class StreamStateManager extends EventEmitter {
 	private readonly config: StreamStateManagerConfig
 	private readonly streams: Map<number, StreamState> = new Map()
 	private readonly inactivityTimers: Map<number, NodeJS.Timeout> = new Map()
+	private readonly logger: Logger
 
 	constructor(config: StreamStateManagerConfig = { inactivityTimeout: 60000 }) {
 		super()
 		this.config = config
+		this.logger = new Logger('StreamStateManager')
 	}
 
 	onPacketReceived(port: number, timestamp: Date): void {
@@ -37,7 +40,7 @@ export class StreamStateManager extends EventEmitter {
 				packetCount: 1,
 			}
 			this.streams.set(port, newStream)
-			console.log(`[StreamStateManager] Stream started on port ${port}`)
+			this.logger.info('Stream started', { port, timestamp })
 			this.emit('streamStart', port)
 		} else {
 			// Update existing stream
@@ -47,7 +50,7 @@ export class StreamStateManager extends EventEmitter {
 			// If stream was inactive, mark as active again
 			if (existingStream.status === 'inactive') {
 				existingStream.status = 'active'
-				console.log(`[StreamStateManager] Stream resumed on port ${port}`)
+				this.logger.info('Stream resumed', { port, timestamp })
 				this.emit('streamResume', port)
 			}
 		}
@@ -114,9 +117,11 @@ export class StreamStateManager extends EventEmitter {
 
 		// Mark stream as inactive
 		stream.status = 'inactive'
-		console.log(
-			`[StreamStateManager] Stream stopped on port ${port} after ${inactivityDuration}ms of inactivity`,
-		)
+		this.logger.info('Stream stopped', {
+			port,
+			inactivityDuration,
+			timestamp: now,
+		})
 
 		this.emit('streamStop', port, inactivityDuration)
 	}

@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { Logger } from './Logger.ts'
 
 export type PacketBufferConfig = {
 	bufferSize: number // bytes
@@ -17,9 +18,11 @@ export class PacketBuffer {
 	private readonly buffers: Map<number, BufferedPacket[]> = new Map()
 	private readonly bufferSizes: Map<number, number> = new Map()
 	private readonly flushTimers: Map<number, NodeJS.Timeout> = new Map()
+	private readonly logger: Logger
 
 	constructor(config: PacketBufferConfig) {
 		this.config = config
+		this.logger = new Logger('PacketBuffer')
 	}
 
 	async addPacket(port: number, data: Buffer, timestamp: Date): Promise<void> {
@@ -35,9 +38,12 @@ export class PacketBuffer {
 
 		// Check for buffer overflow
 		if (currentSize + data.length > this.config.bufferSize) {
-			console.warn(
-				`[PacketBuffer] Buffer overflow on port ${port}, dropping oldest packets`,
-			)
+			this.logger.warn('Buffer overflow, dropping oldest packets', {
+				port,
+				currentSize,
+				incomingSize: data.length,
+				bufferSize: this.config.bufferSize,
+			})
 			await this.handleBufferOverflow(port, data.length)
 		}
 
@@ -79,9 +85,12 @@ export class PacketBuffer {
 
 		// Write to disk
 		await fs.writeFile(filepath, combined)
-		console.log(
-			`[PacketBuffer] Flushed ${buffer.length} packets (${totalSize} bytes) to ${filepath}`,
-		)
+		this.logger.info('Flushed buffer to disk', {
+			port,
+			packetCount: buffer.length,
+			totalSize,
+			filepath,
+		})
 
 		// Clear buffer
 		this.buffers.set(port, [])
@@ -131,7 +140,11 @@ export class PacketBuffer {
 	private startFlushTimer(port: number): void {
 		const timer = setTimeout(() => {
 			void this.flush(port).catch((err) => {
-				console.error(`[PacketBuffer] Error flushing port ${port}:`, err)
+				this.logger.error(
+					'Error flushing buffer',
+					err instanceof Error ? err : new Error(String(err)),
+					{ port },
+				)
 			})
 		}, this.config.flushInterval)
 

@@ -1,5 +1,6 @@
 import dgram from 'node:dgram'
 import { EventEmitter } from 'node:events'
+import { Logger } from './Logger.ts'
 
 export type UDPListenerConfig = {
 	portRange: { start: number; end: number }
@@ -18,10 +19,12 @@ export class UDPListener extends EventEmitter {
 	private readonly config: UDPListenerConfig
 	private readonly sockets: Map<number, dgram.Socket> = new Map()
 	private packetHandler?: PacketHandler
+	private readonly logger: Logger
 
 	constructor(config: UDPListenerConfig) {
 		super()
 		this.config = config
+		this.logger = new Logger('UDPListener')
 	}
 
 	setPacketHandler(handler: PacketHandler): void {
@@ -43,7 +46,7 @@ export class UDPListener extends EventEmitter {
 			closePromises.push(
 				new Promise<void>((resolve) => {
 					socket.close(() => {
-						console.log(`[UDPListener] Closed socket on port ${port}`)
+						this.logger.info('Closed socket', { port })
 						resolve()
 					})
 				}),
@@ -90,12 +93,19 @@ export class UDPListener extends EventEmitter {
 			const socket = dgram.createSocket('udp4')
 
 			socket.on('error', (err) => {
-				console.warn(`[UDPListener] Error on port ${port}: ${err.message}`)
+				this.logger.warn('Error on port', {
+					port,
+					error: err.message,
+					retryCount,
+				})
 
 				if (retryCount < maxRetries) {
-					console.log(
-						`[UDPListener] Retrying port ${port} in ${backoffMs}ms (attempt ${retryCount + 1}/${maxRetries})`,
-					)
+					this.logger.info('Retrying port binding', {
+						port,
+						backoffMs,
+						attempt: retryCount + 1,
+						maxRetries,
+					})
 					// Use void to explicitly ignore the promise
 					void (async () => {
 						try {
@@ -107,8 +117,10 @@ export class UDPListener extends EventEmitter {
 						}
 					})()
 				} else {
-					console.error(
-						`[UDPListener] Failed to bind port ${port} after ${maxRetries} retries`,
+					this.logger.error(
+						'Failed to bind port after retries',
+						err instanceof Error ? err : new Error(String(err)),
+						{ port, maxRetries },
 					)
 					reject(err)
 				}
@@ -119,15 +131,13 @@ export class UDPListener extends EventEmitter {
 
 				// Validate packet (basic validation)
 				if (!this.isValidPacket(msg)) {
-					console.warn(
-						`[UDPListener] Malformed packet received on port ${port}, discarding`,
-					)
+					this.logger.warn('Malformed packet received, discarding', {
+						port,
+						packetSize: msg.length,
+						source: `${rinfo.address}:${rinfo.port}`,
+					})
 					return
 				}
-
-				console.log(
-					`[UDPListener] Received ${msg.length} bytes on port ${port} from ${rinfo.address}:${rinfo.port}`,
-				)
 
 				if (this.packetHandler) {
 					void this.packetHandler.onPacket(port, msg, timestamp)
@@ -138,7 +148,7 @@ export class UDPListener extends EventEmitter {
 
 			socket.on('listening', () => {
 				const address = socket.address()
-				console.log(`[UDPListener] Listening on port ${address.port}`)
+				this.logger.info('Listening on port', { port: address.port })
 				this.sockets.set(port, socket)
 				resolve()
 			})

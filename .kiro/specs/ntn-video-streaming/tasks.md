@@ -218,8 +218,8 @@ integration.
     - Test error handling and retries
     - _Requirements: 2.1, 2.5_
 
-- [ ] 5. Implement CloudWatch metrics and monitoring
-  - [ ] 5.1 Add metrics emission to UDP listener
+- [x] 5. Implement CloudWatch metrics and monitoring
+  - [x] 5.1 Add metrics emission to UDP listener
     - Create MetricsService class using CloudWatch SDK
     - Emit packet loss rate per stream (calculate from sequence numbers)
     - Emit bitrate per stream (calculate from bytes received)
@@ -231,7 +231,7 @@ integration.
     - **Property 15: Stream Metrics Emission**
     - **Validates: Requirements 8.1**
 
-  - [ ] 5.3 Implement structured logging
+  - [x] 5.3 Implement structured logging
     - Create Logger utility with log levels (INFO, WARN, ERROR)
     - Log stream start/stop as INFO with port and timestamp
     - Log packet loss and retries as WARN with context
@@ -239,7 +239,7 @@ integration.
     - Include port, timestamp, and stream identifier in all logs
     - _Requirements: 9.5_
 
-  - [ ] 5.4 Write unit tests for monitoring
+  - [x] 5.4 Write unit tests for monitoring
     - Test metrics calculation and emission
     - Test logging output format
     - Test CloudWatch integration
