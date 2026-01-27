@@ -44,7 +44,7 @@ const streamMetadataService = new StreamMetadataService({
 const packetHandler: PacketHandler = {
 	onPacket: async (port, data, timestamp) => {
 		// Buffer the packet
-		await packetBuffer.addPacket(port, data, timestamp)
+		void packetBuffer.addPacket(port, data, timestamp)
 
 		// Update stream state
 		streamStateManager.onPacketReceived(port, timestamp)

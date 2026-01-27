@@ -148,8 +148,8 @@ integration.
     - Test error handling paths
     - _Requirements: 1.1, 1.2_
 
-- [ ] 4. Implement FFmpeg transcoding service
-  - [ ] 4.1 Create FFmpegTranscoder class
+- [x] 4. Implement FFmpeg transcoding service
+  - [x] 4.1 Create FFmpegTranscoder class
     - Define bitrate profiles (1080p, 720p, 480p, 360p) with resolutions and
       bitrates
     - Implement FFmpeg command builder for multiple outputs
@@ -157,7 +157,7 @@ integration.
     - Implement process lifecycle management (start, stop, restart)
     - _Requirements: 2.1, 2.2, 2.3_
 
-  - [ ] 4.2 Implement HLS transcoding pipeline
+  - [x] 4.2 Implement HLS transcoding pipeline
     - Configure FFmpeg for HLS output with 6-second segments
     - Generate master.m3u8 manifest
     - Generate variant playlists for each bitrate profile
@@ -172,7 +172,7 @@ integration.
     - **Property 4: HLS Format Validity**
     - **Validates: Requirements 2.4**
 
-  - [ ] 4.5 Implement S3 upload for video segments
+  - [x] 4.5 Implement S3 upload for video segments
     - Create S3UploadService class
     - Upload raw segments to s3://bucket/raw/{port}/
     - Upload HLS segments to s3://bucket/hls/{port}/{profile}/
@@ -188,7 +188,7 @@ integration.
     - **Property 8: Reception Timestamp Embedding**
     - **Validates: Requirements 3.5**
 
-  - [ ] 4.8 Implement snapshot capture
+  - [x] 4.8 Implement snapshot capture
     - Extract I-frames from video stream using FFmpeg
     - Save last frame as JPEG to s3://bucket/snapshots/{port}/last_frame.jpg
     - Update DynamoDB with snapshot S3 path
@@ -199,7 +199,7 @@ integration.
     - **Property 12: Last Frame Preservation**
     - **Validates: Requirements 6.3, 11.3**
 
-  - [ ] 4.10 Implement transcoding error handling
+  - [x] 4.10 Implement transcoding error handling
     - Handle FFmpeg process crashes (detect and restart)
     - Implement retry logic with exponential backoff (max 3 retries)
     - Handle invalid input formats (fallback to raw-only mode)
@@ -211,7 +211,7 @@ integration.
     - **Property 5: Error Isolation**
     - **Validates: Requirements 2.5, 6.4**
 
-  - [ ] 4.12 Write unit tests for FFmpeg transcoding
+  - [x] 4.12 Write unit tests for FFmpeg transcoding
     - Test FFmpeg command generation
     - Test process lifecycle management
     - Test S3 upload integration

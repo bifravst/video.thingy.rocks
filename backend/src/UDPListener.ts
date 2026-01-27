@@ -9,7 +9,7 @@ export type UDPListenerConfig = {
 }
 
 export type PacketHandler = {
-	onPacket(port: number, data: Buffer, timestamp: Date): void
+	onPacket(port: number, data: Buffer, timestamp: Date): Promise<void>
 	onStreamStart(port: number): Promise<void>
 	onStreamStop(port: number, inactivityDuration: number): Promise<void>
 }
@@ -130,7 +130,7 @@ export class UDPListener extends EventEmitter {
 				)
 
 				if (this.packetHandler) {
-					this.packetHandler.onPacket(port, msg, timestamp)
+					void this.packetHandler.onPacket(port, msg, timestamp)
 				}
 
 				this.emit('packet', { port, data: msg, timestamp })

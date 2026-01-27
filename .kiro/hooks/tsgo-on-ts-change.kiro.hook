@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "name": "TypeScript Check on Save",
+  "description": "Runs npx tsgo to check for TypeScript errors whenever a TypeScript file is saved",
+  "version": "1",
+  "when": {
+    "type": "fileEdited",
+    "patterns": [
+      "*.ts"
+    ]
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "Run `npx tsgo` to check for TypeScript errors and fix any issues found"
+  }
+}

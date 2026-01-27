@@ -71,7 +71,7 @@ void describe('UDPListener', () => {
 			let receivedData: Buffer | null = null
 
 			const handler: PacketHandler = {
-				onPacket: (port, data) => {
+				onPacket: async (port, data) => {
 					receivedPackets++
 					receivedPort = port
 					receivedData = data
@@ -125,7 +125,7 @@ void describe('UDPListener', () => {
 			let receivedPackets = 0
 
 			const handler: PacketHandler = {
-				onPacket: () => {
+				onPacket: async () => {
 					receivedPackets++
 				},
 				onStreamStart: async () => Promise.resolve(),
