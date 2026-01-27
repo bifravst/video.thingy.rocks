@@ -10,6 +10,7 @@ import {
 } from '@aws-sdk/client-ec2'
 import { IAMClient } from '@aws-sdk/client-iam'
 import { ensureGitHubOIDCProvider } from '@bifravst/ci'
+import chalk from 'chalk'
 import commandLineArgs from 'command-line-args'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
@@ -52,7 +53,12 @@ const ctx = {
 	version,
 }
 
-console.log('Availability Zones:', Array.from(availabilityZones).join(', '))
+console.log(
+	chalk.grey('Availability Zones:'),
+	Array.from(availabilityZones)
+		.map((zone) => chalk.yellow(zone))
+		.join(', '),
+)
 
 const app = new ProdApp({
 	repository: repoInfo(),

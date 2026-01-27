@@ -233,7 +233,6 @@ integration.
 
   - [x] 5.3 Implement structured logging
     - Create Logger utility with log levels (INFO, WARN, ERROR)
-    - Log stream start/stop as INFO with port and timestamp
     - Log packet loss and retries as WARN with context
     - Log crashes and failures as ERROR with stack traces
     - Include port, timestamp, and stream identifier in all logs
@@ -245,8 +244,8 @@ integration.
     - Test CloudWatch integration
     - _Requirements: 8.1, 8.2_
 
-- [ ] 6. Complete EC2 deployment configuration
-  - [ ] 6.1 Write EC2 user data script
+- [x] 6. Complete EC2 deployment configuration
+  - [x] 6.1 Write EC2 user data script
     - Install Node.js v24 and NPM v11
     - Install FFmpeg with required codecs
     - Install AWS CLI
@@ -256,7 +255,7 @@ integration.
     - Start service on boot
     - _Requirements: 7.3_
 
-  - [ ] 6.2 Add EC2 Auto Scaling Group to CDK stack
+  - [x] 6.2 Add EC2 Auto Scaling Group to CDK stack
     - Define launch template with user data script
     - Configure instance type (c5.xlarge for compute-intensive transcoding)
     - Set up Auto Scaling Group (min 2, max 10 instances)
@@ -264,14 +263,14 @@ integration.
     - Add health checks
     - _Requirements: 7.1, 7.3, 7.5_
 
-  - [ ] 6.3 Configure IAM role for EC2 instances
+  - [x] 6.3 Configure IAM role for EC2 instances
     - Grant S3 PutObject and GetObject permissions on video bucket
     - Grant DynamoDB PutItem, UpdateItem, GetItem on StreamMetadata table
     - Grant CloudWatch PutMetricData and PutLogEvents permissions
     - Follow least privilege principle
     - _Requirements: 7.5, 10.5_
 
-  - [ ] 6.4 Add CloudFront distribution to CDK stack
+  - [x] 6.4 Add CloudFront distribution to CDK stack
     - Create distribution with S3 origin for video bucket
     - Configure HTTPS redirect (enforce HTTPS)
     - Set up Origin Access Identity for S3 access
@@ -279,7 +278,7 @@ integration.
     - Configure appropriate TTLs for live streaming
     - _Requirements: 10.1_
 
-  - [ ] 6.5 Configure CloudWatch alarms in CDK
+  - [x] 6.5 Configure CloudWatch alarms in CDK
     - Alarm for high packet loss (>5%)
     - Alarm for FFmpeg process failures
     - Alarm for S3 upload failures
@@ -287,7 +286,7 @@ integration.
     - Alarm for EC2 CPU usage >80%
     - _Requirements: 8.3_
 
-  - [ ] 6.6 Write CDK deployment tests
+  - [x] 6.6 Write CDK deployment tests
     - Test EC2 launch template configuration
     - Test Auto Scaling Group settings
     - Test IAM role permissions
