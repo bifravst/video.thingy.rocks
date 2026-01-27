@@ -1,15 +1,19 @@
 import {
 	DiffMethod,
-	MemoryContext,
+	FileContext,
 	StackSelectionStrategy,
 	Toolkit,
 } from '@aws-cdk/toolkit-lib'
+import {
+	DescribeAvailabilityZonesCommand,
+	EC2Client,
+} from '@aws-sdk/client-ec2'
 import { IAMClient } from '@aws-sdk/client-iam'
 import { ensureGitHubOIDCProvider } from '@bifravst/ci'
-import { fromEnv } from '@bifravst/from-env'
 import commandLineArgs from 'command-line-args'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
+import { env } from '../aws/env.ts'
 import { repoInfo } from './helper/repo.ts'
 import { ProdApp } from './ProdApp.ts'
 
@@ -31,10 +35,15 @@ const options = commandLineArgs([
 ])
 
 const iam = new IAMClient({})
+const accountEnv = await env()
+const ec2Client = new EC2Client()
+const availabilityZones = new Set<string>(
+	(
+		await ec2Client.send(new DescribeAvailabilityZonesCommand({}))
+	).AvailabilityZones?.map((zone) => zone.ZoneName!) ?? [],
+)
 
-const { version } = fromEnv({
-	version: 'VERSION',
-})(process.env)
+const version = process.env.VERSION ?? '0.0.0-development'
 
 const ctx = {
 	...JSON.parse(
@@ -43,18 +52,22 @@ const ctx = {
 	version,
 }
 
+console.log('Availability Zones:', Array.from(availabilityZones).join(', '))
+
 const app = new ProdApp({
 	repository: repoInfo(),
 	gitHubOICDProviderArn: await ensureGitHubOIDCProvider({
 		iam,
 	}),
 	context: ctx,
+	env: accountEnv,
+	availabilityZones,
 })
 
 const cdk = new Toolkit()
 
 const cx = await cdk.fromAssemblyBuilder(async () => app.synth(), {
-	contextStore: new MemoryContext(ctx),
+	contextStore: new FileContext(path.join(process.cwd(), 'cdk.context.json')),
 })
 
 const stacks =

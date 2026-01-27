@@ -46,34 +46,34 @@ integration.
       `npm install @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb @aws-sdk/credential-providers hls.js @types/hls.js react-router-dom`
     - _Requirements: 4.1_
 
-- [ ] 2. Implement CDK infrastructure stack
-  - [ ] 2.1 Define VPC and networking
+- [x] 2. Implement CDK infrastructure stack
+  - [x] 2.1 Define VPC and networking
     - Create VPC with 2 availability zones
     - Configure public and private subnets
     - Set up NAT gateway for private subnet internet access
     - _Requirements: 7.1, 7.2_
 
-  - [ ] 2.2 Define S3 buckets
+  - [x] 2.2 Define S3 buckets
     - Create video storage bucket with folder structure (raw/, hls/, snapshots/)
     - Configure lifecycle policy to delete objects after 30 days
     - Set up CORS configuration for web access
     - Enable encryption at rest
     - _Requirements: 3.1, 3.4, 10.4_
 
-  - [ ] 2.3 Define DynamoDB table
+  - [x] 2.3 Define DynamoDB table
     - Create StreamMetadata table with port as partition key
     - Configure on-demand billing mode
     - Define attributes: status, lastPacketTime, lastFramePath, hlsManifestPath,
       rawStreamPath
     - _Requirements: 6.2, 8.4_
 
-  - [ ] 2.4 Configure Cognito Identity Pool
+  - [x] 2.4 Configure Cognito Identity Pool
     - Create identity pool allowing unauthenticated access
     - Create IAM role for unauthenticated users with read-only DynamoDB access
     - Grant read access to StreamMetadata table
     - _Requirements: 4.1, 10.2_
 
-  - [ ] 2.5 Define security groups
+  - [x] 2.5 Define security groups
     - Create security group allowing UDP ingress on ports 5000-5009
     - Allow HTTPS egress for AWS service communication
     - _Requirements: 7.2, 10.3_
