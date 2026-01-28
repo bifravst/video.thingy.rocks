@@ -8,7 +8,7 @@ void describe('TranscodingManager', () => {
 		void it('should create manager with required config', async () => {
 			const streamMetadataService = new StreamMetadataService({
 				tableName: 'test-table',
-				region: 'us-east-1',
+				region: 'eu-central-1',
 			})
 
 			const manager = new TranscodingManager({
@@ -23,7 +23,7 @@ void describe('TranscodingManager', () => {
 		void it('should use custom segment duration if specified', async () => {
 			const streamMetadataService = new StreamMetadataService({
 				tableName: 'test-table',
-				region: 'us-east-1',
+				region: 'eu-central-1',
 			})
 
 			const manager = new TranscodingManager({
@@ -41,7 +41,7 @@ void describe('TranscodingManager', () => {
 		void it('should return empty array initially', async () => {
 			const streamMetadataService = new StreamMetadataService({
 				tableName: 'test-table',
-				region: 'us-east-1',
+				region: 'eu-central-1',
 			})
 
 			const manager = new TranscodingManager({
@@ -60,7 +60,7 @@ void describe('TranscodingManager', () => {
 		void it('should return null for non-existent transcoder', async () => {
 			const streamMetadataService = new StreamMetadataService({
 				tableName: 'test-table',
-				region: 'us-east-1',
+				region: 'eu-central-1',
 			})
 
 			const manager = new TranscodingManager({
@@ -79,7 +79,7 @@ void describe('TranscodingManager', () => {
 		void it('should stop all transcoders', async () => {
 			const streamMetadataService = new StreamMetadataService({
 				tableName: 'test-table',
-				region: 'us-east-1',
+				region: 'eu-central-1',
 			})
 
 			const manager = new TranscodingManager({

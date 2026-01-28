@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Integration Test: UDP to S3 Storage Flow (Task 7.2)
+ * Integration Test: UDP to S3 Storage Flow
  *
  * This test validates the complete end-to-end flow from UDP packet reception to S3 storage:
  * 1. Send test UDP packets to port 5000
@@ -43,7 +43,7 @@ const { values } = parseArgs({
 		host: { type: 'string', default: 'localhost' },
 		'bucket-name': { type: 'string' },
 		'table-name': { type: 'string' },
-		region: { type: 'string', default: 'us-east-1' },
+		region: { type: 'string', default: 'eu-central-1' },
 		'packet-count': { type: 'string', default: '200' },
 		timeout: { type: 'string', default: '120' },
 	},
@@ -51,29 +51,29 @@ const { values } = parseArgs({
 
 const port = Number.parseInt(values.port ?? '5000', 10)
 const host = values.host ?? 'localhost'
-const bucketName = values['bucket-name']
-const tableName = values['table-name']
-const region = values.region ?? 'us-east-1'
+const bucketName = values['bucket-name'] ?? ''
+const tableName = values['table-name'] ?? ''
+const region = values.region ?? 'eu-central-1'
 const packetCount = Number.parseInt(values['packet-count'] ?? '200', 10)
 const timeout = Number.parseInt(values.timeout ?? '120', 10) * 1000
 
-if (bucketName === undefined || bucketName === null || bucketName === "") {
+if (bucketName === '') {
 	console.error('Error: --bucket-name is required')
 	console.error(
-		'Get it from: aws cloudformation describe-stacks --stack-name NTNVideoStreamingTest --query "Stacks[0].Outputs[?OutputKey==\'VideoBucketName\'].OutputValue" --output text',
+		'Get it from: aws cloudformation describe-stacks --stack-name video-streaming --query "Stacks[0].Outputs[?OutputKey==\'VideoBucketName\'].OutputValue" --output text',
 	)
 	process.exit(1)
 }
 
-if (tableName === undefined || tableName === null || tableName === "") {
+if (tableName === '') {
 	console.error('Error: --table-name is required')
 	console.error(
-		'Get it from: aws cloudformation describe-stacks --stack-name NTNVideoStreamingTest --query "Stacks[0].Outputs[?OutputKey==\'DynamoDBTableName\'].OutputValue" --output text',
+		'Get it from: aws cloudformation describe-stacks --stack-name video-streaming --query "Stacks[0].Outputs[?OutputKey==\'DynamoDBTableName\'].OutputValue" --output text',
 	)
 	process.exit(1)
 }
 
-console.log('Integration Test: UDP to S3 Storage Flow (Task 7.2)')
+console.log('Integration Test: UDP to S3 Storage Flow')
 console.log('====================================================')
 console.log(`Target: ${host}:${port}`)
 console.log(`S3 Bucket: ${bucketName}`)
@@ -181,7 +181,7 @@ const checkDynamoDBMetadata = async (): Promise<void> => {
 			}),
 		)
 
-		if (response.Item === undefined || response.Item === null || Object.keys(response.Item).length === 0) {
+		if (!response.Item || Object.keys(response.Item).length === 0) {
 			throw new Error('Stream metadata not found in DynamoDB')
 		}
 
@@ -189,9 +189,9 @@ const checkDynamoDBMetadata = async (): Promise<void> => {
 		console.log('  ✓ Metadata found:')
 		console.log(`    - Status: ${metadata.status}`)
 		console.log(`    - Last packet time: ${metadata.lastPacketTime}`)
-		console.log(`    - HLS manifest: ${metadata.hlsManifestPath || 'Not set'}`)
-		console.log(`    - Raw stream: ${metadata.rawStreamPath || 'Not set'}`)
-		console.log(`    - Last frame: ${metadata.lastFramePath || 'Not set'}`)
+		console.log(`    - HLS manifest: ${metadata.hlsManifestPath ?? 'Not set'}`)
+		console.log(`    - Raw stream: ${metadata.rawStreamPath ?? 'Not set'}`)
+		console.log(`    - Last frame: ${metadata.lastFramePath ?? 'Not set'}`)
 
 		const duration = Date.now() - stepStartTime
 		results.push({
@@ -301,7 +301,7 @@ const checkHLSSegments = async (): Promise<void> => {
 		results.push({
 			name: 'Check HLS segments',
 			passed: totalSegments > 0,
-			message: `Found ${totalSegments} total segments across ${Object.keys(profileResults).filter((p) => profileResults[p]! > 0).length}/4 profiles`,
+			message: `Found ${totalSegments} total segments across ${Object.keys(profileResults).filter((p) => (profileResults[p] ?? 0) > 0).length}/4 profiles`,
 			duration,
 			requirement: '2.1, 3.1',
 		})
@@ -353,7 +353,7 @@ const checkHLSManifests = async (): Promise<void> => {
 			console.log('  ✓ Master manifest found')
 
 			const lines = masterContent.split('\n').length
-			const variants = (masterContent.match(/#EXT-X-STREAM-INF/g) || []).length
+			const variants = (masterContent.match(/#EXT-X-STREAM-INF/g) ?? []).length
 			console.log(`    - ${lines} lines, ${variants} variants`)
 		} catch (error) {
 			console.log('  ✗ Master manifest not found')
@@ -374,7 +374,7 @@ const checkHLSManifests = async (): Promise<void> => {
 				)
 
 				const content = (await response.Body?.transformToString()) ?? ''
-				const segments = (content.match(/#EXTINF/g) || []).length
+				const segments = (content.match(/#EXTINF/g) ?? []).length
 
 				variantCount++
 				foundVariants.push(profile)
@@ -446,8 +446,18 @@ const printResults = (): void => {
 
 	for (const result of results) {
 		const status = result.passed ? '✓ PASS' : '✗ FAIL'
-		const duration = result.duration ? ` (${result.duration}ms)` : ''
-		const req = result.requirement ? ` [Req: ${result.requirement}]` : ''
+		const duration =
+			result.duration !== undefined &&
+			result.duration !== null &&
+			result.duration !== 0
+				? ` (${result.duration}ms)`
+				: ''
+		const req =
+			result.requirement !== undefined &&
+			result.requirement !== null &&
+			result.requirement !== ''
+				? ` [Req: ${result.requirement}]`
+				: ''
 		console.log(`${status} ${result.name}${duration}${req}`)
 		console.log(`       ${result.message}`)
 
@@ -468,7 +478,7 @@ const printResults = (): void => {
 		console.log('  - EC2 instance not fully initialized')
 		console.log('  - FFmpeg not installed or not running')
 		console.log(
-			'\nCheck CloudWatch logs: aws logs tail /ntn-video-streaming/udp-listener --follow',
+			'\nCheck CloudWatch logs: aws logs tail /video-streaming/udp-listener --follow',
 		)
 		process.exit(1)
 	} else {

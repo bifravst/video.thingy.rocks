@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Integration Test: Offline/Online Transitions (Task 7.4)
+ * Integration Test: Offline/Online Transitions
  *
  * This test validates the system's handling of intermittent connectivity:
  * 1. Send UDP packets to establish active stream
@@ -48,7 +48,7 @@ const { values } = parseArgs({
 		'bucket-name': { type: 'string' },
 		'table-name': { type: 'string' },
 		'cloudfront-url': { type: 'string' },
-		region: { type: 'string', default: 'us-east-1' },
+		region: { type: 'string', default: 'eu-central-1' },
 		'packet-count': { type: 'string', default: '100' },
 		'inactivity-timeout': { type: 'string', default: '65' }, // 65 seconds (slightly more than 1 minute)
 		timeout: { type: 'string', default: '300' },
@@ -60,7 +60,7 @@ const host = values.host ?? 'localhost'
 const bucketName = values['bucket-name']
 const tableName = values['table-name']
 const cloudfrontUrl = values['cloudfront-url']
-const region = values.region ?? 'us-east-1'
+const region = values.region ?? 'eu-central-1'
 const packetCount = Number.parseInt(values['packet-count'] ?? '100', 10)
 const inactivityTimeout = Number.parseInt(
 	values['inactivity-timeout'] ?? '65',
@@ -71,7 +71,7 @@ const timeout = Number.parseInt(values.timeout ?? '300', 10) * 1000
 if (bucketName === undefined || bucketName === null || bucketName === '') {
 	console.error('Error: --bucket-name is required')
 	console.error(
-		'Get it from: aws cloudformation describe-stacks --stack-name NTNVideoStreamingTest --query "Stacks[0].Outputs[?OutputKey==\'VideoBucketName\'].OutputValue" --output text',
+		'Get it from: aws cloudformation describe-stacks --stack-name video-streaming --query "Stacks[0].Outputs[?OutputKey==\'VideoBucketName\'].OutputValue" --output text',
 	)
 	process.exit(1)
 }
@@ -79,7 +79,7 @@ if (bucketName === undefined || bucketName === null || bucketName === '') {
 if (tableName === undefined || tableName === null || tableName === '') {
 	console.error('Error: --table-name is required')
 	console.error(
-		'Get it from: aws cloudformation describe-stacks --stack-name NTNVideoStreamingTest --query "Stacks[0].Outputs[?OutputKey==\'DynamoDBTableName\'].OutputValue" --output text',
+		'Get it from: aws cloudformation describe-stacks --stack-name video-streaming --query "Stacks[0].Outputs[?OutputKey==\'DynamoDBTableName\'].OutputValue" --output text',
 	)
 	process.exit(1)
 }
@@ -91,12 +91,12 @@ if (
 ) {
 	console.error('Error: --cloudfront-url is required')
 	console.error(
-		'Get it from: aws cloudformation describe-stacks --stack-name NTNVideoStreamingTest --query "Stacks[0].Outputs[?OutputKey==\'CloudFrontURL\'].OutputValue" --output text',
+		'Get it from: aws cloudformation describe-stacks --stack-name video-streaming --query "Stacks[0].Outputs[?OutputKey==\'CloudFrontURL\'].OutputValue" --output text',
 	)
 	process.exit(1)
 }
 
-console.log('Integration Test: Offline/Online Transitions (Task 7.4)')
+console.log('Integration Test: Offline/Online Transitions')
 console.log('========================================================')
 console.log(`Target: ${host}:${port}`)
 console.log(`S3 Bucket: ${bucketName}`)
@@ -480,9 +480,7 @@ const resumeSendingPackets = async (): Promise<void> => {
 /**
  * Wait for stream resumption processing
  */
-const waitForResumptionProcessing = async (
-	seconds: number,
-): Promise<void> => {
+const waitForResumptionProcessing = async (seconds: number): Promise<void> => {
 	console.log(
 		`\nStep 9: Waiting ${seconds} seconds for stream resumption processing...`,
 	)
@@ -663,7 +661,7 @@ const printResults = (): void => {
 		console.log('  - CloudFront distribution not fully propagated')
 		console.log('  - Stream state tracking not implemented correctly')
 		console.log(
-			'\nCheck CloudWatch logs: aws logs tail /ntn-video-streaming/udp-listener --follow',
+			'\nCheck CloudWatch logs: aws logs tail /video-streaming/udp-listener --follow',
 		)
 		process.exit(1)
 	} else {
@@ -671,9 +669,11 @@ const printResults = (): void => {
 			'\n✓ All tests passed! Offline/online transitions working correctly.',
 		)
 		console.log('\nRequirements validated:')
-		console.log('  - 11.1: System treats NTNCam offline as expected behavior')
 		console.log(
-			'  - 11.2: System automatically resumes processing when NTNCam returns',
+			'  - 11.1: System treats Cat1bisCam offline as expected behavior',
+		)
+		console.log(
+			'  - 11.2: System automatically resumes processing when Cat1bisCam returns',
 		)
 		console.log(
 			'  - 11.4: System marks stream as inactive after 1 hour offline',

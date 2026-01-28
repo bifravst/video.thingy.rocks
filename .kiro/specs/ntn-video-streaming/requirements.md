@@ -3,17 +3,17 @@
 ## Introduction
 
 This document specifies the requirements for a video streaming application that
-receives UDP video streams from multiple Non-Terrestrial Network Connected
-Cameras (NTNCam devices) and delivers them to web viewers with support for both
-raw and adaptive bitrate streaming. The system will be deployed on AWS using
-serverless components and CDK infrastructure written in TypeScript.
+receives UDP video streams from multiple Cat 1 bis connected cameras (Cat1bisCam
+devices) and delivers them to web viewers with support for both raw and adaptive
+bitrate streaming. The system will be deployed on AWS using serverless
+components and CDK infrastructure written in TypeScript.
 
 ## Glossary
 
-- **NTNCam**: Non-Terrestrial Network Connected Camera - a device that sends
-  video data via UDP with intermittent connectivity
+- **Cat1bisCam**: Cat 1 bis connected camera - a device that sends video data
+  via UDP with intermittent connectivity
 - **Video_Ingestion_Service**: The AWS service that receives UDP video streams
-  from NTNCam devices
+  from Cat1bisCam devices
 - **Stream_Processing_Service**: The service that processes and transcodes video
   streams for delivery
 - **Web_Frontend**: The browser-based application that allows users to view
@@ -24,9 +24,9 @@ serverless components and CDK infrastructure written in TypeScript.
   transcoding
 - **CDK_Infrastructure**: AWS Cloud Development Kit infrastructure code written
   in TypeScript
-- **Stream_Identifier**: The UDP port number (5000-5009) used by an NTNCam
+- **Stream_Identifier**: The UDP port number (5000-5009) used by an Cat1bisCam
   device to send its video stream
-- **Last_Frame**: The most recent video frame received from an NTNCam device
+- **Last_Frame**: The most recent video frame received from an Cat1bisCam device
   before it went offline
 - **Reception_Timestamp**: The timestamp indicating when video data was received
   by the system
@@ -36,7 +36,7 @@ serverless components and CDK infrastructure written in TypeScript.
 ### Requirement 1: UDP Video Ingestion
 
 **User Story:** As a system operator, I want the system to receive UDP video
-streams from multiple NTNCam devices, so that video data can be ingested for
+streams from multiple Cat1bisCam devices, so that video data can be ingested for
 processing and delivery.
 
 #### Acceptance Criteria
@@ -46,7 +46,7 @@ processing and delivery.
 2. WHEN a UDP video packet is received on any port in the range, THE
    Video_Ingestion_Service SHALL accept and buffer the packet
 3. THE Video_Ingestion_Service SHALL handle concurrent UDP streams from multiple
-   NTNCam devices simultaneously
+   Cat1bisCam devices simultaneously
 4. THE Video_Ingestion_Service SHALL use the destination UDP port number as the
    Stream_Identifier for each stream
 5. THE Video_Ingestion_Service SHALL forward buffered video data to the
@@ -74,7 +74,7 @@ adaptive bitrate streams.
 ### Requirement 3: Stream Storage and Delivery
 
 **User Story:** As a viewer, I want processed video streams to be available for
-playback, so that I can watch live video from NTNCam devices.
+playback, so that I can watch live video from Cat1bisCam devices.
 
 #### Acceptance Criteria
 
@@ -91,7 +91,7 @@ playback, so that I can watch live video from NTNCam devices.
 ### Requirement 4: Web Frontend for Stream Viewing
 
 **User Story:** As a viewer, I want to access a web interface to view available
-streams, so that I can select and watch video from NTNCam devices.
+streams, so that I can select and watch video from Cat1bisCam devices.
 
 #### Acceptance Criteria
 
@@ -105,7 +105,7 @@ streams, so that I can select and watch video from NTNCam devices.
    adjust quality based on available bandwidth
 5. THE Web_Frontend SHALL display stream metadata including Stream_Identifier,
    current bitrate, and Reception_Timestamp
-6. WHEN an NTNCam device is offline, THE Web_Frontend SHALL display the
+6. WHEN an Cat1bisCam device is offline, THE Web_Frontend SHALL display the
    Last_Frame as a still image with its Reception_Timestamp
 
 ### Requirement 5: Adaptive Bitrate Streaming
@@ -129,16 +129,16 @@ buffering.
 ### Requirement 6: Multiple Concurrent Streams
 
 **User Story:** As a system operator, I want the system to handle multiple
-NTNCam devices streaming simultaneously, so that all devices can be monitored
-concurrently.
+Cat1bisCam devices streaming simultaneously, so that all devices can be
+monitored concurrently.
 
 #### Acceptance Criteria
 
-1. THE System SHALL support at least 10 concurrent NTNCam device streams across
-   the port range 5000-5009
-2. WHEN a new NTNCam device begins streaming on any port in the range, THE
+1. THE System SHALL support at least 10 concurrent Cat1bisCam device streams
+   across the port range 5000-5009
+2. WHEN a new Cat1bisCam device begins streaming on any port in the range, THE
    System SHALL automatically detect and process the new stream
-3. WHEN an NTNCam device stops streaming, THE System SHALL preserve the
+3. WHEN an Cat1bisCam device stops streaming, THE System SHALL preserve the
    Last_Frame for display
 4. THE System SHALL isolate stream processing so that failure in one stream does
    not affect others
@@ -147,25 +147,25 @@ concurrently.
 ### Requirement 11: Intermittent Connectivity Handling
 
 **User Story:** As a system operator, I want the system to handle intermittent
-NTNCam connectivity gracefully, so that temporary network disruptions are
+Cat1bisCam connectivity gracefully, so that temporary network disruptions are
 treated as normal operation rather than errors.
 
 #### Acceptance Criteria
 
-1. WHEN an NTNCam device stops sending data, THE System SHALL treat this as
+1. WHEN an Cat1bisCam device stops sending data, THE System SHALL treat this as
    expected behavior and not log it as an error
-2. WHEN an NTNCam device resumes streaming after being offline, THE System SHALL
-   automatically resume processing without manual intervention
-3. THE System SHALL preserve the Last_Frame from each NTNCam device for up to 30
-   days
-4. WHEN an NTNCam device has been offline for more than 1 hour, THE System SHALL
-   mark the stream status as inactive but retain the Last_Frame
-5. THE Web_Frontend SHALL display the Last_Frame as a still image when an NTNCam
-   device is offline
+2. WHEN an Cat1bisCam device resumes streaming after being offline, THE System
+   SHALL automatically resume processing without manual intervention
+3. THE System SHALL preserve the Last_Frame from each Cat1bisCam device for up
+   to 30 days
+4. WHEN an Cat1bisCam device has been offline for more than 1 hour, THE System
+   SHALL mark the stream status as inactive but retain the Last_Frame
+5. THE Web_Frontend SHALL display the Last_Frame as a still image when an
+   Cat1bisCam device is offline
 6. THE Web_Frontend SHALL display the Reception_Timestamp of the Last_Frame when
    showing a still image
-7. WHEN an NTNCam device resumes streaming, THE Web_Frontend SHALL automatically
-   transition from still image to live video
+7. WHEN an Cat1bisCam device resumes streaming, THE Web_Frontend SHALL
+   automatically transition from still image to live video
 
 ### Requirement 7: CDK Infrastructure Deployment
 

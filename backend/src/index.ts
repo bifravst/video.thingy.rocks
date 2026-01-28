@@ -21,7 +21,7 @@ const config = {
 	outputDirectory: process.env.OUTPUT_DIR ?? '/tmp/video-streams',
 	inactivityTimeout: 60000, // 1 minute
 	dynamoDBTableName: process.env.DYNAMODB_TABLE_NAME ?? 'StreamMetadata',
-	awsRegion: process.env.AWS_REGION ?? 'us-east-1',
+	awsRegion: process.env.AWS_REGION ?? 'eu-central-1',
 }
 
 // Initialize components

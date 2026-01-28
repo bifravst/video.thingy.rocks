@@ -1,11 +1,14 @@
 #!/bin/bash
 set -e
 
-# EC2 User Data Script for NTN Video Streaming Service
+# EC2 User Data Script for Video Streaming Service
 # This script installs dependencies and configures the UDP listener service
 
 # Update system
 yum update -y
+
+# Install CloudWatch Logs agent
+yum install -y amazon-cloudwatch-agent
 
 # Install Node.js v24 using NodeSource repository
 curl -fsSL https://rpm.nodesource.com/setup_24.x | bash -
@@ -15,9 +18,14 @@ yum install -y nodejs
 node --version
 npm --version
 
-# Install FFmpeg with required codecs
-amazon-linux-extras install -y epel
-yum install -y ffmpeg
+# Install FFmpeg with required codecs (Amazon Linux 2023)
+# Download and install static FFmpeg build
+curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o ffmpeg.tar.xz
+tar xf ffmpeg.tar.xz
+cd ffmpeg-*-amd64-static
+cp ffmpeg ffprobe /usr/local/bin/
+cd ..
+rm -rf ffmpeg-*-amd64-static ffmpeg.tar.xz
 
 # Verify FFmpeg installation
 ffmpeg -version
@@ -33,8 +41,8 @@ rm -rf aws awscliv2.zip
 aws --version
 
 # Create application directory
-mkdir -p /opt/ntn-video-streaming
-cd /opt/ntn-video-streaming
+mkdir -p /opt/video-streaming
+cd /opt/video-streaming
 
 # Create output directory for video streams
 mkdir -p /var/video-streams
@@ -48,7 +56,7 @@ chmod 755 /var/video-streams
 # Note: The actual code deployment will happen via CDK BucketDeployment or similar
 cat > package.json << 'EOF'
 {
-  "name": "ntn-video-streaming-backend",
+  "name": "video-streaming-backend",
   "version": "1.0.0",
   "type": "module",
   "scripts": {
@@ -69,16 +77,20 @@ EOF
 # DYNAMODB_TABLE_NAME - DynamoDB table name
 # OUTPUT_DIR - Output directory for video streams
 
+# Create log directory for application
+mkdir -p /var/log/video-streaming
+chmod 755 /var/log/video-streaming
+
 # Create systemd service file
-cat > /etc/systemd/system/ntn-video-streaming.service << 'EOF'
+cat > /etc/systemd/system/video-streaming.service << 'EOF'
 [Unit]
-Description=NTN Video Streaming UDP Listener Service
+Description=Video Streaming UDP Listener Service
 After=network.target
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/ntn-video-streaming
+WorkingDirectory=/opt/video-streaming
 Environment="NODE_ENV=production"
 Environment="AWS_REGION=__AWS_REGION__"
 Environment="S3_BUCKET=__S3_BUCKET__"
@@ -87,9 +99,9 @@ Environment="OUTPUT_DIR=/var/video-streams"
 ExecStart=/usr/bin/node --experimental-transform-types --no-warnings src/index.ts
 Restart=always
 RestartSec=10
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=ntn-video-streaming
+StandardOutput=append:/var/log/video-streaming/application.log
+StandardError=append:/var/log/video-streaming/application.log
+SyslogIdentifier=video-streaming
 
 [Install]
 WantedBy=multi-user.target
@@ -99,9 +111,54 @@ EOF
 systemctl daemon-reload
 
 # Enable service to start on boot
-systemctl enable ntn-video-streaming.service
+systemctl enable video-streaming.service
+
+# Configure CloudWatch Logs agent
+cat > /opt/aws/amazon-cloudwatch-agent/etc/cloudwatch-config.json << 'EOF'
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/video-streaming/application.log",
+            "log_group_name": "/video-streaming/application",
+            "log_stream_name": "{instance_id}/application",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/var/log/messages",
+            "log_group_name": "/video-streaming/system",
+            "log_stream_name": "{instance_id}/messages",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/var/log/cloud-init.log",
+            "log_group_name": "/video-streaming/cloud-init",
+            "log_stream_name": "{instance_id}/cloud-init",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/var/log/cloud-init-output.log",
+            "log_group_name": "/video-streaming/cloud-init",
+            "log_stream_name": "{instance_id}/cloud-init-output",
+            "timezone": "UTC"
+          }
+        ]
+      }
+    }
+  }
+}
+EOF
+
+# Start CloudWatch Logs agent
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config \
+  -m ec2 \
+  -s \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/cloudwatch-config.json
 
 # Note: Service will be started after code deployment
-# systemctl start ntn-video-streaming.service
+# systemctl start video-streaming.service
 
 echo "EC2 user data script completed successfully"

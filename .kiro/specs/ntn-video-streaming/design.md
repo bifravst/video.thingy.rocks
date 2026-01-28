@@ -1,16 +1,16 @@
-# Design Document: NTN Video Streaming
+# Design Document: Video Streaming
 
 ## Overview
 
-This design document describes a serverless video streaming system for
-Non-Terrestrial Network Connected Cameras (NTNCam devices) deployed on AWS using
-CDK infrastructure written in TypeScript. The system receives UDP video streams
-from multiple cameras on ports 5000-5009, processes them for both raw and
-adaptive bitrate delivery, and provides a web interface for viewing.
+This design document describes a serverless video streaming system for Cat 1 bis
+connected cameras (Cat1bisCam) deployed on AWS using CDK infrastructure written
+in TypeScript. The system receives UDP video streams from multiple cameras on
+ports 5000-5009, processes them for both raw and adaptive bitrate delivery, and
+provides a web interface for viewing.
 
 The architecture leverages AWS serverless components to minimize operational
-overhead while handling intermittent connectivity patterns typical of
-non-terrestrial networks. Key design decisions include:
+overhead while handling intermittent connectivity patterns typical of IoT
+networks. Key design decisions include:
 
 - **EC2-based UDP ingestion** instead of MediaLive (which doesn't support raw
   UDP)
@@ -29,7 +29,7 @@ sending data again.
 ### High-Level Architecture
 
 ```
-NTNCam Devices (UDP 5000-5009)
+Cat1bisCam Devices (UDP 5000-5009)
          |
          v
     [EC2 UDP Listener Fleet]
@@ -85,7 +85,7 @@ with adaptive bitrate support.
 **Bucket Structure**:
 
 ```
-ntn-video-streams/
+video-streams/
 ├── raw/
 │   └── {port}/
 │       └── {timestamp}.ts
@@ -375,7 +375,7 @@ class StreamDynamoDBClient {
   constructor(credentials: AWS.Credentials) {
     this.dynamodb = new AWS.DynamoDB.DocumentClient({
       credentials,
-      region: "us-east-1",
+      region: "eu-central-1",
     });
   }
 
@@ -473,7 +473,7 @@ interface Snapshot {
 ### Stack Structure
 
 ```typescript
-class NTNVideoStreamingStack extends cdk.Stack {
+class VideoStreamingStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 

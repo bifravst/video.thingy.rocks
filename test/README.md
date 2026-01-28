@@ -1,10 +1,9 @@
 # Test Environment
 
-This directory contains test infrastructure for the NTN Video Streaming system.
+This directory contains test infrastructure for the Video Streaming system.
 
 ## Contents
 
-- `deploy-test-stack.ts` - Script to deploy CDK stack to test AWS account
 - `udp-packet-generator.ts` - UDP packet generator for testing video ingestion
 - `fixtures/` - Test data and fixtures
 - `integration/` - Integration test scripts
@@ -14,55 +13,90 @@ This directory contains test infrastructure for the NTN Video Streaming system.
 
 ## Quick Start
 
-### 1. Deploy Test Stack
+### 1. Deploy or update the stack
 
 ```bash
-npm run test:deploy
+npm run cdk:prod:deploy
 ```
 
-### 2. Run Task 7.2: UDP to S3 Flow Test
+### 2. View EC2 Instance Logs
+
+After deployment, you can view the CloudWatch Logs to debug issues:
+
+```bash
+# View application logs (systemd journal for video-streaming service)
+./scripts/view-logs.sh /video-streaming/application
+
+# View system logs
+./scripts/view-logs.sh /video-streaming/system
+
+# View cloud-init logs (useful for debugging startup issues)
+./scripts/view-logs.sh /video-streaming/cloud-init
+```
+
+Or use AWS CLI directly:
+
+```bash
+# List all log groups
+aws logs describe-log-groups --log-group-name-prefix "/video-streaming"
+
+# Tail application logs
+aws logs tail /video-streaming/application --follow --format short
+
+# View last hour of logs
+aws logs tail /video-streaming/application --since 1h --format short
+```
+
+### 3. Run Task 7.2: UDP to S3 Flow Test
 
 ```bash
 # Get stack outputs
-export TEST_BUCKET_NAME=$(aws cloudformation describe-stacks \
-  --stack-name NTNVideoStreamingTest \
+export BUCKET_NAME=$(aws cloudformation describe-stacks \
+  --stack-name video-streaming \
   --query "Stacks[0].Outputs[?OutputKey=='VideoBucketName'].OutputValue" \
   --output text)
 
-export TEST_TABLE_NAME=$(aws cloudformation describe-stacks \
-  --stack-name NTNVideoStreamingTest \
+export TABLE_NAME=$(aws cloudformation describe-stacks \
+  --stack-name video-streaming \
   --query "Stacks[0].Outputs[?OutputKey=='DynamoDBTableName'].OutputValue" \
   --output text)
 
-export TEST_EC2_IP=$(aws ec2 describe-instances \
-  --filters "Name=tag:aws:autoscaling:groupName,Values=*UDPListenerASG*" \
+export ASG_NAME=$(aws autoscaling describe-auto-scaling-groups --query "AutoScalingGroups[?contains(AutoScalingGroupName, 'UDPListenerASG')].AutoScalingGroupName" --output text)
+export EC2_IP=$(aws ec2 describe-instances \
+  --filters "Name=tag:aws:autoscaling:groupName,Values=$ASG_NAME" \
             "Name=instance-state-name,Values=running" \
   --query "Reservations[0].Instances[0].PublicIpAddress" \
   --output text)
 
+# Output
+
+echo $BUCKET_NAME
+echo $TABLE_NAME
+echo $EC2_IP
+
 # Run test
-npm run test:task-7.2 -- \
-  --host $TEST_EC2_IP \
-  --bucket-name $TEST_BUCKET_NAME \
-  --table-name $TEST_TABLE_NAME \
+npm run test:udp-to-s3 -- \
+  --host $EC2_IP \
+  --bucket-name $BUCKET_NAME \
+  --table-name $TABLE_NAME \
   --port 5000
 ```
 
-### 3. Run Task 7.4: Offline/Online Transitions Test
+### 4. Run Task 7.4: Offline/Online Transitions Test
 
 ```bash
 # Get CloudFront URL (in addition to above exports)
-export TEST_CLOUDFRONT_URL=$(aws cloudformation describe-stacks \
-  --stack-name NTNVideoStreamingTest \
+export CLOUDFRONT_URL=$(aws cloudformation describe-stacks \
+  --stack-name video-streaming \
   --query "Stacks[0].Outputs[?OutputKey=='CloudFrontURL'].OutputValue" \
   --output text)
 
 # Run test
-npm run test:task-7.4 -- \
-  --host $TEST_EC2_IP \
-  --bucket-name $TEST_BUCKET_NAME \
-  --table-name $TEST_TABLE_NAME \
-  --cloudfront-url $TEST_CLOUDFRONT_URL \
+npm run test:offline-online-transition -- \
+  --host $EC2_IP \
+  --bucket-name $BUCKET_NAME \
+  --table-name $TABLE_NAME \
+  --cloudfront-url $CLOUDFRONT_URL \
   --port 5000
 ```
 
@@ -96,26 +130,24 @@ Options:
 
 ### Run Integration Tests
 
-#### Task 7.2: UDP to S3 Storage Flow
+#### UDP to S3 Storage Flow
 
 Tests the complete end-to-end flow from UDP packet reception to S3 storage.
 
 ```bash
-npm run test:task-7.2 -- \
+npm run test:udp-to-s3 -- \
   --host <EC2_IP> \
   --bucket-name <BUCKET_NAME> \
   --table-name <TABLE_NAME> \
   --port 5000
 ```
 
-See `TASK-7.2-EXECUTION-GUIDE.md` for detailed instructions.
+#### Offline/Online Transitions
 
-#### Task 7.4: Offline/Online Transitions
-
-Tests the system's handling of intermittent NTNCam connectivity.
+Tests the system's handling of intermittent Cat1bisCam connectivity.
 
 ```bash
-npm run test:task-7.4 -- \
+npm run test:offline-online-transition -- \
   --host <EC2_IP> \
   --bucket-name <BUCKET_NAME> \
   --table-name <TABLE_NAME> \
@@ -123,10 +155,8 @@ npm run test:task-7.4 -- \
   --port 5000
 ```
 
-See `TASK-7.4-EXECUTION-GUIDE.md` for detailed instructions.
-
-**Note:** Task 7.4 takes approximately 2-3 minutes to complete due to the
-inactivity timeout requirement.
+**Note:** This takes approximately 2-3 minutes to complete due to the inactivity
+timeout requirement.
 
 ## Test Fixtures
 
@@ -141,6 +171,6 @@ The `fixtures/` directory contains:
 
 Set these environment variables for testing:
 
-- `AWS_REGION` - AWS region for deployment (default: us-east-1)
-- `TEST_STACK_NAME` - Name for test stack (default: NTNVideoStreamingTest)
+- `AWS_REGION` - AWS region for deployment (default: eu-central-1)
+- `TEST_STACK_NAME` - Name for test stack (default: video-streaming)
 - `TEST_UDP_HOST` - Target host for UDP packets (default: localhost)

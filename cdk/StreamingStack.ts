@@ -2,6 +2,7 @@ import {
 	CfnOutput,
 	Duration,
 	RemovalPolicy,
+	Size,
 	Stack,
 	type Environment,
 } from 'aws-cdk-lib'
@@ -14,6 +15,7 @@ import * as cognito from 'aws-cdk-lib/aws-cognito'
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb'
 import * as ec2 from 'aws-cdk-lib/aws-ec2'
 import * as iam from 'aws-cdk-lib/aws-iam'
+import * as logs from 'aws-cdk-lib/aws-logs'
 import * as s3 from 'aws-cdk-lib/aws-s3'
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment'
 import * as sns from 'aws-cdk-lib/aws-sns'
@@ -62,6 +64,25 @@ export class StreamingStack extends Stack {
 				},
 			],
 			availabilityZones: Array.from(props?.availabilityZones ?? []).slice(0, 2),
+		})
+
+		// Create CloudWatch Log Groups for EC2 instances
+		new logs.LogGroup(this, 'ApplicationLogGroup', {
+			logGroupName: `${this.stackName}/application`,
+			retention: logs.RetentionDays.ONE_WEEK,
+			removalPolicy: RemovalPolicy.DESTROY,
+		})
+
+		new logs.LogGroup(this, 'SystemLogGroup', {
+			logGroupName: `${this.stackName}/system`,
+			retention: logs.RetentionDays.ONE_WEEK,
+			removalPolicy: RemovalPolicy.DESTROY,
+		})
+
+		new logs.LogGroup(this, 'CloudInitLogGroup', {
+			logGroupName: `${this.stackName}/cloud-init`,
+			retention: logs.RetentionDays.ONE_WEEK,
+			removalPolicy: RemovalPolicy.DESTROY,
 		})
 
 		// Task 2.2: Define S3 buckets
@@ -191,7 +212,7 @@ export class StreamingStack extends Stack {
 					'logs:DescribeLogStreams',
 				],
 				resources: [
-					`arn:aws:logs:${this.region}:${this.account}:log-group:/ntn-video-streaming/*`,
+					`arn:aws:logs:${this.region}:${this.account}:log-group:/video-streaming/*`,
 				],
 			}),
 		)
@@ -213,9 +234,15 @@ export class StreamingStack extends Stack {
 		const backendPath = join(__dirname, '..', 'backend')
 
 		new s3deploy.BucketDeployment(this, 'DeployBackendCode', {
-			sources: [s3deploy.Source.asset(backendPath)],
+			sources: [
+				s3deploy.Source.asset(backendPath, {
+					exclude: ['node_modules', 'node_modules/**/*'],
+				}),
+			],
 			destinationBucket: this.codeBucket,
 			destinationKeyPrefix: 'backend/',
+			memoryLimit: 512,
+			ephemeralStorageSize: Size.mebibytes(1024),
 		})
 
 		// Task 6.2: Add EC2 Auto Scaling Group
@@ -232,14 +259,14 @@ export class StreamingStack extends Stack {
 		// Add code download commands to user data
 		const codeDownloadCommands = `
 # Download application code from S3
-aws s3 sync s3://${this.codeBucket.bucketName}/backend/ /opt/ntn-video-streaming/ --region ${this.region}
+aws s3 sync s3://${this.codeBucket.bucketName}/backend/ /opt/video-streaming/ --region ${this.region}
 
 # Install dependencies
-cd /opt/ntn-video-streaming
+cd /opt/video-streaming
 npm install --production
 
 # Start the service
-systemctl start ntn-video-streaming.service
+systemctl start video-streaming.service
 `
 
 		userDataScript += codeDownloadCommands
@@ -257,6 +284,7 @@ systemctl start ntn-video-streaming.service
 			securityGroup: this.udpSecurityGroup,
 			userData,
 			requireImdsv2: true,
+			associatePublicIpAddress: true,
 		})
 
 		// Create Auto Scaling Group with Launch Template
@@ -265,6 +293,9 @@ systemctl start ntn-video-streaming.service
 			'UDPListenerASG',
 			{
 				vpc: this.vpc,
+				vpcSubnets: {
+					subnetType: ec2.SubnetType.PUBLIC,
+				},
 				launchTemplate,
 				minCapacity: 2,
 				maxCapacity: 10,
@@ -281,30 +312,6 @@ systemctl start ntn-video-streaming.service
 			.defaultChild as autoscaling.CfnAutoScalingGroup
 		cfnAsg.healthCheckType = 'EC2'
 		cfnAsg.healthCheckGracePeriod = Duration.minutes(5).toSeconds()
-
-		// Configure target tracking based on network throughput
-		// Use CloudWatch metric for network in
-		const networkInMetric = new cloudwatch.Metric({
-			namespace: 'AWS/EC2',
-			metricName: 'NetworkIn',
-			dimensionsMap: {
-				AutoScalingGroupName: this.autoScalingGroup.autoScalingGroupName,
-			},
-			statistic: 'Average',
-			period: Duration.minutes(1),
-		})
-
-		// Create step scaling policy without cooldown (not valid for step scaling)
-		new autoscaling.StepScalingPolicy(this, 'NetworkInScalingPolicy', {
-			autoScalingGroup: this.autoScalingGroup,
-			metric: networkInMetric,
-			scalingSteps: [
-				{ upper: 10000000, change: -1 }, // Scale down if < 10MB/s
-				{ lower: 50000000, change: +1 }, // Scale up if > 50MB/s
-				{ lower: 100000000, change: +2 }, // Scale up faster if > 100MB/s
-			],
-			adjustmentType: autoscaling.AdjustmentType.CHANGE_IN_CAPACITY,
-		})
 
 		// Task 6.4: CloudFront distribution for video delivery with HLS optimization
 		this.distribution = new cloudfront.Distribution(
@@ -330,7 +337,7 @@ systemctl start ntn-video-streaming.service
 						viewerProtocolPolicy:
 							cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
 						cachePolicy: new cloudfront.CachePolicy(this, 'HLSManifestCache', {
-							cachePolicyName: 'HLSManifestCachePolicy',
+							cachePolicyName: `${Stack.of(this).stackName}-HLSManifestCachePolicy`,
 							comment: 'Cache policy for HLS manifest files',
 							defaultTtl: Duration.seconds(2),
 							minTtl: Duration.seconds(0),
@@ -352,7 +359,7 @@ systemctl start ntn-video-streaming.service
 						viewerProtocolPolicy:
 							cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
 						cachePolicy: new cloudfront.CachePolicy(this, 'HLSSegmentCache', {
-							cachePolicyName: 'HLSSegmentCachePolicy',
+							cachePolicyName: `${Stack.of(this).stackName}-HLSSegmentCachePolicy`,
 							comment: 'Cache policy for HLS video segments',
 							defaultTtl: Duration.seconds(86400), // 24 hours
 							minTtl: Duration.seconds(0),
@@ -374,7 +381,7 @@ systemctl start ntn-video-streaming.service
 						viewerProtocolPolicy:
 							cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
 						cachePolicy: new cloudfront.CachePolicy(this, 'SnapshotCache', {
-							cachePolicyName: 'SnapshotCachePolicy',
+							cachePolicyName: `${Stack.of(this).stackName}-SnapshotCachePolicy`,
 							comment: 'Cache policy for stream snapshots',
 							defaultTtl: Duration.seconds(60),
 							minTtl: Duration.seconds(0),
@@ -389,7 +396,7 @@ systemctl start ntn-video-streaming.service
 						cachedMethods: cloudfront.CachedMethods.CACHE_GET_HEAD,
 					},
 				},
-				comment: 'CloudFront distribution for NTN video streaming',
+				comment: 'CloudFront distribution for Video Streaming',
 				enableLogging: true,
 				priceClass: cloudfront.PriceClass.PRICE_CLASS_100,
 			},
@@ -398,16 +405,16 @@ systemctl start ntn-video-streaming.service
 		// Task 6.5: Configure CloudWatch alarms
 		// Create SNS topic for alarm notifications
 		const alarmTopic = new sns.Topic(this, 'AlarmTopic', {
-			displayName: 'NTN Video Streaming Alarms',
-			topicName: 'ntn-video-streaming-alarms',
+			displayName: 'Video Streaming Alarms',
+			topicName: 'video-streaming-alarms',
 		})
 
 		// Alarm for high packet loss (>5%)
 		const packetLossAlarm = new cloudwatch.Alarm(this, 'PacketLossAlarm', {
-			alarmName: 'NTN-HighPacketLoss',
+			alarmName: `${Stack.of(this).stackName}-HighPacketLoss`,
 			alarmDescription: 'Alarm when packet loss exceeds 5% for any stream',
 			metric: new cloudwatch.Metric({
-				namespace: 'NTN/VideoStreaming',
+				namespace: Stack.of(this).stackName,
 				metricName: 'PacketLossRate',
 				statistic: 'Average',
 				period: Duration.minutes(5),
@@ -424,10 +431,10 @@ systemctl start ntn-video-streaming.service
 			this,
 			'FFmpegFailureAlarm',
 			{
-				alarmName: 'NTN-FFmpegFailures',
+				alarmName: `${Stack.of(this).stackName}-FFmpegFailures`,
 				alarmDescription: 'Alarm when FFmpeg process failures exceed threshold',
 				metric: new cloudwatch.Metric({
-					namespace: 'NTN/VideoStreaming',
+					namespace: Stack.of(this).stackName,
 					metricName: 'FFmpegProcessFailures',
 					statistic: 'Sum',
 					period: Duration.minutes(5),
@@ -448,10 +455,10 @@ systemctl start ntn-video-streaming.service
 			this,
 			'S3UploadFailureAlarm',
 			{
-				alarmName: 'NTN-S3UploadFailures',
+				alarmName: `${Stack.of(this).stackName}-S3UploadFailures`,
 				alarmDescription: 'Alarm when S3 upload failures exceed threshold',
 				metric: new cloudwatch.Metric({
-					namespace: 'NTN/VideoStreaming',
+					namespace: Stack.of(this).stackName,
 					metricName: 'S3UploadFailures',
 					statistic: 'Sum',
 					period: Duration.minutes(5),
@@ -472,7 +479,7 @@ systemctl start ntn-video-streaming.service
 			this,
 			'DynamoThrottleAlarm',
 			{
-				alarmName: 'NTN-DynamoDBThrottling',
+				alarmName: `${Stack.of(this).stackName}-DynamoDBThrottling`,
 				alarmDescription: 'Alarm when DynamoDB requests are throttled',
 				metric: this.streamTable.metricUserErrors({
 					statistic: 'Sum',
@@ -501,7 +508,7 @@ systemctl start ntn-video-streaming.service
 		})
 
 		const cpuAlarm = new cloudwatch.Alarm(this, 'CPUAlarm', {
-			alarmName: 'NTN-HighCPUUsage',
+			alarmName: `${Stack.of(this).stackName}-HighCPUUsage`,
 			alarmDescription: 'Alarm when EC2 CPU usage exceeds 80%',
 			metric: cpuMetric,
 			threshold: 80,
@@ -540,6 +547,11 @@ systemctl start ntn-video-streaming.service
 		new CfnOutput(this, 'AlarmTopicArn', {
 			value: alarmTopic.topicArn,
 			description: 'SNS topic ARN for CloudWatch alarms',
+		})
+
+		new CfnOutput(this, 'LogGroups', {
+			value: `${this.stackName}/*`,
+			description: 'CloudWatch Logs log groups for EC2 instances',
 		})
 	}
 }

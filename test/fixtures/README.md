@@ -1,7 +1,6 @@
 # Test Fixtures
 
-This directory contains test data and fixtures for the NTN Video Streaming
-system.
+This directory contains test data and fixtures for the Video Streaming system.
 
 ## Contents
 

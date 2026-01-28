@@ -36,7 +36,7 @@ const { values } = parseArgs({
 		host: { type: 'string', default: 'localhost' },
 		'bucket-name': { type: 'string' },
 		'table-name': { type: 'string' },
-		region: { type: 'string', default: 'us-east-1' },
+		region: { type: 'string', default: 'eu-central-1' },
 		'packet-count': { type: 'string', default: '100' },
 		timeout: { type: 'string', default: '60' },
 	},
@@ -44,18 +44,18 @@ const { values } = parseArgs({
 
 const port = Number.parseInt(values.port ?? '5000', 10)
 const host = values.host ?? 'localhost'
-const bucketName = values['bucket-name']
-const tableName = values['table-name']
-const region = values.region ?? 'us-east-1'
+const bucketName = values['bucket-name'] ?? ''
+const tableName = values['table-name'] ?? ''
+const region = values.region ?? 'eu-central-1'
 const packetCount = Number.parseInt(values['packet-count'] ?? '100', 10)
 const timeout = Number.parseInt(values.timeout ?? '60', 10) * 1000
 
-if (bucketName === undefined || bucketName === null || bucketName === "") {
+if (bucketName === '') {
 	console.error('Error: --bucket-name is required')
 	process.exit(1)
 }
 
-if (tableName === undefined || tableName === null || tableName === "") {
+if (tableName === '') {
 	console.error('Error: --table-name is required')
 	process.exit(1)
 }
@@ -149,7 +149,11 @@ const checkDynamoDBMetadata = async (): Promise<void> => {
 			}),
 		)
 
-		if (response.Item === undefined || response.Item === null || Object.keys(response.Item).length === 0) {
+		if (
+			response.Item === undefined ||
+			response.Item === null ||
+			Object.keys(response.Item).length === 0
+		) {
 			throw new Error('Stream metadata not found in DynamoDB')
 		}
 
@@ -293,7 +297,11 @@ const checkHLSManifests = async (): Promise<void> => {
 		const masterContent = await masterResponse.Body?.transformToString()
 		console.log('  ✓ Master manifest found')
 
-		if (masterContent) {
+		if (
+			masterContent !== undefined &&
+			masterContent !== null &&
+			masterContent !== ''
+		) {
 			const lines = masterContent.split('\n').length
 			console.log(`    - ${lines} lines`)
 		}
@@ -352,7 +360,12 @@ const printResults = (): void => {
 
 	for (const result of results) {
 		const status = result.passed ? '✓ PASS' : '✗ FAIL'
-		const duration = result.duration ? ` (${result.duration}ms)` : ''
+		const duration =
+			result.duration !== undefined &&
+			result.duration !== null &&
+			result.duration !== 0
+				? ` (${result.duration}ms)`
+				: ''
 		console.log(`${status} ${result.name}${duration}`)
 		console.log(`       ${result.message}`)
 

@@ -32,7 +32,7 @@ export class S3UploadService extends EventEmitter {
 	constructor(config: S3UploadConfig) {
 		super()
 		this.client = new S3Client({
-			region: config.region ?? 'us-east-1',
+			region: config.region ?? 'eu-central-1',
 		})
 		this.bucket = config.bucket
 

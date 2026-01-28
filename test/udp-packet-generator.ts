@@ -2,8 +2,8 @@
 /**
  * UDP Packet Generator for Testing
  *
- * Generates UDP video packets for testing the NTN Video Streaming system.
- * Simulates an NTNCam device sending MPEG-TS video data.
+ * Generates UDP video packets for testing the Video Streaming system.
+ * Simulates an Cat1bisCam device sending MPEG-TS video data.
  *
  * Usage:
  *   node --experimental-transform-types test/udp-packet-generator.ts [options]
@@ -44,9 +44,10 @@ const pattern = values.pattern ?? 'color-bars'
 // Calculate packet interval from bitrate if not specified
 // bitrate (kbps) = (packetSize * 8 * 1000) / (interval * 1000)
 // interval (ms) = (packetSize * 8) / bitrate
-const interval = values.interval
-	? Number.parseInt(values.interval, 10)
-	: Math.floor((packetSize * 8) / bitrate)
+const interval =
+	values.interval !== undefined && values.interval !== null
+		? Number.parseInt(values.interval, 10)
+		: Math.floor((packetSize * 8) / bitrate)
 
 // Validate inputs
 if (port < 5000 || port > 5009) {
@@ -102,7 +103,10 @@ const startTime = Date.now()
  * - Continuity counter: 4 bits
  * - Payload: remaining bytes
  */
-const generateMpegTsPacket = (sequenceNumber: number, pattern: string): Buffer => {
+const generateMpegTsPacket = (
+	sequenceNumber: number,
+	pattern: string,
+): Buffer => {
 	const packet = Buffer.alloc(packetSize)
 
 	// MPEG-TS sync byte

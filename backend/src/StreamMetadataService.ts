@@ -28,7 +28,7 @@ export class StreamMetadataService {
 
 	constructor(config: StreamMetadataServiceConfig) {
 		const client = new DynamoDBClient({
-			region: config.region ?? 'us-east-1',
+			region: config.region ?? 'eu-central-1',
 		})
 		this.docClient = DynamoDBDocumentClient.from(client)
 		this.tableName = config.tableName

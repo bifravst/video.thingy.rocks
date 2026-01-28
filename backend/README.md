@@ -1,13 +1,13 @@
-# NTN Video Streaming Backend
+# Video Streaming Backend
 
 UDP listener and stream processing service for Non-Terrestrial Network Connected
 Cameras.
 
 ## Overview
 
-This service receives UDP video streams from NTNCam devices on ports 5000-5009,
-buffers the data, tracks stream state, and integrates with AWS services
-(DynamoDB, S3) for metadata and storage.
+This service receives UDP video streams from Cat1bisCam devices on ports
+5000-5009, buffers the data, tracks stream state, and integrates with AWS
+services (DynamoDB, S3) for metadata and storage.
 
 ## Components Implemented
 
@@ -74,7 +74,7 @@ Environment variables:
 - `OUTPUT_DIR` - Directory for buffered video files (default:
   `/tmp/video-streams`)
 - `DYNAMODB_TABLE_NAME` - DynamoDB table name (default: `StreamMetadata`)
-- `AWS_REGION` - AWS region (default: `us-east-1`)
+- `AWS_REGION` - AWS region (default: `eu-central-1`)
 
 ## Running
 

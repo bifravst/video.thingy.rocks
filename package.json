@@ -9,8 +9,8 @@
     "test:deploy": "node --experimental-transform-types --no-warnings ./test/deploy-test-stack.ts",
     "test:generate-packets": "node --experimental-transform-types --no-warnings ./test/udp-packet-generator.ts",
     "test:integration": "node --experimental-transform-types --no-warnings ./test/integration/test-udp-to-s3.ts",
-    "test:task-7.2": "node --experimental-transform-types --no-warnings ./test/integration/udp-to-s3-flow.spec.ts",
-    "test:task-7.4": "node --experimental-transform-types --no-warnings ./test/integration/offline-online-transitions.spec.ts",
+    "test:udp-to-s3": "node --experimental-transform-types --no-warnings ./test/integration/udp-to-s3-flow.spec.ts",
+    "test:offline-online-transition": "node --experimental-transform-types --no-warnings ./test/integration/offline-online-transitions.spec.ts",
     "prepare": "husky && check-node-version --package",
     "cdk:bootstrap": "node --experimental-transform-types --no-warnings ./cdk/bootstrap.ts",
     "cdk:prod:deploy": "node --experimental-transform-types --no-warnings ./cdk/deploy-to-production.ts",
@@ -18,7 +18,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/bifravst/thingy-rocks-cloud-ntn-video.git"
+    "url": "git+https://github.com/bifravst/thingy-rocks-cloud-video.git"
   },
   "devDependencies": {
     "@aws-cdk/toolkit-lib": "^1.14.1",

@@ -31,7 +31,7 @@ export class MetricsService {
 			...config,
 		}
 		this.client = new CloudWatchClient({
-			region: this.config.region ?? process.env.AWS_REGION ?? 'us-east-1',
+			region: this.config.region ?? process.env.AWS_REGION ?? 'eu-central-1',
 		})
 	}
 

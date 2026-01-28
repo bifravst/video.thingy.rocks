@@ -1,7 +1,7 @@
 {
   "name": "video.thingy.rocks-backend",
   "version": "0.0.0-development",
-  "description": "NTN Video Streaming Backend - UDP listener and transcoding services",
+  "description": "Video Streaming Backend - UDP listener and transcoding services",
   "type": "module",
   "scripts": {
     "test": "node --no-warnings --experimental-transform-types --test \"!(node_modules)/**/*.spec.ts\""
