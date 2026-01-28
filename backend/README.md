@@ -73,7 +73,7 @@ Environment variables:
 
 - `OUTPUT_DIR` - Directory for buffered video files (default:
   `/tmp/video-streams`)
-- `DYNAMODB_TABLE_NAME` - DynamoDB table name (default: `StreamMetadata`)
+- `TABLE_NAME` - DynamoDB table name (default: `StreamMetadata`)
 - `AWS_REGION` - AWS region (default: `eu-central-1`)
 
 ## Running

@@ -119,11 +119,13 @@ export class SnapshotCapture extends EventEmitter {
 	private async extractIFrame(): Promise<Buffer> {
 		return new Promise((resolve, reject) => {
 			const args = [
+				'-f',
+				'mpegts', // Specify input format
 				'-i',
 				'pipe:0', // Read from stdin
 				'-vf',
 				"select='eq(pict_type,I)'", // Select I-frames only
-				'-vsync',
+				'-fps_mode',
 				'vfr', // Variable frame rate
 				'-frames:v',
 				'1', // Extract only 1 frame

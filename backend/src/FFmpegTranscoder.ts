@@ -1,5 +1,9 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { EventEmitter } from 'node:events'
+import { watch } from 'node:fs'
+import { mkdir, readFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { S3UploadService } from './S3UploadService.ts'
 
 export type BitrateProfile = {
 	name: string // "1080p", "720p", "480p", "360p"
@@ -18,6 +22,7 @@ export type TranscodingConfig = {
 	hlsProfiles: BitrateProfile[]
 	segmentDuration: number // seconds
 	s3Bucket: string
+	localOutputDir: string // Local directory for FFmpeg output
 }
 
 export type TranscodingStatus = {
@@ -33,6 +38,10 @@ export class FFmpegTranscoder extends EventEmitter {
 	private readonly status: TranscodingStatus
 	private readonly maxRetries = 3
 	private retryTimeout?: NodeJS.Timeout
+	private readonly s3UploadService: S3UploadService
+	private readonly fileWatchers: Map<string, ReturnType<typeof watch>> =
+		new Map()
+	private readonly uploadedFiles: Set<string> = new Set()
 
 	// Default bitrate profiles
 	static readonly DEFAULT_PROFILES: BitrateProfile[] = [
@@ -70,6 +79,9 @@ export class FFmpegTranscoder extends EventEmitter {
 			currentSegment: 0,
 			retryCount: 0,
 		}
+		this.s3UploadService = new S3UploadService({
+			bucket: config.s3Bucket,
+		})
 	}
 
 	async start(): Promise<void> {
@@ -81,6 +93,12 @@ export class FFmpegTranscoder extends EventEmitter {
 		}
 
 		try {
+			// Create local output directories
+			await this.createOutputDirectories()
+
+			// Set up file watchers for automatic S3 upload
+			await this.setupFileWatchers()
+
 			const command = this.buildFFmpegCommand()
 			console.log(
 				`[FFmpegTranscoder] Starting FFmpeg for port ${this.config.port}`,
@@ -115,6 +133,15 @@ export class FFmpegTranscoder extends EventEmitter {
 			clearTimeout(this.retryTimeout)
 			this.retryTimeout = undefined
 		}
+
+		// Stop file watchers
+		for (const watcher of this.fileWatchers.values()) {
+			watcher.close()
+		}
+		this.fileWatchers.clear()
+
+		// Stop S3 upload service
+		await this.s3UploadService.stop()
 
 		if (!this.process) {
 			return
@@ -184,58 +211,40 @@ export class FFmpegTranscoder extends EventEmitter {
 	buildFFmpegCommand(): string[] {
 		const args: string[] = []
 
-		// Input from stdin
+		// Force overwrite without asking
+		args.push('-y')
+
+		// Input from stdin (MPEG-TS format)
+		args.push('-f', 'mpegts')
 		args.push('-i', 'pipe:0')
 
-		// Raw stream output (copy codec, no transcoding)
-		args.push('-c:v', 'copy')
-		args.push('-f', 'segment')
-		args.push('-segment_time', this.config.segmentDuration.toString())
-		args.push('-segment_format', 'mpegts')
-		args.push(
-			'-segment_list',
-			`s3://${this.config.s3Bucket}/${this.config.outputPaths.raw}/playlist.m3u8`,
-		)
-		args.push(
-			`s3://${this.config.s3Bucket}/${this.config.outputPaths.raw}/segment_%05d.ts`,
-		)
+		// Output 1: HLS with multiple bitrate profiles
+		for (const profile of this.config.hlsProfiles) {
+			const profileDir = join(
+				this.config.localOutputDir,
+				'hls',
+				this.config.port.toString(),
+				profile.name,
+			)
 
-		// Create filter complex for splitting video into multiple outputs
-		const splitOutputs = this.config.hlsProfiles
-			.map((_, i) => `[v${i}]`)
-			.join('')
-		args.push(
-			'-filter_complex',
-			`[0:v]split=${this.config.hlsProfiles.length}${splitOutputs}`,
-		)
-
-		// HLS outputs for each profile
-		for (let i = 0; i < this.config.hlsProfiles.length; i++) {
-			const profile = this.config.hlsProfiles[i]
-			if (!profile) continue
-
-			args.push('-map', `[v${i}]`)
+			args.push('-map', '0:v')
+			args.push('-map', '0:a?') // Optional audio
+			args.push('-c:v', 'libx264')
+			args.push('-preset', 'veryfast') // Fast encoding for low latency
+			args.push('-tune', 'zerolatency')
 			args.push('-s', profile.resolution)
 			args.push('-b:v', profile.videoBitrate)
-			args.push('-c:v', 'libx264')
-			args.push('-preset', 'fast')
+			args.push('-maxrate', profile.videoBitrate)
+			args.push('-bufsize', `${parseInt(profile.videoBitrate) * 2}k`)
+			args.push('-c:a', 'aac')
+			args.push('-b:a', profile.audioBitrate)
 			args.push('-f', 'hls')
 			args.push('-hls_time', this.config.segmentDuration.toString())
 			args.push('-hls_list_size', '10')
-			args.push('-hls_flags', 'delete_segments')
-			args.push(
-				`s3://${this.config.s3Bucket}/${this.config.outputPaths.hls}/${profile.name}/playlist.m3u8`,
-			)
+			args.push('-hls_flags', 'delete_segments+append_list')
+			args.push('-hls_segment_filename', `${profileDir}/segment_%05d.ts`)
+			args.push(`${profileDir}/playlist.m3u8`)
 		}
-
-		// Snapshot extraction (I-frames only)
-		args.push('-vf', "select='eq(pict_type,I)'")
-		args.push('-vsync', 'vfr')
-		args.push('-frames:v', '1')
-		args.push('-update', '1')
-		args.push(
-			`s3://${this.config.s3Bucket}/${this.config.outputPaths.snapshot}/last_frame.jpg`,
-		)
 
 		return args
 	}
@@ -314,5 +323,146 @@ export class FFmpegTranscoder extends EventEmitter {
 				)
 			})
 		}, backoffMs)
+	}
+
+	private async createOutputDirectories(): Promise<void> {
+		const dirs = [
+			join(this.config.localOutputDir, 'hls', this.config.port.toString()),
+			join(
+				this.config.localOutputDir,
+				'snapshots',
+				this.config.port.toString(),
+			),
+		]
+
+		// Create profile directories
+		for (const profile of this.config.hlsProfiles) {
+			dirs.push(
+				join(
+					this.config.localOutputDir,
+					'hls',
+					this.config.port.toString(),
+					profile.name,
+				),
+			)
+		}
+
+		for (const dir of dirs) {
+			await mkdir(dir, { recursive: true })
+		}
+
+		console.log(
+			`[FFmpegTranscoder] Created output directories for port ${this.config.port}`,
+		)
+	}
+
+	private async setupFileWatchers(): Promise<void> {
+		// Watch HLS directories for new segments and playlists
+		for (const profile of this.config.hlsProfiles) {
+			const profileDir = join(
+				this.config.localOutputDir,
+				'hls',
+				this.config.port.toString(),
+				profile.name,
+			)
+
+			const watcher = watch(profileDir, (eventType, filename) => {
+				if (
+					filename === null ||
+					filename === undefined ||
+					filename === '' ||
+					filename.endsWith('.tmp')
+				)
+					return
+
+				const filePath = join(profileDir, filename)
+
+				// Avoid uploading the same file multiple times
+				if (this.uploadedFiles.has(filePath)) return
+
+				void (async () => {
+					try {
+						// Wait a bit for file to be fully written
+						await new Promise((resolve) => setTimeout(resolve, 1000))
+
+						const fileData = await readFile(filePath)
+						const s3Key = `${this.config.outputPaths.hls}/${profile.name}/${filename}`
+
+						await this.s3UploadService.uploadData(fileData, s3Key, {
+							contentType: filename.endsWith('.m3u8')
+								? 'application/vnd.apple.mpegurl'
+								: 'video/mp2t',
+							receptionTimestamp: new Date(),
+						})
+
+						this.uploadedFiles.add(filePath)
+
+						console.log(
+							`[FFmpegTranscoder] Uploaded ${filename} for port ${this.config.port} profile ${profile.name}`,
+						)
+
+						// Clean up old uploaded files from tracking set
+						if (this.uploadedFiles.size > 1000) {
+							const toDelete = Array.from(this.uploadedFiles).slice(0, 500)
+							for (const path of toDelete) {
+								this.uploadedFiles.delete(path)
+							}
+						}
+					} catch (error) {
+						console.error(
+							`[FFmpegTranscoder] Error uploading ${filename}:`,
+							error,
+						)
+					}
+				})()
+			})
+
+			this.fileWatchers.set(profileDir, watcher)
+		}
+
+		// Watch snapshot directory
+		const snapshotDir = join(
+			this.config.localOutputDir,
+			'snapshots',
+			this.config.port.toString(),
+		)
+
+		const snapshotWatcher = watch(snapshotDir, (eventType, filename) => {
+			if (
+				filename === null ||
+				filename === undefined ||
+				filename === '' ||
+				!filename.endsWith('.jpg')
+			)
+				return
+
+			const filePath = join(snapshotDir, filename)
+
+			void (async () => {
+				try {
+					await new Promise((resolve) => setTimeout(resolve, 100))
+
+					const fileData = await readFile(filePath)
+					const s3Key = `${this.config.outputPaths.snapshot}/${filename}`
+
+					await this.s3UploadService.uploadData(fileData, s3Key, {
+						contentType: 'image/jpeg',
+						receptionTimestamp: new Date(),
+					})
+
+					console.log(
+						`[FFmpegTranscoder] Uploaded snapshot for port ${this.config.port}`,
+					)
+				} catch (error) {
+					console.error(`[FFmpegTranscoder] Error uploading snapshot:`, error)
+				}
+			})()
+		})
+
+		this.fileWatchers.set(snapshotDir, snapshotWatcher)
+
+		console.log(
+			`[FFmpegTranscoder] Set up file watchers for port ${this.config.port}`,
+		)
 	}
 }

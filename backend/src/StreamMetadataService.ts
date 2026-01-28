@@ -25,6 +25,8 @@ export type StreamMetadataServiceConfig = {
 export class StreamMetadataService {
 	private readonly docClient: DynamoDBDocumentClient
 	private readonly tableName: string
+	private readonly lastUpdateTimes: Map<number, number> = new Map()
+	private readonly updateThrottleMs = 1_000 // 1 seconds
 
 	constructor(config: StreamMetadataServiceConfig) {
 		const client = new DynamoDBClient({
@@ -78,8 +80,21 @@ export class StreamMetadataService {
 	}
 
 	async updateLastPacketTime(port: number, timestamp: Date): Promise<void> {
+		// Throttle updates to max once per minute
+		const now = Date.now()
+		const lastUpdate = this.lastUpdateTimes.get(port) ?? 0
+		const timeSinceLastUpdate = now - lastUpdate
+
+		if (timeSinceLastUpdate < this.updateThrottleMs) {
+			// Skip update - too soon since last update
+			return
+		}
+
+		// Update the last update time
+		this.lastUpdateTimes.set(port, now)
+
 		const isoTimestamp = timestamp.toISOString()
-		const now = new Date().toISOString()
+		const isoNow = new Date().toISOString()
 
 		try {
 			await this.docClient.send(
@@ -90,10 +105,11 @@ export class StreamMetadataService {
 						'SET lastPacketTime = :lastPacketTime, updatedAt = :updatedAt',
 					ExpressionAttributeValues: {
 						':lastPacketTime': isoTimestamp,
-						':updatedAt': now,
+						':updatedAt': isoNow,
 					},
 				}),
 			)
+
 			console.log(
 				`[StreamMetadataService] Updated last packet time for port ${port}`,
 			)
@@ -102,6 +118,7 @@ export class StreamMetadataService {
 				`[StreamMetadataService] Error updating last packet time for port ${port}:`,
 				error,
 			)
+			this.lastUpdateTimes.delete(port)
 			throw error
 		}
 	}

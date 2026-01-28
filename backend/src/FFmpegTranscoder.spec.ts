@@ -15,26 +15,17 @@ void describe('FFmpegTranscoder', () => {
 				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
 				segmentDuration: 6,
 				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
 			}
 
 			const transcoder = new FFmpegTranscoder(config)
 			const command = transcoder.buildFFmpegCommand()
 
 			// Verify input from stdin
-			assert.strictEqual(command[0], '-i')
-			assert.strictEqual(command[1], 'pipe:0')
-
-			// Verify raw stream output
-			assert.ok(command.includes('-c:v'))
-			assert.ok(command.includes('copy'))
-			assert.ok(command.includes('-f'))
-			assert.ok(command.includes('segment'))
-
-			// Verify filter complex for splitting
-			assert.ok(command.includes('-filter_complex'))
-			const filterIndex = command.indexOf('-filter_complex')
-			const filterValue = command[filterIndex + 1]
-			assert.ok(filterValue?.includes('split=4') ?? false)
+			assert.strictEqual(command[0], '-f')
+			assert.strictEqual(command[1], 'mpegts')
+			assert.strictEqual(command[2], '-i')
+			assert.strictEqual(command[3], 'pipe:0')
 
 			// Verify HLS outputs for each profile
 			const commandStr = command.join(' ')
@@ -43,9 +34,12 @@ void describe('FFmpegTranscoder', () => {
 			assert.ok(commandStr.includes('480p'))
 			assert.ok(commandStr.includes('360p'))
 
+			// Verify local output paths
+			assert.ok(commandStr.includes('/tmp/ffmpeg-output/hls/5000'))
+
 			// Verify snapshot extraction
 			assert.ok(command.includes('-vf'))
-			assert.ok(command.includes("select='eq(pict_type,I)'"))
+			assert.ok(command.includes("select='eq(pict_type\\,I)',scale=640:360"))
 			assert.ok(command.includes('-frames:v'))
 			assert.ok(command.includes('1'))
 		})
@@ -61,6 +55,7 @@ void describe('FFmpegTranscoder', () => {
 				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
 				segmentDuration: 6,
 				s3Bucket: 'my-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
 			}
 
 			const transcoder = new FFmpegTranscoder(config)
@@ -68,10 +63,9 @@ void describe('FFmpegTranscoder', () => {
 
 			const commandStr = command.join(' ')
 
-			// Verify S3 bucket is used
-			assert.ok(commandStr.includes('s3://my-bucket/raw/5001'))
-			assert.ok(commandStr.includes('s3://my-bucket/hls/5001'))
-			assert.ok(commandStr.includes('s3://my-bucket/snapshots/5001'))
+			// Verify local output paths are used (not S3 paths)
+			assert.ok(commandStr.includes('/tmp/ffmpeg-output/hls/5001'))
+			assert.ok(commandStr.includes('/tmp/ffmpeg-output/snapshots/5001'))
 		})
 
 		void it('should use custom segment duration', () => {
@@ -85,14 +79,11 @@ void describe('FFmpegTranscoder', () => {
 				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
 				segmentDuration: 10,
 				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
 			}
 
 			const transcoder = new FFmpegTranscoder(config)
 			const command = transcoder.buildFFmpegCommand()
-
-			const segmentTimeIndex = command.indexOf('-segment_time')
-			assert.ok(segmentTimeIndex >= 0)
-			assert.strictEqual(command[segmentTimeIndex + 1], '10')
 
 			const hlsTimeIndex = command.indexOf('-hls_time')
 			assert.ok(hlsTimeIndex >= 0)
@@ -112,6 +103,7 @@ void describe('FFmpegTranscoder', () => {
 				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
 				segmentDuration: 6,
 				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
 			}
 
 			const transcoder = new FFmpegTranscoder(config)

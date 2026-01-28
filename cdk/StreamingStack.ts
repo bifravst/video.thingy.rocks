@@ -253,8 +253,8 @@ export class StreamingStack extends Stack {
 		// Replace placeholders in user data script
 		userDataScript = userDataScript
 			.replace(/__AWS_REGION__/g, this.region)
-			.replace(/__S3_BUCKET__/g, this.videoBucket.bucketName)
-			.replace(/__DYNAMODB_TABLE_NAME__/g, this.streamTable.tableName)
+			.replace(/__BUCKET_NAME__/g, this.videoBucket.bucketName)
+			.replace(/__TABLE_NAME__/g, this.streamTable.tableName)
 
 		// Add code download commands to user data
 		const codeDownloadCommands = `

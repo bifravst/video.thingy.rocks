@@ -73,8 +73,8 @@ EOF
 
 # Environment variables will be set by CDK
 # AWS_REGION - AWS region
-# S3_BUCKET - S3 bucket name for video storage
-# DYNAMODB_TABLE_NAME - DynamoDB table name
+# BUCKET_NAME - S3 bucket name for video storage
+# TABLE_NAME - DynamoDB table name
 # OUTPUT_DIR - Output directory for video streams
 
 # Create log directory for application
@@ -93,14 +93,15 @@ User=root
 WorkingDirectory=/opt/video-streaming
 Environment="NODE_ENV=production"
 Environment="AWS_REGION=__AWS_REGION__"
-Environment="S3_BUCKET=__S3_BUCKET__"
-Environment="DYNAMODB_TABLE_NAME=__DYNAMODB_TABLE_NAME__"
+Environment="BUCKET_NAME=__BUCKET_NAME__"
+Environment="TABLE_NAME=__TABLE_NAME__"
 Environment="OUTPUT_DIR=/var/video-streams"
+Environment="TRANSCODING_OUTPUT_DIR=/tmp/video-streams/transcoding"
 ExecStart=/usr/bin/node --experimental-transform-types --no-warnings src/index.ts
 Restart=always
 RestartSec=10
 StandardOutput=append:/var/log/video-streaming/application.log
-StandardError=append:/var/log/video-streaming/application.log
+StandardError=append:/var/log/video-streaming/error.log
 SyslogIdentifier=video-streaming
 
 [Install]
