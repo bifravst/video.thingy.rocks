@@ -99,6 +99,137 @@ void describe('FFmpegTranscoder', () => {
 			assert.ok(hlsTimeIndex >= 0)
 			assert.strictEqual(command[hlsTimeIndex + 1], '10')
 		})
+
+		void it('should include live streaming flags', () => {
+			const config: TranscodingConfig = {
+				port: 5000,
+				outputPaths: {
+					raw: 'raw/5000',
+					hls: 'hls/5000',
+					snapshot: 'snapshots/5000',
+				},
+				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
+				segmentDuration: 6,
+				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
+			}
+
+			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
+			const command = transcoder.buildFFmpegCommand()
+
+			// Verify hls_playlist_type is set to 'event'
+			const playlistTypeIndex = command.indexOf('-hls_playlist_type')
+			assert.ok(
+				playlistTypeIndex >= 0,
+				'hls_playlist_type flag should be present',
+			)
+			assert.strictEqual(
+				command[playlistTypeIndex + 1],
+				'event',
+				'hls_playlist_type should be set to event',
+			)
+
+			// Verify hls_flags includes required flags
+			const hlsFlagsIndex = command.indexOf('-hls_flags')
+			assert.ok(hlsFlagsIndex >= 0, 'hls_flags should be present')
+			const hlsFlags = command[hlsFlagsIndex + 1]
+			assert.ok(
+				hlsFlags !== null &&
+					hlsFlags !== undefined &&
+					hlsFlags.includes('append_list'),
+				'hls_flags should include append_list',
+			)
+			assert.ok(
+				hlsFlags !== null &&
+					hlsFlags !== undefined &&
+					hlsFlags.includes('omit_endlist'),
+				'hls_flags should include omit_endlist',
+			)
+			assert.ok(
+				hlsFlags !== null &&
+					hlsFlags !== undefined &&
+					hlsFlags.includes('delete_segments'),
+				'hls_flags should include delete_segments',
+			)
+		})
+
+		void it('should include all required live streaming flags for each profile', () => {
+			const config: TranscodingConfig = {
+				port: 5000,
+				outputPaths: {
+					raw: 'raw/5000',
+					hls: 'hls/5000',
+					snapshot: 'snapshots/5000',
+				},
+				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
+				segmentDuration: 6,
+				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
+			}
+
+			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
+			const command = transcoder.buildFFmpegCommand()
+
+			// Count occurrences of live streaming flags (should match number of profiles)
+			const playlistTypeCount = command.filter(
+				(arg) => arg === '-hls_playlist_type',
+			).length
+			const hlsFlagsCount = command.filter((arg) => arg === '-hls_flags').length
+
+			assert.strictEqual(
+				playlistTypeCount,
+				FFmpegTranscoder.DEFAULT_PROFILES.length,
+				'hls_playlist_type should be set for each profile',
+			)
+			assert.strictEqual(
+				hlsFlagsCount,
+				FFmpegTranscoder.DEFAULT_PROFILES.length,
+				'hls_flags should be set for each profile',
+			)
+		})
+
+		void it('should log the complete FFmpeg command', () => {
+			const config: TranscodingConfig = {
+				port: 5000,
+				outputPaths: {
+					raw: 'raw/5000',
+					hls: 'hls/5000',
+					snapshot: 'snapshots/5000',
+				},
+				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
+				segmentDuration: 6,
+				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
+			}
+
+			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
+
+			// Capture console.log output
+			const originalLog = console.log
+			let loggedCommand = ''
+			console.log = (message: string) => {
+				if (message.includes('Complete FFmpeg command')) {
+					loggedCommand = message
+				}
+			}
+
+			transcoder.buildFFmpegCommand()
+
+			// Restore console.log
+			console.log = originalLog
+
+			assert.ok(
+				loggedCommand.includes('Complete FFmpeg command'),
+				'Should log the complete FFmpeg command',
+			)
+			assert.ok(
+				loggedCommand.includes('ffmpeg'),
+				'Logged command should include ffmpeg',
+			)
+		})
 	})
 
 	void describe('getStatus', () => {

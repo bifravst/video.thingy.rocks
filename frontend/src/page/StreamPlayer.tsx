@@ -32,10 +32,15 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 	const [retryCount, setRetryCount] = useState(0)
 	const [isRetrying, setIsRetrying] = useState(false)
 	const [maxRetriesReached, setMaxRetriesReached] = useState(false)
+	const [playlistRefreshFailures, setPlaylistRefreshFailures] = useState(0)
+	const [playlistRefreshError, setPlaylistRefreshError] = useState<
+		string | null
+	>(null)
 
 	const videoRef = useRef<HTMLVideoElement>(null)
 	const hlsRef = useRef<Hls | null>(null)
 	const retryTimeoutRef = useRef<number | null>(null)
+	const playlistRetryTimeoutRef = useRef<number | null>(null)
 
 	// Fetch stream details
 	const fetchStreamDetail = async (isManualRetry = false) => {
@@ -91,11 +96,14 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 		}
 	}
 
-	// Cleanup retry timeout on unmount
+	// Cleanup retry timeouts on unmount
 	useEffect(() => {
 		return () => {
 			if (retryTimeoutRef.current !== null) {
 				clearTimeout(retryTimeoutRef.current)
+			}
+			if (playlistRetryTimeoutRef.current !== null) {
+				clearTimeout(playlistRetryTimeoutRef.current)
 			}
 		}
 	}, [])
@@ -169,6 +177,15 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 				capLevelToPlayerSize: true, // Limit quality based on player size
 				maxBufferLength: 30, // Maximum buffer length in seconds
 				maxMaxBufferLength: 60, // Maximum max buffer length
+				// Live streaming configuration
+				liveSyncDurationCount: 3, // Stay 3 segments behind live edge
+				liveMaxLatencyDurationCount: 10, // Max 10 segments behind
+				liveDurationInfinity: true, // Handle infinite duration streams
+				// Manifest loading retry configuration
+				manifestLoadingTimeOut: 10000, // 10 second timeout
+				manifestLoadingMaxRetry: 5, // Retry up to 5 times
+				manifestLoadingRetryDelay: 1000, // Start with 1 second delay
+				manifestLoadingMaxRetryTimeout: 64000, // Max 64 seconds between retries (exponential backoff)
 			})
 
 			hlsRef.current = hls
@@ -202,12 +219,64 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 
 			hls.on(Hls.Events.ERROR, (_event, data) => {
 				console.error('[StreamPlayer] HLS error:', data)
+
+				// Handle manifest/playlist loading errors specifically
+				if (
+					data.type === Hls.ErrorTypes.NETWORK_ERROR &&
+					data.details === 'manifestLoadError'
+				) {
+					console.log(
+						'[StreamPlayer] Playlist refresh failed, implementing retry logic',
+					)
+
+					const currentFailures = playlistRefreshFailures + 1
+					setPlaylistRefreshFailures(currentFailures)
+
+					if (currentFailures <= 5) {
+						// Exponential backoff: 1s, 2s, 4s, 8s, 16s
+						const backoffDelay = 1000 * Math.pow(2, currentFailures - 1)
+						console.log(
+							`[StreamPlayer] Retrying playlist refresh in ${backoffDelay}ms (attempt ${currentFailures}/5)`,
+						)
+
+						// Continue playing buffered segments - don't destroy the player
+						// HLS.js will automatically continue playing buffered content
+
+						// Schedule retry
+						playlistRetryTimeoutRef.current = window.setTimeout(() => {
+							if (hlsRef.current) {
+								console.log('[StreamPlayer] Retrying playlist load...')
+								hlsRef.current.startLoad()
+							}
+						}, backoffDelay)
+					} else {
+						// Max retries reached - emit error event
+						console.error(
+							'[StreamPlayer] Playlist refresh failed after 5 consecutive attempts',
+						)
+						setPlaylistRefreshError(
+							'Unable to refresh playlist after multiple attempts. The stream may be temporarily unavailable.',
+						)
+
+						// Continue playing buffered segments - don't destroy the player
+						// User can still watch what's buffered
+					}
+
+					// Don't treat this as fatal - let buffered content play
+					return
+				}
+
+				// Handle other fatal errors
 				if (data.fatal) {
 					switch (data.type) {
 						case Hls.ErrorTypes.NETWORK_ERROR:
 							console.log(
 								'[StreamPlayer] Network error, attempting to recover...',
 							)
+							// Reset playlist refresh failure count on successful recovery
+							setPlaylistRefreshFailures(0)
+							setPlaylistRefreshError(null)
+
 							// Retry loading with exponential backoff
 							setTimeout(() => {
 								if (hlsRef.current) {
@@ -239,6 +308,18 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 							)
 							break
 					}
+				}
+			})
+
+			// Listen for successful manifest loads to reset failure counter
+			hls.on(Hls.Events.MANIFEST_LOADED, () => {
+				// Reset playlist refresh failure count on successful load
+				if (playlistRefreshFailures > 0) {
+					console.log(
+						'[StreamPlayer] Playlist refresh successful, resuming normal operation',
+					)
+					setPlaylistRefreshFailures(0)
+					setPlaylistRefreshError(null)
 				}
 			})
 
@@ -398,34 +479,61 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 				{/* Video Player */}
 				<div>
 					{streamDetail.status === 'active' ? (
-						<div
-							style={{
-								position: 'relative',
-								backgroundColor: '#000',
-								borderRadius: '8px',
-								overflow: 'hidden',
-							}}
-						>
-							<video
-								ref={videoRef}
-								controls
-								style={{ width: '100%', display: 'block' }}
-							/>
+						<>
 							<div
 								style={{
-									position: 'absolute',
-									top: '1rem',
-									right: '1rem',
-									padding: '0.5rem 1rem',
-									backgroundColor: 'rgba(0, 0, 0, 0.7)',
-									color: 'white',
-									borderRadius: '4px',
-									fontSize: '0.875rem',
+									position: 'relative',
+									backgroundColor: '#000',
+									borderRadius: '8px',
+									overflow: 'hidden',
 								}}
 							>
-								LIVE
+								<video
+									ref={videoRef}
+									controls
+									style={{ width: '100%', display: 'block' }}
+								/>
+								<div
+									style={{
+										position: 'absolute',
+										top: '1rem',
+										right: '1rem',
+										padding: '0.5rem 1rem',
+										backgroundColor: 'rgba(0, 0, 0, 0.7)',
+										color: 'white',
+										borderRadius: '4px',
+										fontSize: '0.875rem',
+									}}
+								>
+									LIVE
+								</div>
 							</div>
-						</div>
+
+							{/* Playlist Refresh Error Warning */}
+							{playlistRefreshError && (
+								<div
+									style={{
+										marginTop: '1rem',
+										padding: '1rem',
+										backgroundColor: '#fff3cd',
+										border: '1px solid #ffc107',
+										borderRadius: '4px',
+										color: '#856404',
+									}}
+								>
+									<p style={{ margin: 0, fontWeight: 'bold' }}>
+										⚠️ Playlist Refresh Issue
+									</p>
+									<p style={{ margin: '0.5rem 0 0 0', fontSize: '0.875rem' }}>
+										{playlistRefreshError}
+									</p>
+									<p style={{ margin: '0.5rem 0 0 0', fontSize: '0.875rem' }}>
+										Buffered content will continue playing. The player will
+										automatically resume when the stream becomes available.
+									</p>
+								</div>
+							)}
+						</>
 					) : (
 						<div
 							style={{

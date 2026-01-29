@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events'
 import { watch } from 'node:fs'
 import { mkdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { MasterPlaylistGenerator } from './MasterPlaylistGenerator.ts'
 import { S3UploadService } from './S3UploadService.ts'
 
 export type BitrateProfile = {
@@ -42,6 +43,7 @@ export class FFmpegTranscoder extends EventEmitter {
 	private readonly fileWatchers: Map<string, ReturnType<typeof watch>> =
 		new Map()
 	private readonly uploadedFiles: Set<string> = new Set()
+	private readonly masterPlaylistGenerator: MasterPlaylistGenerator
 
 	// Default bitrate profiles
 	static readonly DEFAULT_PROFILES: BitrateProfile[] = [
@@ -82,6 +84,11 @@ export class FFmpegTranscoder extends EventEmitter {
 		this.s3UploadService = new S3UploadService({
 			bucket: config.s3Bucket,
 		})
+		this.masterPlaylistGenerator = new MasterPlaylistGenerator({
+			port: config.port,
+			profiles: config.hlsProfiles,
+			localOutputDir: config.localOutputDir,
+		})
 	}
 
 	async start(): Promise<void> {
@@ -113,6 +120,9 @@ export class FFmpegTranscoder extends EventEmitter {
 			this.status.isRunning = true
 			this.status.retryCount = 0
 			this.emit('started', this.config.port)
+
+			// Generate and write master playlist after FFmpeg starts
+			await this.masterPlaylistGenerator.writeMasterPlaylist()
 
 			console.log(
 				`[FFmpegTranscoder] FFmpeg process started for port ${this.config.port}`,
@@ -161,6 +171,11 @@ export class FFmpegTranscoder extends EventEmitter {
 				this.emit('stopped', this.config.port)
 				resolve()
 			})
+
+			// Close stdin to signal end of input
+			if (this.process.stdin && !this.process.stdin.destroyed) {
+				this.process.stdin.end()
+			}
 
 			// Send SIGTERM for graceful shutdown
 			this.process.kill('SIGTERM')
@@ -241,11 +256,16 @@ export class FFmpegTranscoder extends EventEmitter {
 			args.push('-f', 'hls')
 			args.push('-hls_time', this.config.segmentDuration.toString())
 			args.push('-hls_list_size', '10')
-			args.push('-hls_flags', 'delete_segments+append_list')
+			// Live streaming flags: mark as event stream, append to playlist, omit endlist tag
+			args.push('-hls_playlist_type', 'event')
+			args.push('-hls_flags', 'delete_segments+append_list+omit_endlist')
 			args.push('-hls_segment_filename', `${profileDir}/segment_%05d.ts`)
 			args.push(`${profileDir}/playlist.m3u8`)
 		}
 
+		console.log(
+			`[FFmpegTranscoder] Complete FFmpeg command: ffmpeg ${args.join(' ')}`,
+		)
 		return args
 	}
 
@@ -357,6 +377,21 @@ export class FFmpegTranscoder extends EventEmitter {
 	}
 
 	private async setupFileWatchers(): Promise<void> {
+		// Watch master playlist directory
+		const masterPlaylistDir = join(
+			this.config.localOutputDir,
+			'hls',
+			this.config.port.toString(),
+		)
+
+		const masterWatcher = watch(masterPlaylistDir, (eventType, filename) => {
+			if (filename === 'master.m3u8') {
+				void this.uploadMasterPlaylist()
+			}
+		})
+
+		this.fileWatchers.set('master', masterWatcher)
+
 		// Watch HLS directories for new segments and playlists
 		for (const profile of this.config.hlsProfiles) {
 			const profileDir = join(
@@ -464,5 +499,30 @@ export class FFmpegTranscoder extends EventEmitter {
 		console.log(
 			`[FFmpegTranscoder] Set up file watchers for port ${this.config.port}`,
 		)
+	}
+
+	private async uploadMasterPlaylist(): Promise<void> {
+		try {
+			// Wait a bit for file to be fully written
+			await new Promise((resolve) => setTimeout(resolve, 500))
+
+			const masterPlaylistPath =
+				this.masterPlaylistGenerator.getMasterPlaylistPath()
+			const fileData = await readFile(masterPlaylistPath)
+
+			await this.s3UploadService.uploadMasterPlaylist(
+				this.config.port,
+				fileData.toString('utf-8'),
+			)
+
+			console.log(
+				`[FFmpegTranscoder] Uploaded master playlist for port ${this.config.port}`,
+			)
+		} catch (error) {
+			console.error(
+				`[FFmpegTranscoder] Error uploading master playlist for port ${this.config.port}:`,
+				error,
+			)
+		}
 	}
 }

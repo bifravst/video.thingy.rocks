@@ -11,7 +11,27 @@ export type UploadOptions = {
 	receptionTimestamp?: Date
 	contentType?: string
 	metadata?: Record<string, string>
+	cacheControl?: string
 }
+
+/**
+ * Cache configuration for different file types
+ * - Playlist files (.m3u8): no-cache to ensure players always get latest segment list
+ * - Segment files (.ts): immutable with 1-year cache for optimal CDN performance
+ * - Snapshot files (.jpg): no-cache to ensure latest frame is displayed
+ */
+export const CACHE_CONFIGS = {
+	PLAYLIST: {
+		cacheControl: 'no-cache, no-store, must-revalidate',
+		expires: '0',
+	},
+	SEGMENT: {
+		cacheControl: 'max-age=31536000, immutable', // 1 year
+	},
+	SNAPSHOT: {
+		cacheControl: 'no-cache',
+	},
+} as const
 
 type BufferedUpload = {
 	key: string
@@ -73,16 +93,46 @@ export class S3UploadService extends EventEmitter {
 			metadata.receptionTimestamp = options.receptionTimestamp.toISOString()
 		}
 
+		// Determine cache headers based on file extension if not explicitly provided
+		let cacheControl = options.cacheControl
+		let expires: string | undefined
+
+		if (
+			cacheControl === null ||
+			cacheControl === undefined ||
+			cacheControl === ''
+		) {
+			const extension = s3Key.slice(s3Key.lastIndexOf('.'))
+			if (extension === '.m3u8') {
+				cacheControl = CACHE_CONFIGS.PLAYLIST.cacheControl
+				expires = CACHE_CONFIGS.PLAYLIST.expires
+			} else if (extension === '.ts') {
+				cacheControl = CACHE_CONFIGS.SEGMENT.cacheControl
+			} else if (extension === '.jpg' || extension === '.jpeg') {
+				cacheControl = CACHE_CONFIGS.SNAPSHOT.cacheControl
+			}
+		}
+
 		try {
-			await this.client.send(
-				new PutObjectCommand({
-					Bucket: this.bucket,
-					Key: s3Key,
-					Body: data,
-					ContentType: options.contentType ?? 'application/octet-stream',
-					Metadata: metadata,
-				}),
-			)
+			const command = new PutObjectCommand({
+				Bucket: this.bucket,
+				Key: s3Key,
+				Body: data,
+				ContentType: options.contentType ?? 'application/octet-stream',
+				Metadata: metadata,
+				CacheControl:
+					cacheControl !== null &&
+					cacheControl !== undefined &&
+					cacheControl !== ''
+						? cacheControl
+						: undefined,
+				Expires:
+					expires !== null && expires !== undefined && expires !== ''
+						? new Date(expires)
+						: undefined,
+			})
+
+			await this.client.send(command)
 
 			console.log(`[S3UploadService] Uploaded ${s3Key} to S3`)
 			this.emit('uploaded', s3Key)
@@ -126,6 +176,7 @@ export class S3UploadService extends EventEmitter {
 		await this.uploadData(segmentData, s3Key, {
 			receptionTimestamp,
 			contentType: 'video/mp2t',
+			cacheControl: CACHE_CONFIGS.SEGMENT.cacheControl,
 		})
 	}
 
@@ -137,6 +188,7 @@ export class S3UploadService extends EventEmitter {
 		const s3Key = `hls/${port}/${profile}/playlist.m3u8`
 		await this.uploadData(Buffer.from(playlistContent), s3Key, {
 			contentType: 'application/vnd.apple.mpegurl',
+			cacheControl: CACHE_CONFIGS.PLAYLIST.cacheControl,
 		})
 	}
 
@@ -147,6 +199,7 @@ export class S3UploadService extends EventEmitter {
 		const s3Key = `hls/${port}/master.m3u8`
 		await this.uploadData(Buffer.from(playlistContent), s3Key, {
 			contentType: 'application/vnd.apple.mpegurl',
+			cacheControl: CACHE_CONFIGS.PLAYLIST.cacheControl,
 		})
 	}
 
@@ -159,6 +212,7 @@ export class S3UploadService extends EventEmitter {
 		await this.uploadData(imageData, s3Key, {
 			receptionTimestamp,
 			contentType: 'image/jpeg',
+			cacheControl: CACHE_CONFIGS.SNAPSHOT.cacheControl,
 		})
 	}
 
