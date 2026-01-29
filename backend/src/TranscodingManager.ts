@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { HLSTranscodingPipeline } from './HLSTranscodingPipeline.ts'
+import { RawStreamManager } from './RawStreamManager.ts'
 import { S3UploadService } from './S3UploadService.ts'
 import { SnapshotCapture } from './SnapshotCapture.ts'
 import type { StreamMetadataService } from './StreamMetadataService.ts'
@@ -14,6 +15,7 @@ export type TranscodingManagerConfig = {
 type StreamTranscoder = {
 	pipeline: HLSTranscodingPipeline
 	snapshot: SnapshotCapture
+	rawStream: RawStreamManager
 	mode: 'full' | 'raw-only' // full = HLS + raw, raw-only = fallback mode
 	errorCount: number
 	lastError?: string
@@ -71,16 +73,26 @@ export class TranscodingManager extends EventEmitter {
 				streamMetadataService: this.config.streamMetadataService,
 			})
 
+			const rawStream = new RawStreamManager({
+				port,
+				s3Bucket: this.config.s3Bucket,
+				s3Region: this.config.s3Region,
+				streamMetadataService: this.config.streamMetadataService,
+				segmentDuration: this.config.segmentDuration,
+			})
+
 			// Set up error handlers
 			this.setupPipelineErrorHandlers(port, pipeline)
 
 			// Start transcoding
 			await pipeline.start()
 			snapshot.start()
+			rawStream.start()
 
 			this.transcoders.set(port, {
 				pipeline,
 				snapshot,
+				rawStream,
 				mode: 'full',
 				errorCount: 0,
 			})
@@ -108,6 +120,7 @@ export class TranscodingManager extends EventEmitter {
 		try {
 			await transcoder.pipeline.stop()
 			transcoder.snapshot.stop()
+			transcoder.rawStream.stop()
 			this.transcoders.delete(port)
 
 			console.log(`[TranscodingManager] Stopped transcoding for port ${port}`)
@@ -136,6 +149,9 @@ export class TranscodingManager extends EventEmitter {
 
 			// Write to snapshot capture
 			transcoder.snapshot.writeData(data)
+
+			// Write to raw stream manager
+			transcoder.rawStream.writeData(data)
 		} catch (error) {
 			console.error(
 				`[TranscodingManager] Error writing data for port ${port}:`,

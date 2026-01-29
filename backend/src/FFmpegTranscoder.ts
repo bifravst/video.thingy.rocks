@@ -211,12 +211,12 @@ export class FFmpegTranscoder extends EventEmitter {
 	buildFFmpegCommand(): string[] {
 		const args: string[] = []
 
-		// Force overwrite without asking
-		args.push('-y')
-
 		// Input from stdin (MPEG-TS format)
 		args.push('-f', 'mpegts')
 		args.push('-i', 'pipe:0')
+
+		// Force overwrite without asking
+		args.push('-y')
 
 		// Output 1: HLS with multiple bitrate profiles
 		for (const profile of this.config.hlsProfiles) {

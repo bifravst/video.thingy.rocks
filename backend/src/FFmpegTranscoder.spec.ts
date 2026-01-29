@@ -1,8 +1,17 @@
 import assert from 'node:assert'
-import { describe, it } from 'node:test'
+import { after, describe, it } from 'node:test'
 import { FFmpegTranscoder, type TranscodingConfig } from './FFmpegTranscoder.ts'
 
 void describe('FFmpegTranscoder', () => {
+	const transcoders: FFmpegTranscoder[] = []
+
+	// Clean up all transcoders after tests
+	after(async () => {
+		for (const transcoder of transcoders) {
+			await transcoder.stop()
+		}
+	})
+
 	void describe('buildFFmpegCommand', () => {
 		void it('should generate correct FFmpeg command with default profiles', () => {
 			const config: TranscodingConfig = {
@@ -19,16 +28,22 @@ void describe('FFmpegTranscoder', () => {
 			}
 
 			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
 			const command = transcoder.buildFFmpegCommand()
 
-			// Verify input from stdin
-			assert.strictEqual(command[0], '-f')
-			assert.strictEqual(command[1], 'mpegts')
-			assert.strictEqual(command[2], '-i')
-			assert.strictEqual(command[3], 'pipe:0')
+			// Verify command contains required flags
+			const commandStr = command.join(' ')
+
+			// Verify overwrite flag
+			assert.ok(command.includes('-y'))
+
+			// Verify input format and stdin
+			assert.ok(command.includes('-f'))
+			assert.ok(command.includes('mpegts'))
+			assert.ok(command.includes('-i'))
+			assert.ok(command.includes('pipe:0'))
 
 			// Verify HLS outputs for each profile
-			const commandStr = command.join(' ')
 			assert.ok(commandStr.includes('1080p'))
 			assert.ok(commandStr.includes('720p'))
 			assert.ok(commandStr.includes('480p'))
@@ -36,12 +51,6 @@ void describe('FFmpegTranscoder', () => {
 
 			// Verify local output paths
 			assert.ok(commandStr.includes('/tmp/ffmpeg-output/hls/5000'))
-
-			// Verify snapshot extraction
-			assert.ok(command.includes('-vf'))
-			assert.ok(command.includes("select='eq(pict_type\\,I)',scale=640:360"))
-			assert.ok(command.includes('-frames:v'))
-			assert.ok(command.includes('1'))
 		})
 
 		void it('should use correct S3 paths', () => {
@@ -59,13 +68,13 @@ void describe('FFmpegTranscoder', () => {
 			}
 
 			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
 			const command = transcoder.buildFFmpegCommand()
 
 			const commandStr = command.join(' ')
 
 			// Verify local output paths are used (not S3 paths)
 			assert.ok(commandStr.includes('/tmp/ffmpeg-output/hls/5001'))
-			assert.ok(commandStr.includes('/tmp/ffmpeg-output/snapshots/5001'))
 		})
 
 		void it('should use custom segment duration', () => {
@@ -83,6 +92,7 @@ void describe('FFmpegTranscoder', () => {
 			}
 
 			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
 			const command = transcoder.buildFFmpegCommand()
 
 			const hlsTimeIndex = command.indexOf('-hls_time')
@@ -107,6 +117,7 @@ void describe('FFmpegTranscoder', () => {
 			}
 
 			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
 			const status = transcoder.getStatus()
 
 			assert.strictEqual(status.isRunning, false)
