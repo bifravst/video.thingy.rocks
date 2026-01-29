@@ -367,22 +367,22 @@ integration.
     - Document troubleshooting common issues
     - _Requirements: 7.1_
 
-- [ ] 8. Implement web frontend for stream viewing
-  - [ ] 8.1 Install required frontend dependencies
+- [x] 8. Implement web frontend for stream viewing
+  - [x] 8.1 Install required frontend dependencies
     - Install AWS SDK packages:
       `npm install @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb`
     - Install HLS player: `npm install hls.js`
     - Install types: `npm install --save-dev @types/hls.js`
     - _Requirements: 4.1_
 
-  - [ ] 8.2 Create TypeScript interfaces for data models
+  - [x] 8.2 Create TypeScript interfaces for data models
     - Define StreamMetadata interface matching DynamoDB schema
     - Define StreamSummary interface for list view
     - Define StreamDetailResponse interface for player view
     - Create types.d.ts file in frontend/src/
     - _Requirements: 4.1_
 
-  - [ ] 8.3 Create DynamoDB client service
+  - [x] 8.3 Create DynamoDB client service
     - Implement StreamDynamoDBClient class in frontend/src/utils/
     - Use existing AWS credentials from Auth context
     - Implement listStreams() method using DynamoDB scan
@@ -391,7 +391,7 @@ integration.
     - Add error handling for DynamoDB operations
     - _Requirements: 4.1, 8.5_
 
-  - [ ] 8.4 Implement StreamList component
+  - [x] 8.4 Implement StreamList component
     - Create StreamList component in frontend/src/page/
     - Display grid layout of all streams
     - Show stream port number, status badge (active/inactive), and thumbnail
@@ -406,7 +406,7 @@ integration.
     - **Property 9: Stream List Display**
     - **Validates: Requirements 4.1, 4.5**
 
-  - [ ] 8.6 Implement StreamPlayer component
+  - [x] 8.6 Implement StreamPlayer component
     - Create StreamPlayer component in frontend/src/page/
     - Create video player container with hls.js integration
     - Add toggle switch for raw vs adaptive bitrate mode
@@ -416,7 +416,7 @@ integration.
     - Add route for /stream/:port in App.tsx
     - _Requirements: 4.2, 4.3, 4.4, 4.6_
 
-  - [ ] 8.7 Implement adaptive bitrate functionality
+  - [x] 8.7 Implement adaptive bitrate functionality
     - Configure hls.js for automatic quality switching
     - Add manual quality selection dropdown
     - Display current active bitrate and resolution
@@ -428,7 +428,7 @@ integration.
     - **Property 10: Adaptive Bitrate Quality Switching**
     - **Validates: Requirements 4.4, 5.2, 5.3**
 
-  - [ ] 8.9 Implement offline stream handling
+  - [x] 8.9 Implement offline stream handling
     - Detect inactive stream status from DynamoDB
     - Display last frame snapshot image when stream is offline
     - Show "Offline" indicator badge
@@ -441,7 +441,7 @@ integration.
     - **Property 13: Stream Resumption**
     - **Validates: Requirements 11.2, 11.7**
 
-  - [ ] 8.11 Implement frontend error handling
+  - [x] 8.11 Implement frontend error handling
     - Handle stream not found errors (show user-friendly message)
     - Handle playback errors (retry, fallback to lower quality)
     - Handle network interruptions (auto-reconnect with exponential backoff)
@@ -449,7 +449,7 @@ integration.
     - Display error messages with retry actions
     - _Requirements: 9.4_
 
-  - [ ] 8.12 Write unit tests for frontend components
+  - [x] 8.12 Write unit tests for frontend components
     - Test StreamList rendering and polling
     - Test StreamPlayer initialization
     - Test adaptive bitrate controls

@@ -28,8 +28,11 @@ export class StreamingStack extends Stack {
 	public readonly vpc: ec2.Vpc
 	public readonly videoBucket: s3.Bucket
 	public readonly streamTable: dynamodb.Table
+	public readonly userPool: cognito.UserPool
+	public readonly userPoolClient: cognito.UserPoolClient
 	public readonly identityPool: cognito.CfnIdentityPool
 	public readonly unauthRole: iam.Role
+	public readonly authRole: iam.Role
 	public readonly udpSecurityGroup: ec2.SecurityGroup
 	public readonly distribution: cloudfront.Distribution
 	public readonly ec2Role: iam.Role
@@ -114,13 +117,79 @@ export class StreamingStack extends Stack {
 			removalPolicy: RemovalPolicy.DESTROY,
 		})
 
+		// Create Cognito User Pool for authenticated access
+		this.userPool = new cognito.UserPool(this, 'UserPool', {
+			userPoolName: `${this.stackName}-users`,
+			selfSignUpEnabled: true,
+			signInAliases: {
+				email: true,
+			},
+			autoVerify: {
+				email: true,
+			},
+			standardAttributes: {
+				email: {
+					required: true,
+					mutable: true,
+				},
+			},
+			passwordPolicy: {
+				minLength: 8,
+				requireLowercase: true,
+				requireUppercase: true,
+				requireDigits: true,
+				requireSymbols: false,
+			},
+			accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
+			removalPolicy: RemovalPolicy.DESTROY,
+		})
+
+		// Create User Pool Client for frontend
+		this.userPoolClient = this.userPool.addClient('WebClient', {
+			userPoolClientName: `${this.stackName}-web-client`,
+			authFlows: {
+				userPassword: true,
+				userSrp: true,
+			},
+			oAuth: {
+				flows: {
+					authorizationCodeGrant: true,
+					implicitCodeGrant: true,
+				},
+				scopes: [
+					cognito.OAuthScope.EMAIL,
+					cognito.OAuthScope.OPENID,
+					cognito.OAuthScope.PROFILE,
+				],
+				callbackUrls: [
+					'http://localhost:8080/auth/callback',
+					'https://video.thingy.rocks/auth/callback',
+				],
+				logoutUrls: ['http://localhost:8080/', 'https://video.thingy.rocks/'],
+			},
+			preventUserExistenceErrors: true,
+		})
+
+		// Add domain for hosted UI
+		this.userPool.addDomain('UserPoolDomain', {
+			cognitoDomain: {
+				domainPrefix: `${this.stackName}-${this.account}`.toLowerCase(),
+			},
+		})
+
 		// Task 2.4: Configure Cognito Identity Pool
 		this.identityPool = new cognito.CfnIdentityPool(
 			this,
 			'StreamViewerIdentityPool',
 			{
 				allowUnauthenticatedIdentities: true,
-				identityPoolName: 'VideoStreamViewers',
+				identityPoolName: `${this.stackName}-viewers`,
+				cognitoIdentityProviders: [
+					{
+						clientId: this.userPoolClient.userPoolClientId,
+						providerName: this.userPool.userPoolProviderName,
+					},
+				],
 			},
 		)
 
@@ -143,7 +212,26 @@ export class StreamingStack extends Stack {
 		// Grant read-only access to StreamMetadata table
 		this.streamTable.grantReadData(this.unauthRole)
 
-		// Attach the role to the identity pool
+		// Create IAM role for authenticated users with read-only DynamoDB access
+		this.authRole = new iam.Role(this, 'AuthRole', {
+			assumedBy: new iam.FederatedPrincipal(
+				'cognito-identity.amazonaws.com',
+				{
+					StringEquals: {
+						'cognito-identity.amazonaws.com:aud': this.identityPool.ref,
+					},
+					'ForAnyValue:StringLike': {
+						'cognito-identity.amazonaws.com:amr': 'authenticated',
+					},
+				},
+				'sts:AssumeRoleWithWebIdentity',
+			),
+		})
+
+		// Grant read-only access to StreamMetadata table for authenticated users
+		this.streamTable.grantReadData(this.authRole)
+
+		// Attach the roles to the identity pool
 		new cognito.CfnIdentityPoolRoleAttachment(
 			this,
 			'IdentityPoolRoleAttachment',
@@ -151,6 +239,7 @@ export class StreamingStack extends Stack {
 				identityPoolId: this.identityPool.ref,
 				roles: {
 					unauthenticated: this.unauthRole.roleArn,
+					authenticated: this.authRole.roleArn,
 				},
 			},
 		)
@@ -519,6 +608,21 @@ systemctl start video-streaming.service
 		cpuAlarm.addAlarmAction(new cloudwatch_actions.SnsAction(alarmTopic))
 
 		// CDK Outputs
+		new CfnOutput(this, 'UserPoolId', {
+			value: this.userPool.userPoolId,
+			description: 'Cognito User Pool ID',
+		})
+
+		new CfnOutput(this, 'UserPoolURL', {
+			value: `https://cognito-idp.${this.region}.amazonaws.com/${this.userPool.userPoolId}/`,
+			description: 'Cognito User Pool URL for OIDC',
+		})
+
+		new CfnOutput(this, 'UserPoolClientId', {
+			value: this.userPoolClient.userPoolClientId,
+			description: 'Cognito User Pool Client ID',
+		})
+
 		new CfnOutput(this, 'IdentityPoolId', {
 			value: this.identityPool.ref,
 			description: 'Cognito Identity Pool ID for frontend',

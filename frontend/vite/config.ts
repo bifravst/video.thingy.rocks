@@ -8,12 +8,16 @@ export const createConfig = ({
 	cognitoUserPoolClientId,
 	cognitoIdentityPoolId,
 	domainName,
+	dynamodbTableName,
+	cloudfrontDomainName,
 	plugins,
 }: {
 	cognitoUserPoolURL: URL
 	cognitoUserPoolClientId: string
 	cognitoIdentityPoolId: string
 	domainName: string
+	dynamodbTableName: string
+	cloudfrontDomainName: string
 	plugins?: PluginOption[]
 }): ReturnType<typeof defineConfig> => {
 	const define: Record<string, string> = {
@@ -24,6 +28,8 @@ export const createConfig = ({
 		COGNITO_USER_POOL_URL: JSON.stringify(cognitoUserPoolURL.toString()),
 		COGNITO_USER_POOL_CLIENT_ID: JSON.stringify(cognitoUserPoolClientId),
 		COGNITO_IDENTITY_POOL_ID: JSON.stringify(cognitoIdentityPoolId),
+		DYNAMODB_TABLE_NAME: JSON.stringify(dynamodbTableName),
+		CLOUDFRONT_DOMAIN_NAME: JSON.stringify(cloudfrontDomainName),
 	}
 	for (const [k, v] of Object.entries(define)) {
 		console.debug(`[vite define] ${k}:`, v)

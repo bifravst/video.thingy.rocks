@@ -1,1 +1,3 @@
-export const Cameras = () => <main>Cameras page coming soon.</main>
+import { StreamList } from './StreamList.js'
+
+export const Cameras = () => <StreamList />

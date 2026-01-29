@@ -26,10 +26,13 @@
     "test": "node --no-warnings --experimental-transform-types --test \"!(node_modules)/**/*.spec.ts\""
   },
   "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.978.0",
+    "@aws-sdk/lib-dynamodb": "^3.978.0",
     "bootstrap": "5.3.8",
     "classnames": "2.5.1",
     "compare-versions": "6.1.1",
     "date-fns": "4.1.0",
+    "hls.js": "^1.6.15",
     "lucide-preact": "0.563.0",
     "nanoid": "5.1.6",
     "preact": "10.28.2",
@@ -43,6 +46,7 @@
     "@bifravst/prettier-config": "1.1.17",
     "@commitlint/config-conventional": "20.3.1",
     "@preact/preset-vite": "2.10.3",
+    "@types/hls.js": "^0.13.3",
     "@types/semver": "7.7.1",
     "@typescript/native-preview": "7.0.0-dev.20260127.1",
     "commitlint": "20.3.1",
