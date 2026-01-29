@@ -139,12 +139,13 @@ void describe('FFmpegTranscoder', () => {
 				'hls_flags should include append_list',
 			)
 			assert.ok(
-				hlsFlags?.includes('omit_endlist') ?? false,
-				'hls_flags should include omit_endlist',
-			)
-			assert.ok(
 				hlsFlags?.includes('delete_segments') ?? false,
 				'hls_flags should include delete_segments',
+			)
+			// Note: omit_endlist is NOT included so FFmpeg can add #EXT-X-ENDLIST on graceful shutdown
+			assert.ok(
+				!(hlsFlags?.includes('omit_endlist') ?? true),
+				'hls_flags should NOT include omit_endlist to allow stream end signaling',
 			)
 		})
 
@@ -278,6 +279,451 @@ void describe('FFmpegTranscoder', () => {
 			assert.strictEqual(profiles[1]?.videoBitrate, '3000k')
 			assert.strictEqual(profiles[2]?.videoBitrate, '1500k')
 			assert.strictEqual(profiles[3]?.videoBitrate, '800k')
+		})
+	})
+
+	void describe('validateConfiguration', () => {
+		void it('should accept valid configuration', () => {
+			const config: TranscodingConfig = {
+				port: 5000,
+				outputPaths: {
+					raw: 'raw/5000',
+					hls: 'hls/5000',
+					snapshot: 'snapshots/5000',
+				},
+				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
+				segmentDuration: 6,
+				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
+			}
+
+			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
+
+			// Should not throw
+			assert.doesNotThrow(() => {
+				transcoder.validateConfiguration()
+			})
+		})
+
+		void it('should reject negative segment duration', () => {
+			const config: TranscodingConfig = {
+				port: 5000,
+				outputPaths: {
+					raw: 'raw/5000',
+					hls: 'hls/5000',
+					snapshot: 'snapshots/5000',
+				},
+				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
+				segmentDuration: -5,
+				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
+			}
+
+			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
+
+			assert.throws(
+				() => {
+					transcoder.validateConfiguration()
+				},
+				{
+					message: /Invalid segmentDuration.*Must be a positive number/,
+				},
+			)
+		})
+
+		void it('should reject zero segment duration', () => {
+			const config: TranscodingConfig = {
+				port: 5000,
+				outputPaths: {
+					raw: 'raw/5000',
+					hls: 'hls/5000',
+					snapshot: 'snapshots/5000',
+				},
+				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
+				segmentDuration: 0,
+				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
+			}
+
+			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
+
+			assert.throws(
+				() => {
+					transcoder.validateConfiguration()
+				},
+				{
+					message: /Invalid segmentDuration.*Must be a positive number/,
+				},
+			)
+		})
+
+		void it('should verify hls_flags includes append_list', () => {
+			const config: TranscodingConfig = {
+				port: 5000,
+				outputPaths: {
+					raw: 'raw/5000',
+					hls: 'hls/5000',
+					snapshot: 'snapshots/5000',
+				},
+				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
+				segmentDuration: 6,
+				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
+			}
+
+			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
+
+			// Valid configuration should pass
+			assert.doesNotThrow(() => {
+				transcoder.validateConfiguration()
+			})
+
+			// Verify the command actually includes append_list
+			const command = transcoder.buildFFmpegCommand()
+			const hlsFlagsIndex = command.indexOf('-hls_flags')
+			assert.ok(hlsFlagsIndex >= 0)
+			const hlsFlags = command[hlsFlagsIndex + 1]
+			assert.ok(hlsFlags?.includes('append_list') ?? false)
+		})
+
+		void it('should verify hls_list_size is a positive integer', () => {
+			const config: TranscodingConfig = {
+				port: 5000,
+				outputPaths: {
+					raw: 'raw/5000',
+					hls: 'hls/5000',
+					snapshot: 'snapshots/5000',
+				},
+				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
+				segmentDuration: 6,
+				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
+			}
+
+			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
+
+			// Valid configuration should pass
+			assert.doesNotThrow(() => {
+				transcoder.validateConfiguration()
+			})
+
+			// Verify the command includes hls_list_size with positive value
+			const command = transcoder.buildFFmpegCommand()
+			const hlsListSizeIndex = command.indexOf('-hls_list_size')
+			assert.ok(hlsListSizeIndex >= 0)
+			const listSize = parseInt(command[hlsListSizeIndex + 1] ?? '0', 10)
+			assert.ok(listSize > 0)
+		})
+
+		void it('should prevent startup with invalid configuration', async () => {
+			const config: TranscodingConfig = {
+				port: 5000,
+				outputPaths: {
+					raw: 'raw/5000',
+					hls: 'hls/5000',
+					snapshot: 'snapshots/5000',
+				},
+				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
+				segmentDuration: -1, // Invalid
+				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
+			}
+
+			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
+
+			// Add error listener to prevent unhandled error
+			transcoder.on('error', () => {
+				// Expected error
+			})
+
+			// start() should throw due to validation failure
+			await assert.rejects(
+				async () => {
+					await transcoder.start()
+				},
+				{
+					message: /Invalid segmentDuration/,
+				},
+			)
+
+			// Verify transcoder is not running
+			const status = transcoder.getStatus()
+			assert.strictEqual(status.isRunning, false)
+		})
+
+		void it('should emit error event on validation failure', async () => {
+			const config: TranscodingConfig = {
+				port: 5000,
+				outputPaths: {
+					raw: 'raw/5000',
+					hls: 'hls/5000',
+					snapshot: 'snapshots/5000',
+				},
+				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
+				segmentDuration: -1, // Invalid
+				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
+			}
+
+			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
+
+			// Listen for error event
+			let errorEmitted = false
+			let errorMessage = ''
+			transcoder.once('error', (port: number, message: string) => {
+				errorEmitted = true
+				errorMessage = message
+			})
+
+			// start() should throw
+			await assert.rejects(async () => {
+				await transcoder.start()
+			})
+
+			// Verify error event was emitted
+			assert.ok(errorEmitted, 'Error event should be emitted')
+			assert.ok(
+				errorMessage.includes('Invalid segmentDuration'),
+				'Error message should describe the validation failure',
+			)
+		})
+	})
+
+	void describe('stream end handling', () => {
+		void it('should not include omit_endlist flag to allow stream end signaling', () => {
+			const config: TranscodingConfig = {
+				port: 5000,
+				outputPaths: {
+					raw: 'raw/5000',
+					hls: 'hls/5000',
+					snapshot: 'snapshots/5000',
+				},
+				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
+				segmentDuration: 6,
+				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
+			}
+
+			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
+			const command = transcoder.buildFFmpegCommand()
+
+			// Verify omit_endlist is NOT in the command
+			const commandStr = command.join(' ')
+			assert.ok(
+				!commandStr.includes('omit_endlist'),
+				'Command should not include omit_endlist flag',
+			)
+
+			// Verify other required flags are still present
+			assert.ok(
+				commandStr.includes('append_list'),
+				'Command should include append_list flag',
+			)
+			assert.ok(
+				commandStr.includes('delete_segments'),
+				'Command should include delete_segments flag',
+			)
+		})
+
+		void it('should send SIGTERM for graceful shutdown', async () => {
+			const config: TranscodingConfig = {
+				port: 5000,
+				outputPaths: {
+					raw: 'raw/5000',
+					hls: 'hls/5000',
+					snapshot: 'snapshots/5000',
+				},
+				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
+				segmentDuration: 6,
+				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
+			}
+
+			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
+
+			// Mock the process to verify SIGTERM is sent
+			let signalSent: string | undefined
+			const mockProcess = {
+				stdin: {
+					destroyed: false,
+					end: () => {},
+				},
+				kill: (signal?: string) => {
+					signalSent = signal
+					// Simulate immediate exit
+					setTimeout(() => {
+						mockProcess.exitHandler?.(0, signal)
+					}, 10)
+				},
+				once: (event: string, handler: (...args: any[]) => void) => {
+					if (event === 'exit') {
+						mockProcess.exitHandler = handler
+					}
+				},
+				exitHandler: undefined as ((...args: any[]) => void) | undefined,
+				killed: false,
+			}
+
+			// Replace the process with our mock
+			// @ts-expect-error - Accessing private property for testing
+			transcoder.process = mockProcess
+
+			// @ts-expect-error - Accessing private property for testing
+			transcoder.status.isRunning = true
+
+			// Call stop
+			await transcoder.stop()
+
+			// Verify SIGTERM was sent
+			assert.strictEqual(
+				signalSent,
+				'SIGTERM',
+				'Should send SIGTERM for graceful shutdown',
+			)
+		})
+
+		void it('should wait for final playlists to be uploaded after FFmpeg exits', async () => {
+			const config: TranscodingConfig = {
+				port: 5000,
+				outputPaths: {
+					raw: 'raw/5000',
+					hls: 'hls/5000',
+					snapshot: 'snapshots/5000',
+				},
+				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
+				segmentDuration: 6,
+				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
+			}
+
+			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
+
+			// Track timing
+			let exitTime = 0
+			let stopResolvedTime = 0
+
+			// Mock the process
+			const mockProcess = {
+				stdin: {
+					destroyed: false,
+					end: () => {},
+				},
+				kill: (signal?: string) => {
+					// Simulate immediate exit
+					setTimeout(() => {
+						exitTime = Date.now()
+						mockProcess.exitHandler?.(0, signal)
+					}, 10)
+				},
+				once: (event: string, handler: (...args: any[]) => void) => {
+					if (event === 'exit') {
+						mockProcess.exitHandler = handler
+					}
+				},
+				exitHandler: undefined as ((...args: any[]) => void) | undefined,
+				killed: false,
+			}
+
+			// Replace the process with our mock
+			// @ts-expect-error - Accessing private property for testing
+			transcoder.process = mockProcess
+
+			// @ts-expect-error - Accessing private property for testing
+			transcoder.status.isRunning = true
+
+			// Call stop
+			await transcoder.stop()
+			stopResolvedTime = Date.now()
+
+			// Verify there was a delay after exit (at least 1.5 seconds for the 2 second wait)
+			const delay = stopResolvedTime - exitTime
+			assert.ok(
+				delay >= 1500,
+				`Should wait at least 1.5 seconds after FFmpeg exits (actual: ${delay}ms)`,
+			)
+		})
+
+		void it('should clean up resources after stop', async () => {
+			const config: TranscodingConfig = {
+				port: 5000,
+				outputPaths: {
+					raw: 'raw/5000',
+					hls: 'hls/5000',
+					snapshot: 'snapshots/5000',
+				},
+				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
+				segmentDuration: 6,
+				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
+			}
+
+			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
+
+			// Mock the process
+			const mockProcess = {
+				stdin: {
+					destroyed: false,
+					end: () => {},
+				},
+				kill: (signal?: string) => {
+					setTimeout(() => {
+						mockProcess.exitHandler?.(0, signal)
+					}, 10)
+				},
+				once: (event: string, handler: (...args: any[]) => void) => {
+					if (event === 'exit') {
+						mockProcess.exitHandler = handler
+					}
+				},
+				exitHandler: undefined as ((...args: any[]) => void) | undefined,
+				killed: false,
+			}
+
+			// Replace the process with our mock
+			// @ts-expect-error - Accessing private property for testing
+			transcoder.process = mockProcess
+
+			// @ts-expect-error - Accessing private property for testing
+			transcoder.status.isRunning = true
+
+			// Add some mock pending uploads and file watchers
+			// @ts-expect-error - Accessing private property for testing
+			transcoder.pendingUploads.set(
+				'test-file',
+				setTimeout(() => {}, 10000),
+			)
+
+			const mockWatcher = { close: () => {} }
+			// @ts-expect-error - Accessing private property for testing
+			transcoder.fileWatchers.set('test-watcher', mockWatcher)
+
+			// Call stop
+			await transcoder.stop()
+
+			// Verify resources were cleaned up
+			assert.strictEqual(
+				// @ts-expect-error - Accessing private property for testing
+				transcoder.pendingUploads.size,
+				0,
+				'Pending uploads should be cleared',
+			)
+			assert.strictEqual(
+				// @ts-expect-error - Accessing private property for testing
+				transcoder.fileWatchers.size,
+				0,
+				'File watchers should be cleared',
+			)
 		})
 	})
 })

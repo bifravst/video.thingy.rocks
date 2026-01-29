@@ -43,6 +43,7 @@ export class FFmpegTranscoder extends EventEmitter {
 	private readonly fileWatchers: Map<string, ReturnType<typeof watch>> =
 		new Map()
 	private readonly uploadedFiles: Set<string> = new Set()
+	private readonly pendingUploads: Map<string, NodeJS.Timeout> = new Map()
 	private readonly masterPlaylistGenerator: MasterPlaylistGenerator
 
 	// Default bitrate profiles
@@ -100,6 +101,9 @@ export class FFmpegTranscoder extends EventEmitter {
 		}
 
 		try {
+			// Validate configuration before starting
+			this.validateConfiguration()
+
 			// Create local output directories
 			await this.createOutputDirectories()
 
@@ -134,6 +138,8 @@ export class FFmpegTranscoder extends EventEmitter {
 				`[FFmpegTranscoder] Failed to start FFmpeg for port ${this.config.port}:`,
 				error,
 			)
+			// Emit error event if validation fails
+			this.emit('error', this.config.port, this.status.lastError)
 			throw error
 		}
 	}
@@ -144,16 +150,9 @@ export class FFmpegTranscoder extends EventEmitter {
 			this.retryTimeout = undefined
 		}
 
-		// Stop file watchers
-		for (const watcher of this.fileWatchers.values()) {
-			watcher.close()
-		}
-		this.fileWatchers.clear()
-
-		// Stop S3 upload service
-		await this.s3UploadService.stop()
-
 		if (!this.process) {
+			// Clean up even if no process
+			await this.cleanupResources()
 			return
 		}
 
@@ -164,12 +163,28 @@ export class FFmpegTranscoder extends EventEmitter {
 			}
 
 			this.process.once('exit', () => {
-				console.log(
-					`[FFmpegTranscoder] FFmpeg process stopped for port ${this.config.port}`,
-				)
-				this.status.isRunning = false
-				this.emit('stopped', this.config.port)
-				resolve()
+				void (async () => {
+					console.log(
+						`[FFmpegTranscoder] FFmpeg process stopped for port ${this.config.port}`,
+					)
+					this.status.isRunning = false
+
+					// Wait for final playlists to be written and uploaded
+					// FFmpeg adds #EXT-X-ENDLIST tag on graceful shutdown
+					console.log(
+						`[FFmpegTranscoder] Waiting for final playlists to be uploaded for port ${this.config.port}`,
+					)
+					await new Promise((r) => setTimeout(r, 2000))
+
+					// Upload final playlists to ensure #EXT-X-ENDLIST tag is in S3
+					await this.uploadFinalPlaylists()
+
+					// Clean up resources
+					await this.cleanupResources()
+
+					this.emit('stopped', this.config.port)
+					resolve()
+				})()
 			})
 
 			// Close stdin to signal end of input
@@ -178,6 +193,10 @@ export class FFmpegTranscoder extends EventEmitter {
 			}
 
 			// Send SIGTERM for graceful shutdown
+			// This allows FFmpeg to finish writing segments and add #EXT-X-ENDLIST to playlists
+			console.log(
+				`[FFmpegTranscoder] Sending SIGTERM to FFmpeg for graceful shutdown (port ${this.config.port})`,
+			)
 			this.process.kill('SIGTERM')
 
 			// Force kill after 5 seconds if not stopped
@@ -223,6 +242,63 @@ export class FFmpegTranscoder extends EventEmitter {
 		return { ...this.status }
 	}
 
+	/**
+	 * Validates the transcoding configuration before starting FFmpeg.
+	 * Ensures that required HLS flags and parameters are properly configured.
+	 * @throws {Error} If configuration is invalid
+	 */
+	validateConfiguration(): void {
+		// Verify segmentDuration is positive
+		if (this.config.segmentDuration <= 0) {
+			throw new Error(
+				`Invalid segmentDuration: ${this.config.segmentDuration}. Must be a positive number.`,
+			)
+		}
+
+		// Build the command to check the flags
+		const command = this.buildFFmpegCommand()
+
+		// Verify hls_flags includes append_list
+		const hlsFlagsIndex = command.indexOf('-hls_flags')
+		if (hlsFlagsIndex === -1) {
+			throw new Error(
+				'Missing required parameter: -hls_flags not found in FFmpeg command',
+			)
+		}
+
+		const hlsFlagsValue = command[hlsFlagsIndex + 1]
+		if (!(hlsFlagsValue?.includes('append_list') ?? false)) {
+			throw new Error(
+				`Invalid hls_flags: "${hlsFlagsValue ?? ''}". Must include "append_list" for live streaming.`,
+			)
+		}
+
+		// Verify hls_list_size is present and is a positive integer
+		const hlsListSizeIndex = command.indexOf('-hls_list_size')
+		if (hlsListSizeIndex === -1) {
+			throw new Error(
+				'Missing required parameter: -hls_list_size not found in FFmpeg command',
+			)
+		}
+
+		const hlsListSizeValue = command[hlsListSizeIndex + 1]
+		if (hlsListSizeValue === undefined) {
+			throw new Error(
+				'Invalid hls_list_size: value not found after -hls_list_size flag',
+			)
+		}
+		const listSize = parseInt(hlsListSizeValue, 10)
+		if (isNaN(listSize) || listSize <= 0) {
+			throw new Error(
+				`Invalid hls_list_size: "${hlsListSizeValue}". Must be a positive integer.`,
+			)
+		}
+
+		console.log(
+			`[FFmpegTranscoder] Configuration validation passed for port ${this.config.port}`,
+		)
+	}
+
 	buildFFmpegCommand(): string[] {
 		const args: string[] = []
 
@@ -256,9 +332,10 @@ export class FFmpegTranscoder extends EventEmitter {
 			args.push('-f', 'hls')
 			args.push('-hls_time', this.config.segmentDuration.toString())
 			args.push('-hls_list_size', '10')
-			// Live streaming flags: mark as event stream, append to playlist, omit endlist tag
+			// Live streaming flags: mark as event stream, append to playlist
+			// Note: omit_endlist is removed so FFmpeg can add #EXT-X-ENDLIST on graceful shutdown
 			args.push('-hls_playlist_type', 'event')
-			args.push('-hls_flags', 'delete_segments+append_list+omit_endlist')
+			args.push('-hls_flags', 'delete_segments+append_list')
 			args.push('-hls_segment_filename', `${profileDir}/segment_%05d.ts`)
 			args.push(`${profileDir}/playlist.m3u8`)
 		}
@@ -386,7 +463,11 @@ export class FFmpegTranscoder extends EventEmitter {
 
 		const masterWatcher = watch(masterPlaylistDir, (eventType, filename) => {
 			if (filename === 'master.m3u8') {
-				void this.uploadMasterPlaylist()
+				void this.debouncedUpload(
+					join(masterPlaylistDir, filename),
+					async () => this.uploadMasterPlaylist(),
+					500, // 500ms debounce for playlists
+				)
 			}
 		})
 
@@ -412,44 +493,49 @@ export class FFmpegTranscoder extends EventEmitter {
 
 				const filePath = join(profileDir, filename)
 
-				// Avoid uploading the same file multiple times
-				if (this.uploadedFiles.has(filePath)) return
+				// Determine debounce time based on file type
+				// Playlists need faster updates (500ms), segments can wait longer (1000ms)
+				const debounceMs = filename.endsWith('.m3u8') ? 500 : 1000
 
-				void (async () => {
-					try {
-						// Wait a bit for file to be fully written
-						await new Promise((resolve) => setTimeout(resolve, 1000))
+				void this.debouncedUpload(
+					filePath,
+					async () => {
+						// Avoid uploading the same file multiple times
+						if (this.uploadedFiles.has(filePath)) return
 
-						const fileData = await readFile(filePath)
-						const s3Key = `${this.config.outputPaths.hls}/${profile.name}/${filename}`
+						try {
+							const fileData = await readFile(filePath)
+							const s3Key = `${this.config.outputPaths.hls}/${profile.name}/${filename}`
 
-						await this.s3UploadService.uploadData(fileData, s3Key, {
-							contentType: filename.endsWith('.m3u8')
-								? 'application/vnd.apple.mpegurl'
-								: 'video/mp2t',
-							receptionTimestamp: new Date(),
-						})
+							await this.s3UploadService.uploadData(fileData, s3Key, {
+								contentType: filename.endsWith('.m3u8')
+									? 'application/vnd.apple.mpegurl'
+									: 'video/mp2t',
+								receptionTimestamp: new Date(),
+							})
 
-						this.uploadedFiles.add(filePath)
+							this.uploadedFiles.add(filePath)
 
-						console.log(
-							`[FFmpegTranscoder] Uploaded ${filename} for port ${this.config.port} profile ${profile.name}`,
-						)
+							console.log(
+								`[FFmpegTranscoder] Uploaded ${filename} for port ${this.config.port} profile ${profile.name}`,
+							)
 
-						// Clean up old uploaded files from tracking set
-						if (this.uploadedFiles.size > 1000) {
-							const toDelete = Array.from(this.uploadedFiles).slice(0, 500)
-							for (const path of toDelete) {
-								this.uploadedFiles.delete(path)
+							// Clean up old uploaded files from tracking set
+							if (this.uploadedFiles.size > 1000) {
+								const toDelete = Array.from(this.uploadedFiles).slice(0, 500)
+								for (const path of toDelete) {
+									this.uploadedFiles.delete(path)
+								}
 							}
+						} catch (error) {
+							console.error(
+								`[FFmpegTranscoder] Error uploading ${filename}:`,
+								error,
+							)
 						}
-					} catch (error) {
-						console.error(
-							`[FFmpegTranscoder] Error uploading ${filename}:`,
-							error,
-						)
-					}
-				})()
+					},
+					debounceMs,
+				)
 			})
 
 			this.fileWatchers.set(profileDir, watcher)
@@ -473,25 +559,27 @@ export class FFmpegTranscoder extends EventEmitter {
 
 			const filePath = join(snapshotDir, filename)
 
-			void (async () => {
-				try {
-					await new Promise((resolve) => setTimeout(resolve, 100))
+			void this.debouncedUpload(
+				filePath,
+				async () => {
+					try {
+						const fileData = await readFile(filePath)
+						const s3Key = `${this.config.outputPaths.snapshot}/${filename}`
 
-					const fileData = await readFile(filePath)
-					const s3Key = `${this.config.outputPaths.snapshot}/${filename}`
+						await this.s3UploadService.uploadData(fileData, s3Key, {
+							contentType: 'image/jpeg',
+							receptionTimestamp: new Date(),
+						})
 
-					await this.s3UploadService.uploadData(fileData, s3Key, {
-						contentType: 'image/jpeg',
-						receptionTimestamp: new Date(),
-					})
-
-					console.log(
-						`[FFmpegTranscoder] Uploaded snapshot for port ${this.config.port}`,
-					)
-				} catch (error) {
-					console.error(`[FFmpegTranscoder] Error uploading snapshot:`, error)
-				}
-			})()
+						console.log(
+							`[FFmpegTranscoder] Uploaded snapshot for port ${this.config.port}`,
+						)
+					} catch (error) {
+						console.error(`[FFmpegTranscoder] Error uploading snapshot:`, error)
+					}
+				},
+				100, // 100ms debounce for snapshots
+			)
 		})
 
 		this.fileWatchers.set(snapshotDir, snapshotWatcher)
@@ -524,5 +612,114 @@ export class FFmpegTranscoder extends EventEmitter {
 				error,
 			)
 		}
+	}
+
+	/**
+	 * Debounces file uploads to prevent duplicate uploads when files change rapidly.
+	 * If a file changes again before the debounce period expires, the previous upload is cancelled.
+	 * @param filePath - Unique identifier for the file being uploaded
+	 * @param uploadFn - Function to execute after debounce period
+	 * @param debounceMs - Milliseconds to wait before uploading
+	 */
+	private async debouncedUpload(
+		filePath: string,
+		uploadFn: () => Promise<void>,
+		debounceMs: number,
+	): Promise<void> {
+		// Cancel any pending upload for this file
+		const existingTimeout = this.pendingUploads.get(filePath)
+		if (existingTimeout) {
+			clearTimeout(existingTimeout)
+			console.log(
+				`[FFmpegTranscoder] Cancelled pending upload for ${filePath}, file changed again`,
+			)
+		}
+
+		// Schedule new upload
+		const timeout = setTimeout(() => {
+			this.pendingUploads.delete(filePath)
+			void uploadFn()
+		}, debounceMs)
+
+		this.pendingUploads.set(filePath, timeout)
+	}
+
+	/**
+	 * Uploads final playlists after stream ends to ensure #EXT-X-ENDLIST tag is in S3.
+	 * This is called after FFmpeg gracefully shuts down and writes the final playlists.
+	 */
+	private async uploadFinalPlaylists(): Promise<void> {
+		try {
+			// Upload master playlist
+			const masterPlaylistPath =
+				this.masterPlaylistGenerator.getMasterPlaylistPath()
+			const masterData = await readFile(masterPlaylistPath)
+			await this.s3UploadService.uploadMasterPlaylist(
+				this.config.port,
+				masterData.toString('utf-8'),
+			)
+			console.log(
+				`[FFmpegTranscoder] Uploaded final master playlist for port ${this.config.port}`,
+			)
+
+			// Upload all profile playlists
+			for (const profile of this.config.hlsProfiles) {
+				const playlistPath = join(
+					this.config.localOutputDir,
+					'hls',
+					this.config.port.toString(),
+					profile.name,
+					'playlist.m3u8',
+				)
+
+				try {
+					const playlistData = await readFile(playlistPath)
+					const s3Key = `${this.config.outputPaths.hls}/${profile.name}/playlist.m3u8`
+
+					await this.s3UploadService.uploadData(playlistData, s3Key, {
+						contentType: 'application/vnd.apple.mpegurl',
+						receptionTimestamp: new Date(),
+					})
+
+					console.log(
+						`[FFmpegTranscoder] Uploaded final playlist for port ${this.config.port} profile ${profile.name}`,
+					)
+				} catch (error) {
+					console.error(
+						`[FFmpegTranscoder] Error uploading final playlist for profile ${profile.name}:`,
+						error,
+					)
+				}
+			}
+		} catch (error) {
+			console.error(
+				`[FFmpegTranscoder] Error uploading final playlists for port ${this.config.port}:`,
+				error,
+			)
+		}
+	}
+
+	/**
+	 * Cleans up resources including file watchers, pending uploads, and S3 upload service.
+	 */
+	private async cleanupResources(): Promise<void> {
+		// Clear pending uploads
+		for (const timeout of this.pendingUploads.values()) {
+			clearTimeout(timeout)
+		}
+		this.pendingUploads.clear()
+
+		// Stop file watchers
+		for (const watcher of this.fileWatchers.values()) {
+			watcher.close()
+		}
+		this.fileWatchers.clear()
+
+		// Stop S3 upload service
+		await this.s3UploadService.stop()
+
+		console.log(
+			`[FFmpegTranscoder] Cleaned up resources for port ${this.config.port}`,
+		)
 	}
 }

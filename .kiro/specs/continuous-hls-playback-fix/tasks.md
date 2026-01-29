@@ -130,8 +130,8 @@ plays by:
     - Simulate failure and recovery sequences, verify playback continues
     - _Requirements: 6.1, 6.2, 6.3, 6.4_
 
-- [ ] 6. Update frontend to use master playlist URL
-  - [ ] 6.1 Update StreamDynamoDBClient
+- [x] 6. Update frontend to use master playlist URL
+  - [x] 6.1 Update StreamDynamoDBClient
     - Modify `getStreamDetail()` to construct master.m3u8 URL
     - Change URL format from `hls/{port}/{profile}/playlist.m3u8` to
       `hls/{port}/master.m3u8`
@@ -139,14 +139,14 @@ plays by:
       compatibility)
     - _Requirements: 4.5_
 
-  - [ ] 6.2 Write unit tests for URL construction
+  - [x] 6.2 Write unit tests for URL construction
     - Test master playlist URL format
     - Test fallback to profile-specific URL
     - Test URL construction for different ports
     - _Requirements: 4.5_
 
-- [ ] 7. Add configuration validation to FFmpegTranscoder
-  - [ ] 7.1 Implement configuration validation method
+- [x] 7. Add configuration validation to FFmpegTranscoder
+  - [x] 7.1 Implement configuration validation method
     - Create `validateConfiguration()` method
     - Verify `hls_flags` includes `append_list`
     - Verify `hls_list_size` is a positive integer
@@ -154,14 +154,14 @@ plays by:
     - Throw error if configuration is invalid
     - _Requirements: 8.2, 8.3, 8.4_
 
-  - [ ] 7.2 Call validation before starting FFmpeg
+  - [x] 7.2 Call validation before starting FFmpeg
     - Call `validateConfiguration()` in `start()` method before spawning process
     - Log validation errors with details
     - Emit error event if validation fails
     - Refuse to start if configuration is invalid
     - _Requirements: 8.2, 8.3, 8.4_
 
-  - [ ] 7.3 Write unit tests for configuration validation
+  - [x] 7.3 Write unit tests for configuration validation
     - Test validation accepts valid configuration
     - Test validation rejects missing append_list flag
     - Test validation rejects invalid hls_list_size
@@ -169,17 +169,17 @@ plays by:
     - Test that invalid configuration prevents startup
     - _Requirements: 8.2, 8.3, 8.4_
 
-- [ ] 8. Checkpoint - Verify all changes
+- [x] 8. Checkpoint - Verify all changes
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 9. Update file watcher to handle playlist updates
-  - [ ] 9.1 Add debouncing to file watcher
+- [x] 9. Update file watcher to handle playlist updates
+  - [x] 9.1 Add debouncing to file watcher
     - Implement debounce logic to prevent duplicate uploads
     - Wait 500ms after file change before uploading
     - Cancel pending uploads if file changes again
     - _Requirements: 2.1, 2.2_
 
-  - [ ] 9.2 Ensure playlist uploads happen immediately
+  - [x] 9.2 Ensure playlist uploads happen immediately
     - Prioritize playlist uploads over segment uploads
     - Upload playlists within 1 second of modification
     - Log upload timing for monitoring
@@ -192,26 +192,26 @@ plays by:
       seconds
     - _Requirements: 1.2, 2.1, 2.2_
 
-- [ ] 10. Add stream end handling
-  - [ ] 10.1 Update FFmpeg command for stream end
+- [x] 10. Add stream end handling
+  - [x] 10.1 Update FFmpeg command for stream end
     - Remove `omit_endlist` flag when stream is stopping
     - Allow FFmpeg to add #EXT-X-ENDLIST tag on graceful shutdown
     - Ensure final playlist is uploaded to S3
     - _Requirements: 1.4_
 
-  - [ ] 10.2 Update stop() method in FFmpegTranscoder
+  - [x] 10.2 Update stop() method in FFmpegTranscoder
     - Send SIGTERM to FFmpeg for graceful shutdown
     - Wait for FFmpeg to finish writing final playlist
     - Upload final playlist with #EXT-X-ENDLIST tag
     - _Requirements: 1.4_
 
-  - [ ] 10.3 Write unit test for stream end behavior
+  - [x] 10.3 Write unit test for stream end behavior
     - Test that stopped streams have #EXT-X-ENDLIST tag
     - Test that final playlist is uploaded
     - Test graceful shutdown timing
     - _Requirements: 1.4_
 
-- [ ] 11. Final checkpoint and integration testing
+- [x] 11. Final checkpoint and integration testing
   - Ensure all tests pass, ask the user if questions arise.
 
 ## Notes
