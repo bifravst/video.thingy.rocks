@@ -56,7 +56,7 @@ void describe('MasterPlaylistGenerator', () => {
 				localOutputDir: testOutputDir,
 			})
 
-			assert.ok(generator)
+			assert.ok(generator !== undefined)
 		})
 	})
 
@@ -84,7 +84,7 @@ void describe('MasterPlaylistGenerator', () => {
 			const content = generator.generateMasterPlaylist()
 
 			// Should have 4 stream info tags (one per profile)
-			const streamInfoCount = (content.match(/#EXT-X-STREAM-INF/g) || []).length
+			const streamInfoCount = (content.match(/#EXT-X-STREAM-INF/g) ?? []).length
 			assert.strictEqual(streamInfoCount, 4)
 		})
 
@@ -158,7 +158,7 @@ void describe('MasterPlaylistGenerator', () => {
 
 			// Each profile should have stream info followed by path
 			// Line 2: #EXT-X-STREAM-INF for 1080p
-			assert.ok(lines[2]?.startsWith('#EXT-X-STREAM-INF'))
+			assert.ok(lines[2]?.startsWith('#EXT-X-STREAM-INF') ?? false)
 			// Line 3: 1080p/playlist.m3u8
 			assert.strictEqual(lines[3], '1080p/playlist.m3u8')
 		})

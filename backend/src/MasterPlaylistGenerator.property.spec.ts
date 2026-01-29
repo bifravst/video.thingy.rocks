@@ -65,7 +65,7 @@ void describe('MasterPlaylistGenerator - Property Tests', () => {
 				const nameCount = new Map<string, number>()
 
 				for (const profile of profiles) {
-					const count = nameCount.get(profile.name) || 0
+					const count = nameCount.get(profile.name) ?? 0
 					nameCount.set(profile.name, count + 1)
 
 					const uniqueName =
@@ -169,7 +169,7 @@ void describe('MasterPlaylistGenerator - Property Tests', () => {
 					const content = generator.generateMasterPlaylist()
 
 					// Count #EXT-X-STREAM-INF tags
-					const streamInfoCount = (content.match(/#EXT-X-STREAM-INF/g) || [])
+					const streamInfoCount = (content.match(/#EXT-X-STREAM-INF/g) ?? [])
 						.length
 
 					assert.strictEqual(
@@ -242,7 +242,7 @@ void describe('MasterPlaylistGenerator - Property Tests', () => {
 					for (const profile of profiles) {
 						// Check that we have a stream info line
 						assert.ok(
-							lines[lineIndex]?.startsWith('#EXT-X-STREAM-INF'),
+							lines[lineIndex]?.startsWith('#EXT-X-STREAM-INF') ?? false,
 							`Line ${lineIndex} should be #EXT-X-STREAM-INF tag`,
 						)
 
@@ -314,7 +314,7 @@ void describe('MasterPlaylistGenerator - Property Tests', () => {
 						// Should not throw and should include all profiles
 						assert.ok(content.includes('#EXTM3U'))
 						assert.strictEqual(
-							(content.match(/#EXT-X-STREAM-INF/g) || []).length,
+							(content.match(/#EXT-X-STREAM-INF/g) ?? []).length,
 							profiles.length,
 						)
 					},

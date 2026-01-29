@@ -135,21 +135,15 @@ void describe('FFmpegTranscoder', () => {
 			assert.ok(hlsFlagsIndex >= 0, 'hls_flags should be present')
 			const hlsFlags = command[hlsFlagsIndex + 1]
 			assert.ok(
-				hlsFlags !== null &&
-					hlsFlags !== undefined &&
-					hlsFlags.includes('append_list'),
+				hlsFlags?.includes('append_list') ?? false,
 				'hls_flags should include append_list',
 			)
 			assert.ok(
-				hlsFlags !== null &&
-					hlsFlags !== undefined &&
-					hlsFlags.includes('omit_endlist'),
+				hlsFlags?.includes('omit_endlist') ?? false,
 				'hls_flags should include omit_endlist',
 			)
 			assert.ok(
-				hlsFlags !== null &&
-					hlsFlags !== undefined &&
-					hlsFlags.includes('delete_segments'),
+				hlsFlags?.includes('delete_segments') ?? false,
 				'hls_flags should include delete_segments',
 			)
 		})

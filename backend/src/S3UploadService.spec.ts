@@ -1,3 +1,4 @@
+import type { PutObjectCommandInput, S3Client } from '@aws-sdk/client-s3'
 import assert from 'node:assert'
 import { describe, it, mock } from 'node:test'
 import { CACHE_CONFIGS, S3UploadService } from './S3UploadService.ts'
@@ -85,11 +86,8 @@ void describe('S3UploadService', () => {
 			})
 
 			// Mock the S3 client send method to capture the command
-			let capturedCommand: any
-			service['client'].send = mock.fn(async (command: any) => {
-				capturedCommand = command
-				return {}
-			})
+			const sendMock = mock.fn<S3Client['send']>(async () => ({}))
+			service['client'].send = sendMock
 
 			const testData = Buffer.from('test playlist content')
 			const s3Key = 'hls/5000/1080p/playlist.m3u8'
@@ -98,17 +96,21 @@ void describe('S3UploadService', () => {
 				contentType: 'application/vnd.apple.mpegurl',
 			})
 
-			assert.ok(capturedCommand, 'Command should be captured')
+			assert.ok(sendMock.mock.callCount() > 0, 'Command should be captured')
 			assert.strictEqual(
-				capturedCommand.input.CacheControl,
+				(sendMock.mock.calls[0]?.arguments[0]?.input as PutObjectCommandInput)
+					?.CacheControl,
 				'no-cache, no-store, must-revalidate',
 			)
 			assert.ok(
-				capturedCommand.input.Expires instanceof Date,
+				(sendMock.mock.calls[0]?.arguments[0]?.input as PutObjectCommandInput)
+					?.Expires instanceof Date,
 				'Expires should be a Date object',
 			)
 			assert.strictEqual(
-				capturedCommand.input.Expires.getTime(),
+				(
+					sendMock.mock.calls[0]?.arguments[0]?.input as PutObjectCommandInput
+				)?.Expires?.getTime(),
 				new Date('0').getTime(),
 			)
 
@@ -121,11 +123,8 @@ void describe('S3UploadService', () => {
 			})
 
 			// Mock the S3 client send method to capture the command
-			let capturedCommand: any
-			service['client'].send = mock.fn(async (command: any) => {
-				capturedCommand = command
-				return {}
-			})
+			const sendMock = mock.fn<S3Client['send']>(async () => ({}))
+			service['client'].send = sendMock
 
 			const testData = Buffer.from('test segment content')
 			const s3Key = 'hls/5000/1080p/segment_00001.ts'
@@ -134,12 +133,17 @@ void describe('S3UploadService', () => {
 				contentType: 'video/mp2t',
 			})
 
-			assert.ok(capturedCommand, 'Command should be captured')
+			assert.ok(sendMock.mock.callCount() > 0, 'Command should be captured')
 			assert.strictEqual(
-				capturedCommand.input.CacheControl,
+				(sendMock.mock.calls[0]?.arguments[0]?.input as PutObjectCommandInput)
+					?.CacheControl,
 				'max-age=31536000, immutable',
 			)
-			assert.strictEqual(capturedCommand.input.Expires, undefined)
+			assert.strictEqual(
+				(sendMock.mock.calls[0]?.arguments[0]?.input as PutObjectCommandInput)
+					?.Expires,
+				undefined,
+			)
 
 			await service.stop()
 		})
@@ -150,11 +154,8 @@ void describe('S3UploadService', () => {
 			})
 
 			// Mock the S3 client send method to capture the command
-			let capturedCommand: any
-			service['client'].send = mock.fn(async (command: any) => {
-				capturedCommand = command
-				return {}
-			})
+			const sendMock = mock.fn<S3Client['send']>(async () => ({}))
+			service['client'].send = sendMock
 
 			const testData = Buffer.from('test image content')
 			const s3Key = 'snapshots/5000/last_frame.jpg'
@@ -163,9 +164,17 @@ void describe('S3UploadService', () => {
 				contentType: 'image/jpeg',
 			})
 
-			assert.ok(capturedCommand, 'Command should be captured')
-			assert.strictEqual(capturedCommand.input.CacheControl, 'no-cache')
-			assert.strictEqual(capturedCommand.input.Expires, undefined)
+			assert.ok(sendMock.mock.callCount() > 0, 'Command should be captured')
+			assert.strictEqual(
+				(sendMock.mock.calls[0]?.arguments[0]?.input as PutObjectCommandInput)
+					?.CacheControl,
+				'no-cache',
+			)
+			assert.strictEqual(
+				(sendMock.mock.calls[0]?.arguments[0]?.input as PutObjectCommandInput)
+					?.Expires,
+				undefined,
+			)
 
 			await service.stop()
 		})
@@ -176,11 +185,8 @@ void describe('S3UploadService', () => {
 			})
 
 			// Mock the S3 client send method to capture the command
-			let capturedCommand: any
-			service['client'].send = mock.fn(async (command: any) => {
-				capturedCommand = command
-				return {}
-			})
+			const sendMock = mock.fn<S3Client['send']>(async () => ({}))
+			service['client'].send = sendMock
 
 			const testData = Buffer.from('test content')
 			const s3Key = 'test/file.m3u8'
@@ -191,9 +197,17 @@ void describe('S3UploadService', () => {
 				cacheControl: customCacheControl,
 			})
 
-			assert.ok(capturedCommand, 'Command should be captured')
-			assert.strictEqual(capturedCommand.input.CacheControl, customCacheControl)
-			assert.strictEqual(capturedCommand.input.Expires, undefined)
+			assert.ok(sendMock.mock.callCount() > 0, 'Command should be captured')
+			assert.strictEqual(
+				(sendMock.mock.calls[0]?.arguments[0]?.input as PutObjectCommandInput)
+					?.CacheControl,
+				customCacheControl,
+			)
+			assert.strictEqual(
+				(sendMock.mock.calls[0]?.arguments[0]?.input as PutObjectCommandInput)
+					?.Expires,
+				undefined,
+			)
 
 			await service.stop()
 		})
@@ -204,11 +218,8 @@ void describe('S3UploadService', () => {
 			})
 
 			// Mock the S3 client send method to capture the command
-			let capturedCommand: any
-			service['client'].send = mock.fn(async (command: any) => {
-				capturedCommand = command
-				return {}
-			})
+			const sendMock = mock.fn<S3Client['send']>(async () => ({}))
+			service['client'].send = sendMock
 
 			const testData = Buffer.from('test content')
 			const s3Key = 'test/file.txt'
@@ -217,9 +228,17 @@ void describe('S3UploadService', () => {
 				contentType: 'text/plain',
 			})
 
-			assert.ok(capturedCommand, 'Command should be captured')
-			assert.strictEqual(capturedCommand.input.CacheControl, undefined)
-			assert.strictEqual(capturedCommand.input.Expires, undefined)
+			assert.ok(sendMock.mock.callCount() > 0, 'Command should be captured')
+			assert.strictEqual(
+				(sendMock.mock.calls[0]?.arguments[0]?.input as PutObjectCommandInput)
+					?.CacheControl,
+				undefined,
+			)
+			assert.strictEqual(
+				(sendMock.mock.calls[0]?.arguments[0]?.input as PutObjectCommandInput)
+					?.Expires,
+				undefined,
+			)
 
 			await service.stop()
 		})

@@ -56,7 +56,7 @@ void describe('StreamPlayer - HLS Configuration', () => {
 			)
 		})
 
-		it('should configure liveMaxLatencyDurationCount to limit maximum latency', () => {
+		void it('should configure liveMaxLatencyDurationCount to limit maximum latency', () => {
 			const hlsConfig = {
 				enableWorker: true,
 				lowLatencyMode: true,
@@ -85,7 +85,7 @@ void describe('StreamPlayer - HLS Configuration', () => {
 			)
 		})
 
-		it('should enable liveDurationInfinity for infinite duration streams', () => {
+		void it('should enable liveDurationInfinity for infinite duration streams', () => {
 			const hlsConfig = {
 				enableWorker: true,
 				lowLatencyMode: true,
@@ -110,7 +110,7 @@ void describe('StreamPlayer - HLS Configuration', () => {
 			)
 		})
 
-		it('should enable low latency mode for live streaming', () => {
+		void it('should enable low latency mode for live streaming', () => {
 			const hlsConfig = {
 				enableWorker: true,
 				lowLatencyMode: true,
@@ -141,7 +141,7 @@ void describe('StreamPlayer - HLS Configuration', () => {
 		 * Test that retry parameters are configured correctly
 		 * Requirements: 3.1, 3.2
 		 */
-		it('should configure manifestLoadingMaxRetry to 5 attempts', () => {
+		void it('should configure manifestLoadingMaxRetry to 5 attempts', () => {
 			const hlsConfig = {
 				enableWorker: true,
 				lowLatencyMode: true,
@@ -166,7 +166,7 @@ void describe('StreamPlayer - HLS Configuration', () => {
 			)
 		})
 
-		it('should configure manifestLoadingRetryDelay to 1 second', () => {
+		void it('should configure manifestLoadingRetryDelay to 1 second', () => {
 			const hlsConfig = {
 				enableWorker: true,
 				lowLatencyMode: true,
@@ -191,7 +191,7 @@ void describe('StreamPlayer - HLS Configuration', () => {
 			)
 		})
 
-		it('should configure manifestLoadingMaxRetryTimeout for exponential backoff', () => {
+		void it('should configure manifestLoadingMaxRetryTimeout for exponential backoff', () => {
 			const hlsConfig = {
 				enableWorker: true,
 				lowLatencyMode: true,
@@ -216,7 +216,7 @@ void describe('StreamPlayer - HLS Configuration', () => {
 			)
 		})
 
-		it('should configure manifestLoadingTimeOut to 10 seconds', () => {
+		void it('should configure manifestLoadingTimeOut to 10 seconds', () => {
 			const hlsConfig = {
 				enableWorker: true,
 				lowLatencyMode: true,
@@ -247,7 +247,7 @@ void describe('StreamPlayer - HLS Configuration', () => {
 		 * Test that player is initialized correctly with live stream URL
 		 * Requirements: 3.1
 		 */
-		it('should initialize with correct configuration object', () => {
+		void it('should initialize with correct configuration object', () => {
 			const hlsConfig = {
 				enableWorker: true,
 				lowLatencyMode: true,
@@ -288,7 +288,7 @@ void describe('StreamPlayer - HLS Configuration', () => {
 			)
 		})
 
-		it('should verify HLS.js is supported before initialization', () => {
+		void it('should verify HLS.js is supported before initialization', () => {
 			// HLS.js provides isSupported() method to check browser compatibility
 			const isSupported = Hls.isSupported()
 
@@ -300,7 +300,7 @@ void describe('StreamPlayer - HLS Configuration', () => {
 			)
 		})
 
-		it('should use adaptive bitrate streaming with auto quality selection', () => {
+		void it('should use adaptive bitrate streaming with auto quality selection', () => {
 			const hlsConfig = {
 				enableWorker: true,
 				lowLatencyMode: true,
@@ -334,7 +334,7 @@ void describe('StreamPlayer - HLS Configuration', () => {
 		/**
 		 * Test that buffer parameters are configured appropriately for live streaming
 		 */
-		it('should configure appropriate buffer lengths for live streaming', () => {
+		void it('should configure appropriate buffer lengths for live streaming', () => {
 			const hlsConfig = {
 				enableWorker: true,
 				lowLatencyMode: true,
@@ -379,7 +379,7 @@ void describe('StreamPlayer - HLS Configuration', () => {
 		/**
 		 * Test that all required live streaming parameters are present
 		 */
-		it('should have all required live streaming configuration parameters', () => {
+		void it('should have all required live streaming configuration parameters', () => {
 			const hlsConfig = {
 				enableWorker: true,
 				lowLatencyMode: true,
@@ -416,7 +416,7 @@ void describe('StreamPlayer - HLS Configuration', () => {
 			}
 		})
 
-		it('should have sensible values for live streaming parameters', () => {
+		void it('should have sensible values for live streaming parameters', () => {
 			const hlsConfig = {
 				enableWorker: true,
 				lowLatencyMode: true,
@@ -470,7 +470,7 @@ void describe('StreamPlayer - Error Handling for Playlist Refresh Failures', () 
 		 * Test exponential backoff calculation for playlist refresh retries
 		 * Requirement 6.1: Retry with exponential backoff
 		 */
-		it('should implement exponential backoff for playlist refresh retries', () => {
+		void it('should implement exponential backoff for playlist refresh retries', () => {
 			// Test exponential backoff calculation: 1s, 2s, 4s, 8s, 16s
 			const calculateBackoff = (attempt: number) => 1000 * Math.pow(2, attempt)
 
@@ -501,7 +501,7 @@ void describe('StreamPlayer - Error Handling for Playlist Refresh Failures', () 
 			)
 		})
 
-		it('should calculate exponential backoff correctly for all retry attempts', () => {
+		void it('should calculate exponential backoff correctly for all retry attempts', () => {
 			// Verify the exponential backoff formula for all 5 retries
 			const retries = [
 				{ attempt: 1, expectedDelay: 1000 },
@@ -527,7 +527,7 @@ void describe('StreamPlayer - Error Handling for Playlist Refresh Failures', () 
 		 * Test retry count limits and error emission
 		 * Requirement 6.3: Emit error event after 5 consecutive failures
 		 */
-		it('should retry up to 5 times before emitting error', () => {
+		void it('should retry up to 5 times before emitting error', () => {
 			const maxRetries = 5
 
 			// Verify max retry count matches requirement
@@ -538,7 +538,7 @@ void describe('StreamPlayer - Error Handling for Playlist Refresh Failures', () 
 			)
 		})
 
-		it('should emit error event after 5 consecutive failures', () => {
+		void it('should emit error event after 5 consecutive failures', () => {
 			const maxRetries = 5
 			let errorEmitted = false
 
@@ -561,7 +561,7 @@ void describe('StreamPlayer - Error Handling for Playlist Refresh Failures', () 
 			assert.ok(errorEmitted, 'Error should be emitted after 5 failures')
 		})
 
-		it('should provide user feedback for playlist refresh errors', () => {
+		void it('should provide user feedback for playlist refresh errors', () => {
 			// After max retries, user should be informed
 			let userMessage = ''
 
@@ -593,7 +593,7 @@ void describe('StreamPlayer - Error Handling for Playlist Refresh Failures', () 
 		 * Test that buffered segments continue playing during retries
 		 * Requirement 6.2: Continue playing buffered segments during retries
 		 */
-		it('should continue playing buffered segments during retries', () => {
+		void it('should continue playing buffered segments during retries', () => {
 			// The implementation should NOT destroy the HLS player during retries
 			// This allows buffered segments to continue playing
 			// This is a behavioral test - the player should remain active
@@ -606,7 +606,7 @@ void describe('StreamPlayer - Error Handling for Playlist Refresh Failures', () 
 			)
 		})
 
-		it('should not treat playlist refresh failures as fatal', () => {
+		void it('should not treat playlist refresh failures as fatal', () => {
 			// Playlist refresh failures should not destroy the player
 			// They should be handled gracefully with retries
 			const errorData = {
@@ -628,7 +628,7 @@ void describe('StreamPlayer - Error Handling for Playlist Refresh Failures', () 
 		 * Test recovery when playlist becomes available again
 		 * Requirement 6.4: Resume normal operation when playlist becomes available
 		 */
-		it('should reset failure count on successful playlist load', () => {
+		void it('should reset failure count on successful playlist load', () => {
 			// Simulate failure followed by success
 			let failureCount = 3
 
@@ -646,7 +646,7 @@ void describe('StreamPlayer - Error Handling for Playlist Refresh Failures', () 
 			)
 		})
 
-		it('should resume normal operation when playlist becomes available', () => {
+		void it('should resume normal operation when playlist becomes available', () => {
 			// Test that after failures, a successful load resumes normal operation
 			let failureCount = 5
 			let errorState = 'error'
@@ -671,7 +671,7 @@ void describe('StreamPlayer - Error Handling for Playlist Refresh Failures', () 
 			)
 		})
 
-		it('should clear error message on successful recovery', () => {
+		void it('should clear error message on successful recovery', () => {
 			// After recovery, error message should be cleared
 			let errorMessage: string | null =
 				'Unable to refresh playlist after multiple attempts.'
@@ -695,7 +695,7 @@ void describe('StreamPlayer - Error Handling for Playlist Refresh Failures', () 
 		/**
 		 * Test that manifestLoadError is detected correctly
 		 */
-		it('should handle manifestLoadError specifically', () => {
+		void it('should handle manifestLoadError specifically', () => {
 			// The error handler should specifically check for manifestLoadError
 			const errorData = {
 				type: 'networkError',
@@ -716,7 +716,7 @@ void describe('StreamPlayer - Error Handling for Playlist Refresh Failures', () 
 			)
 		})
 
-		it('should distinguish between manifest errors and other network errors', () => {
+		void it('should distinguish between manifest errors and other network errors', () => {
 			// Manifest load errors should be handled differently from other network errors
 			const manifestError = {
 				type: 'networkError',
@@ -745,13 +745,13 @@ void describe('StreamPlayer - Error Handling for Playlist Refresh Failures', () 
 		/**
 		 * Test integration with HLS.js error event system
 		 */
-		it('should listen for HLS.Events.ERROR', () => {
+		void it('should listen for HLS.Events.ERROR', () => {
 			// Verify that the error event listener is set up
 			// This is tested by checking that Hls.Events.ERROR exists
 			assert.ok(Hls.Events.ERROR, 'HLS.Events.ERROR should be defined')
 		})
 
-		it('should listen for HLS.Events.MANIFEST_LOADED for recovery', () => {
+		void it('should listen for HLS.Events.MANIFEST_LOADED for recovery', () => {
 			// Verify that the manifest loaded event listener is set up for recovery
 			assert.ok(
 				Hls.Events.MANIFEST_LOADED,
@@ -759,7 +759,7 @@ void describe('StreamPlayer - Error Handling for Playlist Refresh Failures', () 
 			)
 		})
 
-		it('should check for NETWORK_ERROR type in error handler', () => {
+		void it('should check for NETWORK_ERROR type in error handler', () => {
 			// Verify that error type checking is implemented
 			const errorTypes = Hls.ErrorTypes
 

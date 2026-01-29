@@ -1,3 +1,4 @@
+import type { PutObjectCommandInput, S3Client } from '@aws-sdk/client-s3'
 import * as fc from 'fast-check'
 import assert from 'node:assert'
 import { describe, it, mock } from 'node:test'
@@ -426,11 +427,8 @@ void describe('S3UploadService - Property Tests', () => {
 						})
 
 						// Mock the S3 client send method to capture the command
-						let capturedCommand: any
-						service['client'].send = mock.fn(async (command: any) => {
-							capturedCommand = command
-							return {}
-						})
+						const sendMock = mock.fn<S3Client['send']>(async () => ({}))
+						service['client'].send = sendMock
 
 						const s3Key = `hls/${port}/${profile}/segment_${segmentNumber.toString().padStart(5, '0')}.ts`
 						await service.uploadData(Buffer.from(data), s3Key, {
@@ -439,18 +437,27 @@ void describe('S3UploadService - Property Tests', () => {
 
 						// Verify exact cache-control value
 						assert.strictEqual(
-							capturedCommand.input.CacheControl,
+							(
+								sendMock.mock.calls[0]?.arguments[0]
+									?.input as PutObjectCommandInput
+							)?.CacheControl,
 							'max-age=31536000, immutable',
 							'Cache-Control should be exactly "max-age=31536000, immutable"',
 						)
 
 						// Verify it contains both max-age and immutable
 						assert.ok(
-							capturedCommand.input.CacheControl.includes('max-age=31536000'),
+							(
+								sendMock.mock.calls[0]?.arguments[0]
+									?.input as PutObjectCommandInput
+							)?.CacheControl?.includes('max-age=31536000') ?? false,
 							'Cache-Control should include max-age=31536000',
 						)
 						assert.ok(
-							capturedCommand.input.CacheControl.includes('immutable'),
+							(
+								sendMock.mock.calls[0]?.arguments[0]
+									?.input as PutObjectCommandInput
+							)?.CacheControl?.includes('immutable') ?? false,
 							'Cache-Control should include immutable',
 						)
 

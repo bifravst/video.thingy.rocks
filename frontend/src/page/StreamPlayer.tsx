@@ -510,7 +510,7 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 							</div>
 
 							{/* Playlist Refresh Error Warning */}
-							{playlistRefreshError && (
+							{playlistRefreshError !== null && (
 								<div
 									style={{
 										marginTop: '1rem',
