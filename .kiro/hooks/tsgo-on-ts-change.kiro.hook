@@ -11,6 +11,6 @@
   },
   "then": {
     "type": "askAgent",
-    "prompt": "Run `npx tsgo` to check for TypeScript errors and fix any issues found"
+    "prompt": "Run `npx tsgo` to check for TypeScript errors and fix any issues found. Consider no output from the script as success."
   }
 }
