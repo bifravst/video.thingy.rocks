@@ -14,9 +14,15 @@ export const StreamList = () => {
 	const [error, setError] = useState<string | null>(null)
 	const [retryCount, setRetryCount] = useState(0)
 	const [isRetrying, setIsRetrying] = useState(false)
+	const [maxRetriesReached, setMaxRetriesReached] = useState(false)
 
-	const fetchStreams = async () => {
+	const fetchStreams = async (isManualRetry = false) => {
 		if (!awsConfig) {
+			return
+		}
+
+		// Don't retry automatically if max retries reached (unless manual retry)
+		if (maxRetriesReached && !isManualRetry) {
 			return
 		}
 
@@ -31,26 +37,32 @@ export const StreamList = () => {
 			setError(null)
 			setRetryCount(0)
 			setIsRetrying(false)
+			setMaxRetriesReached(false)
 		} catch (err) {
 			console.error('[StreamList] Failed to fetch streams:', err)
 			const errorMessage =
 				err instanceof Error ? err.message : 'Failed to load streams'
 			setError(errorMessage)
 
-			// Implement exponential backoff for retries
-			if (retryCount < 5) {
+			// Check if we should retry (before incrementing count)
+			const nextRetryCount = retryCount + 1
+			if (nextRetryCount <= 5 && !maxRetriesReached) {
 				const backoffDelay = Math.min(1000 * Math.pow(2, retryCount), 30000) // Max 30 seconds
 				console.log(
-					`[StreamList] Retrying in ${backoffDelay}ms (attempt ${retryCount + 1})`,
+					`[StreamList] Retrying in ${backoffDelay}ms (attempt ${nextRetryCount}/5)`,
 				)
 				setIsRetrying(true)
+				setRetryCount(nextRetryCount)
 
 				setTimeout(() => {
-					setRetryCount((prev) => prev + 1)
 					void fetchStreams()
 				}, backoffDelay)
 			} else {
 				setIsRetrying(false)
+				setMaxRetriesReached(true)
+				console.log(
+					'[StreamList] Max retries reached, stopping automatic retries',
+				)
 			}
 		} finally {
 			setLoading(false)
@@ -65,20 +77,23 @@ export const StreamList = () => {
 		// Initial fetch
 		void fetchStreams()
 
-		// Set up polling
+		// Set up polling - only if not in error state with max retries
 		const intervalId = setInterval(() => {
-			void fetchStreams()
+			if (!maxRetriesReached) {
+				void fetchStreams()
+			}
 		}, POLL_INTERVAL)
 
 		return () => clearInterval(intervalId)
-	}, [awsConfig])
+	}, [awsConfig, maxRetriesReached])
 
 	const handleRetry = () => {
 		setLoading(true)
 		setError(null)
 		setRetryCount(0)
 		setIsRetrying(false)
-		void fetchStreams()
+		setMaxRetriesReached(false)
+		void fetchStreams(true) // Manual retry
 	}
 
 	const handleStreamClick = (port: number) => {

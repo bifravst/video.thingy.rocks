@@ -142,6 +142,15 @@ export class StreamingStack extends Stack {
 			},
 			accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
 			removalPolicy: RemovalPolicy.DESTROY,
+			// Email configuration - use Cognito default for now
+			// To use custom SES: configure email property with SES settings
+			email: cognito.UserPoolEmail.withCognito('noreply@verificationemail.com'),
+			// Verification messages
+			userVerification: {
+				emailSubject: 'Verify your email for Video Streaming',
+				emailBody: 'Thank you for signing up! Your verification code is {####}',
+				emailStyle: cognito.VerificationEmailStyle.CODE,
+			},
 		})
 
 		// Create User Pool Client for frontend
@@ -211,6 +220,14 @@ export class StreamingStack extends Stack {
 
 		// Grant read-only access to StreamMetadata table
 		this.streamTable.grantReadData(this.unauthRole)
+		// Also grant Scan permission for listing all streams
+		this.unauthRole.addToPolicy(
+			new iam.PolicyStatement({
+				effect: iam.Effect.ALLOW,
+				actions: ['dynamodb:Scan'],
+				resources: [this.streamTable.tableArn],
+			}),
+		)
 
 		// Create IAM role for authenticated users with read-only DynamoDB access
 		this.authRole = new iam.Role(this, 'AuthRole', {
@@ -230,6 +247,14 @@ export class StreamingStack extends Stack {
 
 		// Grant read-only access to StreamMetadata table for authenticated users
 		this.streamTable.grantReadData(this.authRole)
+		// Also grant Scan permission for listing all streams
+		this.authRole.addToPolicy(
+			new iam.PolicyStatement({
+				effect: iam.Effect.ALLOW,
+				actions: ['dynamodb:Scan'],
+				resources: [this.streamTable.tableArn],
+			}),
+		)
 
 		// Attach the roles to the identity pool
 		new cognito.CfnIdentityPoolRoleAttachment(

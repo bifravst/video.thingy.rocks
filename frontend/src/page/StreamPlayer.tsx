@@ -31,14 +31,20 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 	>(null)
 	const [retryCount, setRetryCount] = useState(0)
 	const [isRetrying, setIsRetrying] = useState(false)
+	const [maxRetriesReached, setMaxRetriesReached] = useState(false)
 
 	const videoRef = useRef<HTMLVideoElement>(null)
 	const hlsRef = useRef<Hls | null>(null)
 	const retryTimeoutRef = useRef<number | null>(null)
 
 	// Fetch stream details
-	const fetchStreamDetail = async () => {
+	const fetchStreamDetail = async (isManualRetry = false) => {
 		if (!awsConfig) {
+			return
+		}
+
+		// Don't retry automatically if max retries reached (unless manual retry)
+		if (maxRetriesReached && !isManualRetry) {
 			return
 		}
 
@@ -53,26 +59,32 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 			setError(null)
 			setRetryCount(0) // Reset retry count on success
 			setIsRetrying(false)
+			setMaxRetriesReached(false)
 		} catch (err) {
 			console.error('[StreamPlayer] Failed to fetch stream detail:', err)
 			const errorMessage =
 				err instanceof Error ? err.message : 'Failed to load stream'
 			setError(errorMessage)
 
-			// Implement exponential backoff for retries
-			if (retryCount < 5) {
+			// Check if we should retry (before incrementing count)
+			const nextRetryCount = retryCount + 1
+			if (nextRetryCount <= 5 && !maxRetriesReached) {
 				const backoffDelay = Math.min(1000 * Math.pow(2, retryCount), 30000) // Max 30 seconds
 				console.log(
-					`[StreamPlayer] Retrying in ${backoffDelay}ms (attempt ${retryCount + 1})`,
+					`[StreamPlayer] Retrying in ${backoffDelay}ms (attempt ${nextRetryCount}/5)`,
 				)
 				setIsRetrying(true)
+				setRetryCount(nextRetryCount)
 
 				retryTimeoutRef.current = window.setTimeout(() => {
-					setRetryCount((prev) => prev + 1)
 					void fetchStreamDetail()
 				}, backoffDelay)
 			} else {
 				setIsRetrying(false)
+				setMaxRetriesReached(true)
+				console.log(
+					'[StreamPlayer] Max retries reached, stopping automatic retries',
+				)
 			}
 		} finally {
 			setLoading(false)
@@ -97,11 +109,13 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 		void fetchStreamDetail()
 
 		const intervalId = setInterval(() => {
-			void fetchStreamDetail()
+			if (!maxRetriesReached) {
+				void fetchStreamDetail()
+			}
 		}, POLL_INTERVAL)
 
 		return () => clearInterval(intervalId)
-	}, [awsConfig, port])
+	}, [awsConfig, port, maxRetriesReached])
 
 	// Detect stream status changes and handle transitions
 	useEffect(() => {
@@ -279,10 +293,11 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 		setError(null)
 		setRetryCount(0)
 		setIsRetrying(false)
+		setMaxRetriesReached(false)
 		if (retryTimeoutRef.current !== null) {
 			clearTimeout(retryTimeoutRef.current)
 		}
-		void fetchStreamDetail()
+		void fetchStreamDetail(true) // Manual retry
 	}
 
 	if (!awsConfig) {

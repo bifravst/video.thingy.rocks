@@ -50,9 +50,11 @@ export class StreamDynamoDBClient {
 				const metadata = item as StreamMetadata
 				return {
 					port: metadata.port,
-					status: metadata.status,
-					lastPacketTime: metadata.lastPacketTime,
-					thumbnailUrl: this.buildCloudFrontUrl(metadata.lastFramePath),
+					status: metadata.status ?? 'inactive',
+					lastPacketTime: metadata.lastPacketTime ?? new Date().toISOString(),
+					thumbnailUrl:
+						this.buildCloudFrontUrl(metadata.lastFramePath) ||
+						'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="300" height="200"%3E%3Crect fill="%23ddd" width="300" height="200"/%3E%3Ctext x="50%25" y="50%25" text-anchor="middle" dy=".3em" fill="%23999"%3ENo Image%3C/text%3E%3C/svg%3E',
 				}
 			})
 
@@ -83,14 +85,16 @@ export class StreamDynamoDBClient {
 
 			return {
 				port: metadata.port,
-				status: metadata.status,
-				lastPacketTime: metadata.lastPacketTime,
-				hlsManifestUrl: this.buildCloudFrontUrl(metadata.hlsManifestPath),
-				rawStreamUrl: this.buildCloudFrontUrl(metadata.rawStreamPath),
-				lastFrameUrl: this.buildCloudFrontUrl(metadata.lastFramePath),
+				status: metadata.status ?? 'inactive',
+				lastPacketTime: metadata.lastPacketTime ?? new Date().toISOString(),
+				hlsManifestUrl: this.buildCloudFrontUrl(metadata.hlsManifestPath) || '',
+				rawStreamUrl: this.buildCloudFrontUrl(metadata.rawStreamPath) || '',
+				lastFrameUrl:
+					this.buildCloudFrontUrl(metadata.lastFramePath) ||
+					'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="800" height="600"%3E%3Crect fill="%23333" width="800" height="600"/%3E%3Ctext x="50%25" y="50%25" text-anchor="middle" dy=".3em" fill="%23999" font-size="24"%3ENo Image Available%3C/text%3E%3C/svg%3E',
 				metadata: {
-					createdAt: metadata.createdAt,
-					updatedAt: metadata.updatedAt,
+					createdAt: metadata.createdAt ?? new Date().toISOString(),
+					updatedAt: metadata.updatedAt ?? new Date().toISOString(),
 				},
 			}
 		} catch (error) {
@@ -140,7 +144,12 @@ export class StreamDynamoDBClient {
 	/**
 	 * Build CloudFront URL from S3 path
 	 */
-	private buildCloudFrontUrl(s3Path: string): string {
+	private buildCloudFrontUrl(s3Path: string | undefined): string {
+		// Handle undefined or empty paths
+		if (s3Path === undefined || s3Path === null) {
+			return ''
+		}
+
 		// Remove s3://bucket/ prefix if present
 		const path = s3Path.replace(/^s3:\/\/[^/]+\//, '')
 		return `https://${this.cloudFrontDomain}/${path}`
