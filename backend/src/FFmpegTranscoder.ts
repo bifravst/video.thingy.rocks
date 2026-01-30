@@ -335,7 +335,10 @@ export class FFmpegTranscoder extends EventEmitter {
 			// Live streaming flags: mark as event stream, append to playlist
 			// Note: omit_endlist is removed so FFmpeg can add #EXT-X-ENDLIST on graceful shutdown
 			args.push('-hls_playlist_type', 'event')
-			args.push('-hls_flags', 'delete_segments+append_list')
+			args.push('-hls_flags', 'append_list+program_date_time')
+			args.push('-hls_start_number_source', 'datetime')
+			args.push('-hls_init_time', '6')
+			args.push('-hls_segment_options', 'Cache-Control:max-age=60')
 			args.push('-hls_segment_filename', `${profileDir}/segment_%05d.ts`)
 			args.push(`${profileDir}/playlist.m3u8`)
 		}

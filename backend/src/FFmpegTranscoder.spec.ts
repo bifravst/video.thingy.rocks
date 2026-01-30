@@ -139,13 +139,50 @@ void describe('FFmpegTranscoder', () => {
 				'hls_flags should include append_list',
 			)
 			assert.ok(
-				hlsFlags?.includes('delete_segments') ?? false,
-				'hls_flags should include delete_segments',
+				hlsFlags?.includes('program_date_time') ?? false,
+				'hls_flags should include program_date_time',
+			)
+			assert.ok(
+				!(hlsFlags?.includes('delete_segments') ?? true),
+				'hls_flags should NOT include delete_segments',
 			)
 			// Note: omit_endlist is NOT included so FFmpeg can add #EXT-X-ENDLIST on graceful shutdown
 			assert.ok(
 				!(hlsFlags?.includes('omit_endlist') ?? true),
 				'hls_flags should NOT include omit_endlist to allow stream end signaling',
+			)
+
+			// Verify hls_start_number_source is set to 'datetime'
+			const startNumberSourceIndex = command.indexOf('-hls_start_number_source')
+			assert.ok(
+				startNumberSourceIndex >= 0,
+				'hls_start_number_source should be present',
+			)
+			assert.strictEqual(
+				command[startNumberSourceIndex + 1],
+				'datetime',
+				'hls_start_number_source should be set to datetime',
+			)
+
+			// Verify hls_init_time is set to '6'
+			const initTimeIndex = command.indexOf('-hls_init_time')
+			assert.ok(initTimeIndex >= 0, 'hls_init_time should be present')
+			assert.strictEqual(
+				command[initTimeIndex + 1],
+				'6',
+				'hls_init_time should be set to 6',
+			)
+
+			// Verify hls_segment_options includes Cache-Control
+			const segmentOptionsIndex = command.indexOf('-hls_segment_options')
+			assert.ok(
+				segmentOptionsIndex >= 0,
+				'hls_segment_options should be present',
+			)
+			assert.strictEqual(
+				command[segmentOptionsIndex + 1],
+				'Cache-Control:max-age=60',
+				'hls_segment_options should set Cache-Control header',
 			)
 		})
 
@@ -528,8 +565,8 @@ void describe('FFmpegTranscoder', () => {
 				'Command should include append_list flag',
 			)
 			assert.ok(
-				commandStr.includes('delete_segments'),
-				'Command should include delete_segments flag',
+				!commandStr.includes('delete_segments'),
+				'Command should NOT include delete_segments flag',
 			)
 		})
 
