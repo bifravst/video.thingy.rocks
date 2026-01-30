@@ -114,6 +114,7 @@ export class TranscodingManager extends EventEmitter {
 	async stopTranscoding(port: number): Promise<void> {
 		const transcoder = this.transcoders.get(port)
 		if (!transcoder) {
+			console.log(`[TranscodingManager] No transcoder to stop for port ${port}`)
 			return
 		}
 
@@ -121,7 +122,6 @@ export class TranscodingManager extends EventEmitter {
 			await transcoder.pipeline.stop()
 			transcoder.snapshot.stop()
 			transcoder.rawStream.stop()
-			this.transcoders.delete(port)
 
 			console.log(`[TranscodingManager] Stopped transcoding for port ${port}`)
 			this.emit('transcodingStopped', port)
@@ -130,7 +130,13 @@ export class TranscodingManager extends EventEmitter {
 				`[TranscodingManager] Error stopping transcoding for port ${port}:`,
 				error,
 			)
-			throw error
+			// Don't throw - we still want to clean up
+		} finally {
+			// Always remove from map, even if stop failed
+			this.transcoders.delete(port)
+			console.log(
+				`[TranscodingManager] Removed transcoder from map for port ${port}`,
+			)
 		}
 	}
 

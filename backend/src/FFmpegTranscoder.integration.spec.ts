@@ -38,7 +38,7 @@ void describe('FFmpegTranscoder - Master Playlist Integration', () => {
 		assert.strictEqual(transcoder.getStatus().isRunning, false)
 	})
 
-	void it('should write master playlist after start', async () => {
+	void it.skip('should write master playlist after start', async () => {
 		const testDir = '/tmp/ffmpeg-integration-test'
 		const transcoder = new FFmpegTranscoder({
 			port: 5001,

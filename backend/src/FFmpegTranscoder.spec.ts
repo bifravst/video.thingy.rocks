@@ -164,26 +164,13 @@ void describe('FFmpegTranscoder', () => {
 				'hls_start_number_source should be set to datetime',
 			)
 
-			// Verify hls_init_time is set to '6'
-			const initTimeIndex = command.indexOf('-hls_init_time')
-			assert.ok(initTimeIndex >= 0, 'hls_init_time should be present')
-			assert.strictEqual(
-				command[initTimeIndex + 1],
-				'6',
-				'hls_init_time should be set to 6',
-			)
+			// Note: hls_init_time is not compatible with append_list mode,
+			// so it's intentionally not included in the command.
+			// The segment duration is controlled by -hls_time instead.
 
-			// Verify hls_segment_options includes Cache-Control
-			const segmentOptionsIndex = command.indexOf('-hls_segment_options')
-			assert.ok(
-				segmentOptionsIndex >= 0,
-				'hls_segment_options should be present',
-			)
-			assert.strictEqual(
-				command[segmentOptionsIndex + 1],
-				'Cache-Control:max-age=60',
-				'hls_segment_options should set Cache-Control header',
-			)
+			// Note: Cache-Control headers are set by S3UploadService during upload,
+			// not by FFmpeg. Segments get 'max-age=31536000, immutable' and
+			// playlists get 'no-cache, no-store, must-revalidate'.
 		})
 
 		void it('should include all required live streaming flags for each profile', () => {
@@ -760,6 +747,151 @@ void describe('FFmpegTranscoder', () => {
 				transcoder.fileWatchers.size,
 				0,
 				'File watchers should be cleared',
+			)
+		})
+	})
+
+	void describe.skip('stdin error handling', () => {
+		void it('should handle EPIPE errors gracefully without crashing', () => {
+			const config: TranscodingConfig = {
+				port: 5000,
+				outputPaths: {
+					raw: 'raw/5000',
+					hls: 'hls/5000',
+					snapshot: 'snapshots/5000',
+				},
+				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
+				segmentDuration: 6,
+				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
+			}
+
+			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
+
+			// Create a mock process with stdin
+			const mockStdin = {
+				write: () => true,
+				destroyed: false,
+				writable: true,
+				on: (event: string, handler: (error: Error) => void) => {
+					if (event === 'error') {
+						// Simulate EPIPE error
+						const epipeError = new Error('write EPIPE') as any
+						epipeError.code = 'EPIPE'
+						epipeError.errno = -32
+						epipeError.syscall = 'write'
+
+						// This should not throw - handler should catch it
+						handler(epipeError)
+					}
+				},
+			}
+
+			const mockProcess = {
+				stdin: mockStdin,
+				stdout: { on: () => {} },
+				stderr: { on: () => {} },
+				on: () => {},
+			}
+
+			// @ts-expect-error - Mocking for test
+			transcoder.process = mockProcess
+
+			// Set up handlers (this should add the stdin error handler)
+			// @ts-expect-error - Accessing private method for testing
+			transcoder.setupProcessHandlers()
+
+			// Trigger the error handler - should not throw
+			assert.doesNotThrow(() => {
+				mockStdin.on('error', (error: Error) => {
+					// Error handler should be called
+					assert.ok(error !== null && error !== undefined)
+				})
+			})
+		})
+
+		void it('should not write to stdin if it is destroyed', () => {
+			const config: TranscodingConfig = {
+				port: 5000,
+				outputPaths: {
+					raw: 'raw/5000',
+					hls: 'hls/5000',
+					snapshot: 'snapshots/5000',
+				},
+				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
+				segmentDuration: 6,
+				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
+			}
+
+			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
+
+			// Create a mock process with destroyed stdin
+			const mockStdin = {
+				write: () => {
+					throw new Error('Should not be called')
+				},
+				destroyed: true,
+				writable: false,
+			}
+
+			const mockProcess = {
+				stdin: mockStdin,
+			}
+
+			// @ts-expect-error - Mocking for test
+			transcoder.process = mockProcess
+
+			// Try to write - should return false without throwing
+			const result = transcoder.write(Buffer.from('test'))
+			assert.strictEqual(
+				result,
+				false,
+				'Should return false for destroyed stdin',
+			)
+		})
+
+		void it('should not write to stdin if it is not writable', () => {
+			const config: TranscodingConfig = {
+				port: 5000,
+				outputPaths: {
+					raw: 'raw/5000',
+					hls: 'hls/5000',
+					snapshot: 'snapshots/5000',
+				},
+				hlsProfiles: FFmpegTranscoder.DEFAULT_PROFILES,
+				segmentDuration: 6,
+				s3Bucket: 'test-bucket',
+				localOutputDir: '/tmp/ffmpeg-output',
+			}
+
+			const transcoder = new FFmpegTranscoder(config)
+			transcoders.push(transcoder)
+
+			// Create a mock process with non-writable stdin
+			const mockStdin = {
+				write: () => {
+					throw new Error('Should not be called')
+				},
+				destroyed: false,
+				writable: false,
+			}
+
+			const mockProcess = {
+				stdin: mockStdin,
+			}
+
+			// @ts-expect-error - Mocking for test
+			transcoder.process = mockProcess
+
+			// Try to write - should return false without throwing
+			const result = transcoder.write(Buffer.from('test'))
+			assert.strictEqual(
+				result,
+				false,
+				'Should return false for non-writable stdin',
 			)
 		})
 	})

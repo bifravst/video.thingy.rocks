@@ -4,6 +4,8 @@ import assert from 'node:assert'
 import { describe, it, mock } from 'node:test'
 import { CACHE_CONFIGS, S3UploadService } from './S3UploadService.ts'
 
+const testConfig = { bucket: 'test-bucket', uploadIntervalMs: 0 } as const
+
 /**
  * Property-Based Tests for S3 Upload Service Cache Headers
  *
@@ -68,9 +70,7 @@ void describe('S3UploadService - Property Tests', () => {
 					profileArb,
 					playlistContentArb,
 					async (port, profile, content) => {
-						const service = new S3UploadService({
-							bucket: 'test-bucket',
-						})
+						const service = new S3UploadService(testConfig)
 
 						// Mock the S3 client send method to capture the command
 						let capturedCommand: any
@@ -116,9 +116,7 @@ void describe('S3UploadService - Property Tests', () => {
 					profileArb,
 					playlistContentArb,
 					async (port, profile, content) => {
-						const service = new S3UploadService({
-							bucket: 'test-bucket',
-						})
+						const service = new S3UploadService(testConfig)
 
 						// Mock the S3 client send method to capture the command
 						let capturedCommand: any
@@ -149,9 +147,7 @@ void describe('S3UploadService - Property Tests', () => {
 		void it('should set no-cache headers for master playlists', async () => {
 			await fc.assert(
 				fc.asyncProperty(portArb, playlistContentArb, async (port, content) => {
-					const service = new S3UploadService({
-						bucket: 'test-bucket',
-					})
+					const service = new S3UploadService(testConfig)
 
 					// Mock the S3 client send method to capture the command
 					let capturedCommand: any
@@ -194,9 +190,7 @@ void describe('S3UploadService - Property Tests', () => {
 						maxLength: 100,
 					}),
 					async (port, profile, chunks) => {
-						const service = new S3UploadService({
-							bucket: 'test-bucket',
-						})
+						const service = new S3UploadService(testConfig)
 
 						// Mock the S3 client send method to capture the command
 						let capturedCommand: any
@@ -233,7 +227,7 @@ void describe('S3UploadService - Property Tests', () => {
 	 * **Validates: Requirements 7.4, 7.5**
 	 *
 	 * For any segment file (.ts) uploaded to S3, the Cache-Control header
-	 * should be set to `max-age=31536000, immutable` and the content type
+	 * should be set to `max-age=60, public` and the content type
 	 * should be `video/mp2t`.
 	 */
 	void describe('Property 4: Segment Cache Headers', () => {
@@ -256,7 +250,7 @@ void describe('S3UploadService - Property Tests', () => {
 		// Arbitrary generator for segment data (simulating video data)
 		const segmentDataArb = fc.uint8Array({ minLength: 100, maxLength: 10000 })
 
-		void it('should set immutable cache headers for all segment files', async () => {
+		void it('should set public cache headers for all segment files', async () => {
 			await fc.assert(
 				fc.asyncProperty(
 					portArb,
@@ -264,9 +258,7 @@ void describe('S3UploadService - Property Tests', () => {
 					segmentNumberArb,
 					segmentDataArb,
 					async (port, profile, segmentNumber, data) => {
-						const service = new S3UploadService({
-							bucket: 'test-bucket',
-						})
+						const service = new S3UploadService(testConfig)
 
 						// Mock the S3 client send method to capture the command
 						let capturedCommand: any
@@ -284,7 +276,7 @@ void describe('S3UploadService - Property Tests', () => {
 						assert.strictEqual(
 							capturedCommand.input.CacheControl,
 							CACHE_CONFIGS.SEGMENT.cacheControl,
-							`Segment ${s3Key} should have immutable cache headers`,
+							`Segment ${s3Key} should have public cache headers`,
 						)
 
 						// Verify Expires is not set for segments
@@ -309,9 +301,7 @@ void describe('S3UploadService - Property Tests', () => {
 					segmentNumberArb,
 					segmentDataArb,
 					async (port, profile, segmentNumber, data) => {
-						const service = new S3UploadService({
-							bucket: 'test-bucket',
-						})
+						const service = new S3UploadService(testConfig)
 
 						// Mock the S3 client send method to capture the command
 						let capturedCommand: any
@@ -339,16 +329,14 @@ void describe('S3UploadService - Property Tests', () => {
 			)
 		})
 
-		void it('should set immutable headers for raw segments', async () => {
+		void it('should set public headers for raw segments', async () => {
 			await fc.assert(
 				fc.asyncProperty(
 					portArb,
 					segmentNumberArb,
 					segmentDataArb,
 					async (port, segmentNumber, data) => {
-						const service = new S3UploadService({
-							bucket: 'test-bucket',
-						})
+						const service = new S3UploadService(testConfig)
 
 						// Mock the S3 client send method to capture the command
 						let capturedCommand: any
@@ -366,7 +354,7 @@ void describe('S3UploadService - Property Tests', () => {
 						assert.strictEqual(
 							capturedCommand.input.CacheControl,
 							CACHE_CONFIGS.SEGMENT.cacheControl,
-							`Raw segment ${s3Key} should have immutable cache headers`,
+							`Raw segment ${s3Key} should have public cache headers`,
 						)
 
 						await service.stop()
@@ -376,7 +364,7 @@ void describe('S3UploadService - Property Tests', () => {
 			)
 		})
 
-		void it('should apply immutable headers regardless of segment size', async () => {
+		void it('should apply public headers regardless of segment size', async () => {
 			await fc.assert(
 				fc.asyncProperty(
 					portArb,
@@ -384,9 +372,7 @@ void describe('S3UploadService - Property Tests', () => {
 					segmentNumberArb,
 					fc.uint8Array({ minLength: 1, maxLength: 100000 }),
 					async (port, profile, segmentNumber, data) => {
-						const service = new S3UploadService({
-							bucket: 'test-bucket',
-						})
+						const service = new S3UploadService(testConfig)
 
 						// Mock the S3 client send method to capture the command
 						let capturedCommand: any
@@ -404,7 +390,7 @@ void describe('S3UploadService - Property Tests', () => {
 						assert.strictEqual(
 							capturedCommand.input.CacheControl,
 							CACHE_CONFIGS.SEGMENT.cacheControl,
-							`Segment ${s3Key} of size ${data.length} should have immutable cache headers`,
+							`Segment ${s3Key} of size ${data.length} should have public cache headers`,
 						)
 
 						await service.stop()
@@ -422,9 +408,7 @@ void describe('S3UploadService - Property Tests', () => {
 					segmentNumberArb,
 					segmentDataArb,
 					async (port, profile, segmentNumber, data) => {
-						const service = new S3UploadService({
-							bucket: 'test-bucket',
-						})
+						const service = new S3UploadService(testConfig)
 
 						// Mock the S3 client send method to capture the command
 						const sendMock = mock.fn<S3Client['send']>(async () => ({}))
@@ -441,24 +425,24 @@ void describe('S3UploadService - Property Tests', () => {
 								sendMock.mock.calls[0]?.arguments[0]
 									?.input as PutObjectCommandInput
 							)?.CacheControl,
-							'max-age=31536000, immutable',
-							'Cache-Control should be exactly "max-age=31536000, immutable"',
+							'max-age=60, public',
+							'Cache-Control should be exactly "max-age=60, public"',
 						)
 
-						// Verify it contains both max-age and immutable
+						// Verify it contains both max-age and public
 						assert.ok(
 							(
 								sendMock.mock.calls[0]?.arguments[0]
 									?.input as PutObjectCommandInput
-							)?.CacheControl?.includes('max-age=31536000') ?? false,
-							'Cache-Control should include max-age=31536000',
+							)?.CacheControl?.includes('max-age=60') ?? false,
+							'Cache-Control should include max-age=60',
 						)
 						assert.ok(
 							(
 								sendMock.mock.calls[0]?.arguments[0]
 									?.input as PutObjectCommandInput
-							)?.CacheControl?.includes('immutable') ?? false,
-							'Cache-Control should include immutable',
+							)?.CacheControl?.includes('public') ?? false,
+							'Cache-Control should include public',
 						)
 
 						await service.stop()
@@ -477,9 +461,7 @@ void describe('S3UploadService - Property Tests', () => {
 					segmentNumberArb,
 					segmentDataArb,
 					async (port, prefix, profile, segmentNumber, data) => {
-						const service = new S3UploadService({
-							bucket: 'test-bucket',
-						})
+						const service = new S3UploadService(testConfig)
 
 						// Mock the S3 client send method to capture the command
 						let capturedCommand: any
@@ -497,7 +479,7 @@ void describe('S3UploadService - Property Tests', () => {
 						assert.strictEqual(
 							capturedCommand.input.CacheControl,
 							CACHE_CONFIGS.SEGMENT.cacheControl,
-							`Segment ${s3Key} should have immutable cache headers`,
+							`Segment ${s3Key} should have public cache headers`,
 						)
 
 						await service.stop()

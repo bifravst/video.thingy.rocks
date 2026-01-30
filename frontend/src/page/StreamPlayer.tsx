@@ -12,6 +12,111 @@ type StreamPlayerProps = {
 	port: number
 }
 
+/**
+ * Check if a recording is available by performing a HEAD request to the manifest URL
+ * @param manifestUrl - The HLS manifest URL to check
+ * @returns Promise<boolean> - true if recording is available (200 status), false otherwise
+ * Requirements: 1.2, 1.3, 1.4
+ */
+const checkRecordingAvailability = async (
+	manifestUrl: string,
+): Promise<boolean> => {
+	try {
+		console.log('[StreamPlayer] Checking recording availability:', manifestUrl)
+
+		// Create an AbortController for timeout handling
+		const controller = new AbortController()
+		const timeoutId = setTimeout(() => controller.abort(), 5000) // 5 second timeout
+
+		const response = await fetch(manifestUrl, {
+			method: 'HEAD',
+			signal: controller.signal,
+		})
+
+		clearTimeout(timeoutId)
+
+		const isAvailable = response.status === 200
+		console.log(
+			`[StreamPlayer] Recording availability check result: ${isAvailable ? 'available' : 'not available'} (status: ${response.status})`,
+		)
+
+		return isAvailable
+	} catch (error) {
+		// Handle network errors and timeouts
+		if (error instanceof Error) {
+			if (error.name === 'AbortError') {
+				console.log(
+					'[StreamPlayer] Recording availability check timed out after 5 seconds',
+				)
+			} else {
+				console.log(
+					'[StreamPlayer] Recording availability check failed:',
+					error.message,
+				)
+			}
+		} else {
+			console.log(
+				'[StreamPlayer] Recording availability check failed with unknown error',
+			)
+		}
+		return false
+	}
+}
+
+/**
+ * Create HLS configuration for live streaming mode
+ * @returns HLS configuration object with live streaming parameters
+ * Requirements: 3.1, 3.2, 3.3
+ */
+const createLiveHLSConfig = () => {
+	return {
+		enableWorker: true,
+		lowLatencyMode: true,
+		// Enable adaptive bitrate streaming
+		startLevel: -1, // Start with auto quality selection
+		capLevelToPlayerSize: true, // Limit quality based on player size
+		maxBufferLength: 30, // Maximum buffer length in seconds
+		maxMaxBufferLength: 60, // Maximum max buffer length
+		// Live streaming configuration
+		liveSyncDurationCount: 3, // Stay 3 segments behind live edge
+		liveMaxLatencyDurationCount: 100, // Max 100 segments behind (playlist contains last 100 segments)
+		liveDurationInfinity: true, // Handle infinite duration streams
+		// Manifest loading retry configuration
+		manifestLoadingTimeOut: 10000, // 10 second timeout
+		manifestLoadingMaxRetry: 5, // Retry up to 5 times
+		manifestLoadingRetryDelay: 1000, // Start with 1 second delay
+		manifestLoadingMaxRetryTimeout: 64000, // Max 64 seconds between retries (exponential backoff)
+	}
+}
+
+/**
+ * Create HLS configuration for VOD (Video-On-Demand) playback mode
+ * @returns HLS configuration object without live streaming parameters
+ * Requirements: 2.3, 3.1, 3.2, 3.3, 3.4
+ */
+const createVODHLSConfig = () => {
+	return {
+		enableWorker: true,
+		lowLatencyMode: false, // Disable low latency mode for VOD
+		// Enable adaptive bitrate streaming
+		startLevel: -1, // Start with auto quality selection
+		capLevelToPlayerSize: true, // Limit quality based on player size
+		maxBufferLength: 30, // Maximum buffer length in seconds
+		maxMaxBufferLength: 60, // Maximum max buffer length
+		// VOD playback configuration
+		startPosition: 0, // Start playback from the beginning
+		// Manifest loading retry configuration
+		manifestLoadingTimeOut: 10000, // 10 second timeout
+		manifestLoadingMaxRetry: 5, // Retry up to 5 times
+		manifestLoadingRetryDelay: 1000, // Start with 1 second delay
+		manifestLoadingMaxRetryTimeout: 64000, // Max 64 seconds between retries (exponential backoff)
+		// Explicitly exclude live parameters (not set):
+		// - liveSyncDurationCount: not included for VOD
+		// - liveMaxLatencyDurationCount: not included for VOD
+		// - liveDurationInfinity: not included for VOD
+	}
+}
+
 export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 	const { awsConfig } = useAuth()
 	const [streamDetail, setStreamDetail] = useState<StreamDetailResponse | null>(
@@ -36,6 +141,11 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 	const [playlistRefreshError, setPlaylistRefreshError] = useState<
 		string | null
 	>(null)
+	const [playbackMode, setPlaybackMode] = useState<'live' | 'vod' | 'offline'>(
+		'offline',
+	)
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars -- Will be used in subsequent tasks
+	const [recordingAvailable, setRecordingAvailable] = useState<boolean>(false)
 
 	const videoRef = useRef<HTMLVideoElement>(null)
 	const hlsRef = useRef<Hls | null>(null)
@@ -43,7 +153,10 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 	const playlistRetryTimeoutRef = useRef<number | null>(null)
 
 	// Fetch stream details
-	const fetchStreamDetail = async (isManualRetry = false) => {
+	const fetchStreamDetail = async (
+		isManualRetry = false,
+		isInitialLoad = false,
+	) => {
 		if (!awsConfig) {
 			return
 		}
@@ -65,6 +178,48 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 			setRetryCount(0) // Reset retry count on success
 			setIsRetrying(false)
 			setMaxRetriesReached(false)
+
+			// Requirements: 10.1, 10.2, 10.5
+			// On initial load, if stream is inactive, immediately check for recording availability
+			if (isInitialLoad && detail.status === 'inactive') {
+				console.log(
+					'[StreamPlayer] Initial load with inactive stream - checking for recording immediately',
+				)
+				try {
+					const isAvailable = await checkRecordingAvailability(
+						detail.hlsManifestUrl,
+					)
+					if (isAvailable) {
+						setRecordingAvailable(true)
+						setPlaybackMode('vod')
+						console.log(
+							'[StreamPlayer] Initial load: Recording available, setting mode to VOD',
+						)
+					} else {
+						setRecordingAvailable(false)
+						setPlaybackMode('offline')
+						console.log(
+							'[StreamPlayer] Initial load: No recording available, setting mode to offline',
+						)
+					}
+				} catch (error) {
+					console.error(
+						'[StreamPlayer] Error checking recording availability on initial load:',
+						error,
+					)
+					setRecordingAvailable(false)
+					setPlaybackMode('offline')
+					console.log(
+						'[StreamPlayer] Initial load: Error checking recording, setting mode to offline',
+					)
+				}
+			} else if (isInitialLoad && detail.status === 'active') {
+				// If stream is active on initial load, set mode to live
+				console.log(
+					'[StreamPlayer] Initial load with active stream - setting mode to live',
+				)
+				setPlaybackMode('live')
+			}
 		} catch (err) {
 			console.error('[StreamPlayer] Failed to fetch stream detail:', err)
 			const errorMessage =
@@ -114,7 +269,8 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 			return
 		}
 
-		void fetchStreamDetail()
+		// Initial load with flag to trigger immediate recording check
+		void fetchStreamDetail(false, true)
 
 		const intervalId = setInterval(() => {
 			if (!maxRetriesReached) {
@@ -131,22 +287,62 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 			return
 		}
 
-		// Detect transition from offline to active
+		// Detect transition from inactive to active
 		if (previousStatus === 'inactive' && streamDetail.status === 'active') {
 			console.log(
 				'[StreamPlayer] Stream resumed - transitioning from offline to live',
 			)
+			// Set playback mode to live
+			setPlaybackMode('live')
+			console.log('[StreamPlayer] Mode transition: offline/vod -> live')
 			// The HLS player will automatically initialize in the next effect
 		}
 
-		// Detect transition from active to offline
+		// Detect transition from active to inactive
 		if (previousStatus === 'active' && streamDetail.status === 'inactive') {
-			console.log('[StreamPlayer] Stream went offline - showing last frame')
+			console.log('[StreamPlayer] Stream went offline - checking for recording')
 			// Clean up HLS player
 			if (hlsRef.current !== null) {
 				hlsRef.current.destroy()
 				hlsRef.current = null
 			}
+
+			// Reset stream mode to adaptive when transitioning away from live
+			// Requirements: 9.3, 9.4
+			setStreamMode('adaptive')
+			console.log('[StreamPlayer] Reset stream mode to adaptive')
+
+			// Check if recording is available
+			void (async () => {
+				try {
+					const isAvailable = await checkRecordingAvailability(
+						streamDetail.hlsManifestUrl,
+					)
+					if (isAvailable) {
+						setRecordingAvailable(true)
+						setPlaybackMode('vod')
+						console.log(
+							'[StreamPlayer] Mode transition: live -> vod (recording available)',
+						)
+					} else {
+						setRecordingAvailable(false)
+						setPlaybackMode('offline')
+						console.log(
+							'[StreamPlayer] Mode transition: live -> offline (no recording)',
+						)
+					}
+				} catch (error) {
+					console.error(
+						'[StreamPlayer] Error checking recording availability:',
+						error,
+					)
+					setRecordingAvailable(false)
+					setPlaybackMode('offline')
+					console.log(
+						'[StreamPlayer] Mode transition: live -> offline (error checking recording)',
+					)
+				}
+			})()
 		}
 
 		setPreviousStatus(streamDetail.status)
@@ -154,39 +350,46 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 
 	// Initialize HLS player
 	useEffect(() => {
-		if (
-			streamDetail === null ||
-			!videoRef.current ||
-			streamDetail.status !== 'active'
-		) {
+		// Return early if no stream detail or video element
+		if (streamDetail === null || !videoRef.current) {
+			return
+		}
+
+		// Return early if playback mode is offline
+		if (playbackMode === 'offline') {
 			return
 		}
 
 		const video = videoRef.current
-		const streamUrl =
-			streamMode === 'adaptive'
-				? streamDetail.hlsManifestUrl
-				: streamDetail.rawStreamUrl
+
+		// Determine stream URL and HLS config based on playback mode
+		let streamUrl: string
+		let hlsConfig: ReturnType<
+			typeof createLiveHLSConfig | typeof createVODHLSConfig
+		>
+
+		if (playbackMode === 'live') {
+			// Live mode: use streamMode logic (adaptive vs raw)
+			streamUrl =
+				streamMode === 'adaptive'
+					? streamDetail.hlsManifestUrl
+					: streamDetail.rawStreamUrl
+			hlsConfig = createLiveHLSConfig()
+			console.log(
+				`[StreamPlayer] Initializing live HLS player with ${streamMode} mode`,
+			)
+		} else if (playbackMode === 'vod') {
+			// VOD mode: always use adaptive manifest URL
+			streamUrl = streamDetail.hlsManifestUrl
+			hlsConfig = createVODHLSConfig()
+			console.log('[StreamPlayer] Initializing VOD HLS player')
+		} else {
+			// Should not reach here, but return early as safety
+			return
+		}
 
 		if (Hls.isSupported()) {
-			const hls = new Hls({
-				enableWorker: true,
-				lowLatencyMode: true,
-				// Enable adaptive bitrate streaming
-				startLevel: -1, // Start with auto quality selection
-				capLevelToPlayerSize: true, // Limit quality based on player size
-				maxBufferLength: 30, // Maximum buffer length in seconds
-				maxMaxBufferLength: 60, // Maximum max buffer length
-				// Live streaming configuration
-				liveSyncDurationCount: 3, // Stay 3 segments behind live edge
-				liveMaxLatencyDurationCount: 10, // Max 10 segments behind
-				liveDurationInfinity: true, // Handle infinite duration streams
-				// Manifest loading retry configuration
-				manifestLoadingTimeOut: 10000, // 10 second timeout
-				manifestLoadingMaxRetry: 5, // Retry up to 5 times
-				manifestLoadingRetryDelay: 1000, // Start with 1 second delay
-				manifestLoadingMaxRetryTimeout: 64000, // Max 64 seconds between retries (exponential backoff)
-			})
+			const hls = new Hls(hlsConfig)
 
 			hlsRef.current = hls
 
@@ -194,15 +397,16 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 			hls.attachMedia(video)
 
 			hls.on(Hls.Events.MANIFEST_PARSED, () => {
-				console.log('[StreamPlayer] HLS manifest parsed')
+				console.log(`[StreamPlayer] HLS manifest parsed (${playbackMode} mode)`)
 
-				// Populate available quality levels
+				// Populate available quality levels (for both live and VOD)
 				const levels = hls.levels.map((level, index) => ({
 					index,
 					label: `${level.height}p (${Math.round(level.bitrate / 1000)} kbps)`,
 				}))
 				setAvailableLevels(levels)
 
+				// Autoplay for both live and VOD modes
 				video.play().catch((err) => {
 					console.error('[StreamPlayer] Failed to autoplay:', err)
 				})
@@ -218,13 +422,61 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 			})
 
 			hls.on(Hls.Events.ERROR, (_event, data) => {
-				console.error('[StreamPlayer] HLS error:', data)
+				console.error(`[StreamPlayer] HLS error (${playbackMode} mode):`, data)
+
+				// Handle fragment/segment loading errors (missing segments)
+				// Requirements: 8.3, 8.4
+				if (
+					data.type === Hls.ErrorTypes.NETWORK_ERROR &&
+					(data.details === 'fragLoadError' ||
+						data.details === 'fragLoadTimeOut')
+				) {
+					console.warn(
+						`[StreamPlayer] Segment load error in ${playbackMode} mode:`,
+						{
+							details: data.details,
+							frag: data.frag,
+							url: data.frag?.url,
+						},
+					)
+
+					// For VOD mode, allow HLS.js to attempt automatic recovery
+					// HLS.js will skip to the next available segment
+					if (playbackMode === 'vod') {
+						console.log(
+							'[StreamPlayer] VOD segment missing - allowing HLS.js to skip to next available segment',
+						)
+						// Don't treat as fatal - HLS.js will handle recovery automatically
+						// Continue playback with available segments
+						return
+					}
+
+					// For live mode, also allow automatic recovery
+					console.log(
+						'[StreamPlayer] Live segment missing - allowing HLS.js to recover',
+					)
+					return
+				}
 
 				// Handle manifest/playlist loading errors specifically
 				if (
 					data.type === Hls.ErrorTypes.NETWORK_ERROR &&
 					data.details === 'manifestLoadError'
 				) {
+					// For VOD mode, fall back to offline mode on manifest load error
+					if (playbackMode === 'vod') {
+						console.error(
+							'[StreamPlayer] VOD manifest load failed, falling back to offline mode',
+						)
+						setPlaybackMode('offline')
+						setRecordingAvailable(false)
+						setError(
+							'Recording playback failed. The recording manifest could not be loaded.',
+						)
+						return
+					}
+
+					// For live mode, implement retry logic
 					console.log(
 						'[StreamPlayer] Playlist refresh failed, implementing retry logic',
 					)
@@ -270,6 +522,20 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 				if (data.fatal) {
 					switch (data.type) {
 						case Hls.ErrorTypes.NETWORK_ERROR:
+							// For VOD mode, fall back to offline mode on fatal network error
+							if (playbackMode === 'vod') {
+								console.error(
+									'[StreamPlayer] Fatal VOD network error, falling back to offline mode',
+								)
+								setPlaybackMode('offline')
+								setRecordingAvailable(false)
+								setError(
+									'Recording playback failed. The recording may be temporarily unavailable.',
+								)
+								break
+							}
+
+							// For live mode, attempt recovery
 							console.log(
 								'[StreamPlayer] Network error, attempting to recover...',
 							)
@@ -285,6 +551,20 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 							}, 1000)
 							break
 						case Hls.ErrorTypes.MEDIA_ERROR:
+							// For VOD mode, fall back to offline mode on fatal media error
+							if (playbackMode === 'vod') {
+								console.error(
+									'[StreamPlayer] Fatal VOD media error, falling back to offline mode',
+								)
+								setPlaybackMode('offline')
+								setRecordingAvailable(false)
+								setError(
+									'Recording playback failed. The recording media could not be played.',
+								)
+								break
+							}
+
+							// For live mode, attempt recovery
 							console.log(
 								'[StreamPlayer] Media error, attempting to recover...',
 							)
@@ -303,9 +583,17 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 							break
 						default:
 							console.error('[StreamPlayer] Fatal error, cannot recover')
-							setError(
-								'Playback error occurred. Please try refreshing the page.',
-							)
+							if (playbackMode === 'vod') {
+								setPlaybackMode('offline')
+								setRecordingAvailable(false)
+								setError(
+									'Recording playback failed. Please try refreshing the page.',
+								)
+							} else {
+								setError(
+									'Playback error occurred. Please try refreshing the page.',
+								)
+							}
 							break
 					}
 				}
@@ -344,7 +632,7 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 			setError('HLS is not supported in this browser')
 			return
 		}
-	}, [streamDetail, streamMode])
+	}, [streamDetail, streamMode, playbackMode])
 
 	const handleModeToggle = () => {
 		setStreamMode((prev) => (prev === 'adaptive' ? 'raw' : 'adaptive'))
@@ -478,7 +766,7 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 			>
 				{/* Video Player */}
 				<div>
-					{streamDetail.status === 'active' ? (
+					{playbackMode === 'live' || playbackMode === 'vod' ? (
 						<>
 							<div
 								style={{
@@ -499,13 +787,17 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 										top: '1rem',
 										right: '1rem',
 										padding: '0.5rem 1rem',
-										backgroundColor: 'rgba(0, 0, 0, 0.7)',
+										backgroundColor:
+											playbackMode === 'live'
+												? 'rgba(40, 167, 69, 0.9)' // Green for LIVE
+												: 'rgba(52, 58, 64, 0.9)', // Dark gray/blue for RECORDED
 										color: 'white',
 										borderRadius: '4px',
 										fontSize: '0.875rem',
+										fontWeight: 'bold',
 									}}
 								>
-									LIVE
+									{playbackMode === 'live' ? 'LIVE' : 'RECORDED'}
 								</div>
 							</div>
 
@@ -571,7 +863,7 @@ export const StreamPlayer = ({ port }: StreamPlayerProps) => {
 					)}
 
 					{/* Mode Toggle */}
-					{streamDetail.status === 'active' && (
+					{playbackMode === 'live' && (
 						<div style={{ marginTop: '1rem' }}>
 							<div
 								style={{

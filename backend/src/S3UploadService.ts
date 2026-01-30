@@ -5,6 +5,8 @@ import { readFile } from 'node:fs/promises'
 export type S3UploadConfig = {
 	bucket: string
 	region?: string
+	/** Retry interval in ms; set to 0 to disable (e.g. in tests). Default 5000. */
+	uploadIntervalMs?: number
 }
 
 export type UploadOptions = {
@@ -17,7 +19,7 @@ export type UploadOptions = {
 /**
  * Cache configuration for different file types
  * - Playlist files (.m3u8): no-cache to ensure players always get latest segment list
- * - Segment files (.ts): immutable with 1-year cache for optimal CDN performance
+ * - Segment files (.ts): 60 seconds cache since they can be overwritten when new streams start
  * - Snapshot files (.jpg): no-cache to ensure latest frame is displayed
  */
 export const CACHE_CONFIGS = {
@@ -26,7 +28,7 @@ export const CACHE_CONFIGS = {
 		expires: '0',
 	},
 	SEGMENT: {
-		cacheControl: 'max-age=31536000, immutable', // 1 year
+		cacheControl: 'max-age=60, public', // 60 seconds
 	},
 	SNAPSHOT: {
 		cacheControl: 'no-cache',
@@ -56,10 +58,12 @@ export class S3UploadService extends EventEmitter {
 		})
 		this.bucket = config.bucket
 
-		// Start periodic upload retry
-		this.uploadInterval = setInterval(() => {
-			void this.processBufferedUploads()
-		}, 5000)
+		const intervalMs = config.uploadIntervalMs ?? 5000
+		if (intervalMs > 0) {
+			this.uploadInterval = setInterval(() => {
+				void this.processBufferedUploads()
+			}, intervalMs)
+		}
 	}
 
 	async uploadFile(

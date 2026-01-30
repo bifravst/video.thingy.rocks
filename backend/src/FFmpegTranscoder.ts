@@ -128,6 +128,9 @@ export class FFmpegTranscoder extends EventEmitter {
 			// Generate and write master playlist after FFmpeg starts
 			await this.masterPlaylistGenerator.writeMasterPlaylist()
 
+			// Upload master playlist to S3 immediately
+			await this.uploadMasterPlaylist()
+
 			console.log(
 				`[FFmpegTranscoder] FFmpeg process started for port ${this.config.port}`,
 			)
@@ -223,6 +226,14 @@ export class FFmpegTranscoder extends EventEmitter {
 		if (!this.process?.stdin) {
 			console.warn(
 				`[FFmpegTranscoder] Cannot write to FFmpeg stdin for port ${this.config.port}: process not running`,
+			)
+			return false
+		}
+
+		// Check if stdin is writable (not closed/destroyed)
+		if (this.process.stdin.destroyed || !this.process.stdin.writable) {
+			console.warn(
+				`[FFmpegTranscoder] Cannot write to FFmpeg stdin for port ${this.config.port}: stdin is closed`,
 			)
 			return false
 		}
@@ -331,14 +342,13 @@ export class FFmpegTranscoder extends EventEmitter {
 			args.push('-b:a', profile.audioBitrate)
 			args.push('-f', 'hls')
 			args.push('-hls_time', this.config.segmentDuration.toString())
-			args.push('-hls_list_size', '10')
+			args.push('-hls_list_size', '100')
 			// Live streaming flags: mark as event stream, append to playlist
 			// Note: omit_endlist is removed so FFmpeg can add #EXT-X-ENDLIST on graceful shutdown
 			args.push('-hls_playlist_type', 'event')
 			args.push('-hls_flags', 'append_list+program_date_time')
 			args.push('-hls_start_number_source', 'datetime')
-			args.push('-hls_init_time', '6')
-			args.push('-hls_segment_options', 'Cache-Control:max-age=60')
+			// Note: hls_init_time is not compatible with append_list mode
 			args.push('-hls_segment_filename', `${profileDir}/segment_%05d.ts`)
 			args.push(`${profileDir}/playlist.m3u8`)
 		}
@@ -353,6 +363,21 @@ export class FFmpegTranscoder extends EventEmitter {
 		if (!this.process) {
 			return
 		}
+
+		// Handle stdin errors (EPIPE when FFmpeg closes)
+		this.process.stdin?.on('error', (error: Error) => {
+			// EPIPE errors are expected when FFmpeg closes - don't crash the app
+			if ((error as any).code === 'EPIPE') {
+				console.warn(
+					`[FFmpegTranscoder] FFmpeg stdin closed for port ${this.config.port} (EPIPE)`,
+				)
+			} else {
+				console.error(
+					`[FFmpegTranscoder] stdin error for port ${this.config.port}:`,
+					error,
+				)
+			}
+		})
 
 		// Handle stdout
 		this.process.stdout?.on('data', (data: Buffer) => {

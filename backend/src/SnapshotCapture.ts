@@ -143,6 +143,21 @@ export class SnapshotCapture extends EventEmitter {
 			const outputChunks: Buffer[] = []
 			const errorChunks: Buffer[] = []
 
+			// Handle stdin errors (EPIPE when FFmpeg closes)
+			ffmpeg.stdin.on('error', (error: Error) => {
+				// EPIPE errors are expected when FFmpeg closes - don't crash
+				if ((error as any).code === 'EPIPE') {
+					console.warn(
+						`[SnapshotCapture] FFmpeg stdin closed for port ${this.config.port} (EPIPE)`,
+					)
+				} else {
+					console.error(
+						`[SnapshotCapture] stdin error for port ${this.config.port}:`,
+						error,
+					)
+				}
+			})
+
 			ffmpeg.stdout.on('data', (chunk: Buffer) => {
 				outputChunks.push(chunk)
 			})
@@ -170,9 +185,16 @@ export class SnapshotCapture extends EventEmitter {
 
 			// Write buffered data to FFmpeg stdin
 			for (const chunk of this.dataBuffer) {
-				ffmpeg.stdin.write(chunk)
+				// Check if stdin is still writable before writing
+				if (!ffmpeg.stdin.destroyed && ffmpeg.stdin.writable) {
+					ffmpeg.stdin.write(chunk)
+				}
 			}
-			ffmpeg.stdin.end()
+
+			// Only end stdin if it's still writable
+			if (!ffmpeg.stdin.destroyed && ffmpeg.stdin.writable) {
+				ffmpeg.stdin.end()
+			}
 		})
 	}
 }

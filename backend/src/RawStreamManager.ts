@@ -21,7 +21,7 @@ export class RawStreamManager extends EventEmitter {
 	private readonly config: RawStreamManagerConfig
 	private readonly s3UploadService: S3UploadService
 	private readonly segments: RawSegment[] = []
-	private readonly maxSegments = 10 // Keep last 10 segments in manifest
+	private readonly maxSegments = 100 // Keep last 100 segments in manifest
 	private segmentCounter = 0
 	private currentSegmentData: Buffer[] = []
 	private currentSegmentStartTime?: Date
@@ -81,9 +81,12 @@ export class RawStreamManager extends EventEmitter {
 		const endTime = new Date()
 		const duration = (endTime.getTime() - startTime.getTime()) / 1000
 
-		// Generate segment filename
+		// Generate segment filename and increment counter BEFORE upload
+		// This ensures sequential numbering even if uploads fail
 		const filename = `segment_${String(this.segmentCounter).padStart(5, '0')}.ts`
 		const s3Key = `raw/${this.config.port}/${filename}`
+		const segmentNumber = this.segmentCounter
+		this.segmentCounter++
 
 		try {
 			// Upload segment to S3
@@ -110,11 +113,9 @@ export class RawStreamManager extends EventEmitter {
 			console.log(
 				`[RawStreamManager] Uploaded raw segment ${filename} for port ${this.config.port}`,
 			)
-
-			this.segmentCounter++
 		} catch (error) {
 			console.error(
-				`[RawStreamManager] Error uploading segment for port ${this.config.port}:`,
+				`[RawStreamManager] Error uploading segment ${segmentNumber} for port ${this.config.port}:`,
 				error,
 			)
 		}
