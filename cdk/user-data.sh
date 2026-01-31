@@ -18,18 +18,6 @@ yum install -y nodejs
 node --version
 npm --version
 
-# Install FFmpeg with required codecs (Amazon Linux 2023)
-# Download and install static FFmpeg build
-curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o ffmpeg.tar.xz
-tar xf ffmpeg.tar.xz
-cd ffmpeg-*-amd64-static
-cp ffmpeg ffprobe /usr/local/bin/
-cd ..
-rm -rf ffmpeg-*-amd64-static ffmpeg.tar.xz
-
-# Verify FFmpeg installation
-ffmpeg -version
-
 # Install AWS CLI v2
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
 yum install -y unzip
@@ -73,7 +61,6 @@ EOF
 
 # Environment variables will be set by CDK
 # AWS_REGION - AWS region
-# BUCKET_NAME - S3 bucket name for video storage
 # TABLE_NAME - DynamoDB table name
 # OUTPUT_DIR - Output directory for video streams
 
@@ -93,7 +80,6 @@ User=root
 WorkingDirectory=/opt/video-streaming
 Environment="NODE_ENV=production"
 Environment="AWS_REGION=__AWS_REGION__"
-Environment="BUCKET_NAME=__BUCKET_NAME__"
 Environment="TABLE_NAME=__TABLE_NAME__"
 Environment="OUTPUT_DIR=/var/video-streams"
 Environment="TRANSCODING_OUTPUT_DIR=/tmp/video-streams/transcoding"

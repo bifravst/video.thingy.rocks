@@ -68,24 +68,12 @@ echo ""
 echo "Step 3: Getting stack outputs..."
 echo ""
 
-CLOUDFRONT_DOMAIN=$(aws cloudformation describe-stacks \
-  --stack-name "$STACK_NAME" \
-  --query "Stacks[0].Outputs[?OutputKey=='CloudFrontURL'].OutputValue" \
-  --output text 2>/dev/null)
-
 TABLE_NAME=$(aws cloudformation describe-stacks \
   --stack-name "$STACK_NAME" \
   --query "Stacks[0].Outputs[?OutputKey=='DynamoDBTableName'].OutputValue" \
   --output text 2>/dev/null)
 
-BUCKET_NAME=$(aws cloudformation describe-stacks \
-  --stack-name "$STACK_NAME" \
-  --query "Stacks[0].Outputs[?OutputKey=='VideoBucketName'].OutputValue" \
-  --output text 2>/dev/null)
-
-echo -e "${GREEN}✓${NC} CloudFront: $CLOUDFRONT_DOMAIN"
 echo -e "${GREEN}✓${NC} DynamoDB: $TABLE_NAME"
-echo -e "${GREEN}✓${NC} S3 Bucket: $BUCKET_NAME"
 echo ""
 
 # Step 4: Find running instance

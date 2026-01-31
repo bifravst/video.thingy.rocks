@@ -7,8 +7,6 @@ import {
 	type Environment,
 } from 'aws-cdk-lib'
 import * as autoscaling from 'aws-cdk-lib/aws-autoscaling'
-import * as cloudfront from 'aws-cdk-lib/aws-cloudfront'
-import * as origins from 'aws-cdk-lib/aws-cloudfront-origins'
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch'
 import * as cloudwatch_actions from 'aws-cdk-lib/aws-cloudwatch-actions'
 import * as cognito from 'aws-cdk-lib/aws-cognito'
@@ -26,7 +24,6 @@ import { fileURLToPath } from 'node:url'
 
 export class StreamingStack extends Stack {
 	public readonly vpc: ec2.Vpc
-	public readonly videoBucket: s3.Bucket
 	public readonly streamTable: dynamodb.Table
 	public readonly userPool: cognito.UserPool
 	public readonly userPoolClient: cognito.UserPoolClient
@@ -34,7 +31,6 @@ export class StreamingStack extends Stack {
 	public readonly unauthRole: iam.Role
 	public readonly authRole: iam.Role
 	public readonly udpSecurityGroup: ec2.SecurityGroup
-	public readonly distribution: cloudfront.Distribution
 	public readonly ec2Role: iam.Role
 	public readonly autoScalingGroup: autoscaling.AutoScalingGroup
 	public readonly codeBucket: s3.Bucket
@@ -51,7 +47,6 @@ export class StreamingStack extends Stack {
 			env: props?.env,
 		})
 
-		// Task 2.1: Define VPC and networking
 		this.vpc = new ec2.Vpc(this, 'StreamingVPC', {
 			natGateways: 1,
 			subnetConfiguration: [
@@ -88,29 +83,6 @@ export class StreamingStack extends Stack {
 			removalPolicy: RemovalPolicy.DESTROY,
 		})
 
-		// Task 2.2: Define S3 buckets
-		this.videoBucket = new s3.Bucket(this, 'VideoBucket', {
-			encryption: s3.BucketEncryption.S3_MANAGED,
-			blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-			removalPolicy: RemovalPolicy.DESTROY,
-			autoDeleteObjects: true,
-			lifecycleRules: [
-				{
-					expiration: Duration.days(30),
-					id: 'DeleteOldVideos',
-				},
-			],
-			cors: [
-				{
-					allowedMethods: [s3.HttpMethods.GET, s3.HttpMethods.HEAD],
-					allowedOrigins: ['*'],
-					allowedHeaders: ['*'],
-					maxAge: 3000,
-				},
-			],
-		})
-
-		// Task 2.3: Define DynamoDB table
 		this.streamTable = new dynamodb.Table(this, 'StreamMetadata', {
 			partitionKey: { name: 'port', type: dynamodb.AttributeType.NUMBER },
 			billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
@@ -186,7 +158,6 @@ export class StreamingStack extends Stack {
 			},
 		})
 
-		// Task 2.4: Configure Cognito Identity Pool
 		this.identityPool = new cognito.CfnIdentityPool(
 			this,
 			'StreamViewerIdentityPool',
@@ -269,7 +240,6 @@ export class StreamingStack extends Stack {
 			},
 		)
 
-		// Task 2.5: Define security groups
 		this.udpSecurityGroup = new ec2.SecurityGroup(this, 'UDPSecurityGroup', {
 			vpc: this.vpc,
 			description: 'Security group for UDP video ingestion',
@@ -290,7 +260,6 @@ export class StreamingStack extends Stack {
 			'Allow HTTPS egress for AWS service communication',
 		)
 
-		// Task 6.3: Configure IAM role for EC2 instances
 		this.ec2Role = new iam.Role(this, 'EC2InstanceRole', {
 			assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
 			description: 'IAM role for EC2 instances running UDP listener service',
@@ -300,9 +269,6 @@ export class StreamingStack extends Stack {
 				),
 			],
 		})
-
-		// Grant S3 permissions for video storage
-		this.videoBucket.grantReadWrite(this.ec2Role)
 
 		// Grant DynamoDB permissions for stream metadata
 		this.streamTable.grantReadWriteData(this.ec2Role)
@@ -359,7 +325,6 @@ export class StreamingStack extends Stack {
 			ephemeralStorageSize: Size.mebibytes(1024),
 		})
 
-		// Task 6.2: Add EC2 Auto Scaling Group
 		// Read user data script
 		const userDataScriptPath = join(__dirname, 'user-data.sh')
 		let userDataScript = readFileSync(userDataScriptPath, 'utf-8')
@@ -367,7 +332,6 @@ export class StreamingStack extends Stack {
 		// Replace placeholders in user data script
 		userDataScript = userDataScript
 			.replace(/__AWS_REGION__/g, this.region)
-			.replace(/__BUCKET_NAME__/g, this.videoBucket.bucketName)
 			.replace(/__TABLE_NAME__/g, this.streamTable.tableName)
 
 		// Add code download commands to user data
@@ -427,96 +391,6 @@ systemctl start video-streaming.service
 		cfnAsg.healthCheckType = 'EC2'
 		cfnAsg.healthCheckGracePeriod = Duration.minutes(5).toSeconds()
 
-		// Task 6.4: CloudFront distribution for video delivery with HLS optimization
-		this.distribution = new cloudfront.Distribution(
-			this,
-			'StreamingDistribution',
-			{
-				defaultBehavior: {
-					origin: origins.S3BucketOrigin.withOriginAccessControl(
-						this.videoBucket,
-					),
-					viewerProtocolPolicy:
-						cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-					cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
-					allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD,
-					cachedMethods: cloudfront.CachedMethods.CACHE_GET_HEAD,
-				},
-				additionalBehaviors: {
-					// HLS manifest files (.m3u8) - short TTL for live streaming
-					'*.m3u8': {
-						origin: origins.S3BucketOrigin.withOriginAccessControl(
-							this.videoBucket,
-						),
-						viewerProtocolPolicy:
-							cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-						cachePolicy: new cloudfront.CachePolicy(this, 'HLSManifestCache', {
-							cachePolicyName: `${Stack.of(this).stackName}-HLSManifestCachePolicy`,
-							comment: 'Cache policy for HLS manifest files',
-							defaultTtl: Duration.seconds(2),
-							minTtl: Duration.seconds(0),
-							maxTtl: Duration.seconds(10),
-							headerBehavior: cloudfront.CacheHeaderBehavior.none(),
-							queryStringBehavior: cloudfront.CacheQueryStringBehavior.none(),
-							cookieBehavior: cloudfront.CacheCookieBehavior.none(),
-							enableAcceptEncodingGzip: false,
-							enableAcceptEncodingBrotli: false,
-						}),
-						allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD,
-						cachedMethods: cloudfront.CachedMethods.CACHE_GET_HEAD,
-					},
-					// HLS video segments (.ts) - longer TTL
-					'*.ts': {
-						origin: origins.S3BucketOrigin.withOriginAccessControl(
-							this.videoBucket,
-						),
-						viewerProtocolPolicy:
-							cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-						cachePolicy: new cloudfront.CachePolicy(this, 'HLSSegmentCache', {
-							cachePolicyName: `${Stack.of(this).stackName}-HLSSegmentCachePolicy`,
-							comment: 'Cache policy for HLS video segments',
-							defaultTtl: Duration.seconds(86400), // 24 hours
-							minTtl: Duration.seconds(0),
-							maxTtl: Duration.days(30),
-							headerBehavior: cloudfront.CacheHeaderBehavior.none(),
-							queryStringBehavior: cloudfront.CacheQueryStringBehavior.none(),
-							cookieBehavior: cloudfront.CacheCookieBehavior.none(),
-							enableAcceptEncodingGzip: false,
-							enableAcceptEncodingBrotli: false,
-						}),
-						allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD,
-						cachedMethods: cloudfront.CachedMethods.CACHE_GET_HEAD,
-					},
-					// Snapshots (.jpg) - medium TTL
-					'snapshots/*': {
-						origin: origins.S3BucketOrigin.withOriginAccessControl(
-							this.videoBucket,
-						),
-						viewerProtocolPolicy:
-							cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-						cachePolicy: new cloudfront.CachePolicy(this, 'SnapshotCache', {
-							cachePolicyName: `${Stack.of(this).stackName}-SnapshotCachePolicy`,
-							comment: 'Cache policy for stream snapshots',
-							defaultTtl: Duration.seconds(60),
-							minTtl: Duration.seconds(0),
-							maxTtl: Duration.seconds(300),
-							headerBehavior: cloudfront.CacheHeaderBehavior.none(),
-							queryStringBehavior: cloudfront.CacheQueryStringBehavior.none(),
-							cookieBehavior: cloudfront.CacheCookieBehavior.none(),
-							enableAcceptEncodingGzip: false,
-							enableAcceptEncodingBrotli: false,
-						}),
-						allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD,
-						cachedMethods: cloudfront.CachedMethods.CACHE_GET_HEAD,
-					},
-				},
-				comment: 'CloudFront distribution for Video Streaming',
-				enableLogging: true,
-				priceClass: cloudfront.PriceClass.PRICE_CLASS_100,
-			},
-		)
-
-		// Task 6.5: Configure CloudWatch alarms
 		// Create SNS topic for alarm notifications
 		const alarmTopic = new sns.Topic(this, 'AlarmTopic', {
 			displayName: 'Video Streaming Alarms',
@@ -539,54 +413,6 @@ systemctl start video-streaming.service
 			treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
 		})
 		packetLossAlarm.addAlarmAction(new cloudwatch_actions.SnsAction(alarmTopic))
-
-		// Alarm for FFmpeg process failures
-		const ffmpegFailureAlarm = new cloudwatch.Alarm(
-			this,
-			'FFmpegFailureAlarm',
-			{
-				alarmName: `${Stack.of(this).stackName}-FFmpegFailures`,
-				alarmDescription: 'Alarm when FFmpeg process failures exceed threshold',
-				metric: new cloudwatch.Metric({
-					namespace: Stack.of(this).stackName,
-					metricName: 'FFmpegProcessFailures',
-					statistic: 'Sum',
-					period: Duration.minutes(5),
-				}),
-				threshold: 3,
-				evaluationPeriods: 1,
-				comparisonOperator:
-					cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
-				treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-			},
-		)
-		ffmpegFailureAlarm.addAlarmAction(
-			new cloudwatch_actions.SnsAction(alarmTopic),
-		)
-
-		// Alarm for S3 upload failures
-		const s3UploadFailureAlarm = new cloudwatch.Alarm(
-			this,
-			'S3UploadFailureAlarm',
-			{
-				alarmName: `${Stack.of(this).stackName}-S3UploadFailures`,
-				alarmDescription: 'Alarm when S3 upload failures exceed threshold',
-				metric: new cloudwatch.Metric({
-					namespace: Stack.of(this).stackName,
-					metricName: 'S3UploadFailures',
-					statistic: 'Sum',
-					period: Duration.minutes(5),
-				}),
-				threshold: 10,
-				evaluationPeriods: 1,
-				comparisonOperator:
-					cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
-				treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-			},
-		)
-		s3UploadFailureAlarm.addAlarmAction(
-			new cloudwatch_actions.SnsAction(alarmTopic),
-		)
 
 		// Alarm for DynamoDB throttling
 		const dynamoThrottleAlarm = new cloudwatch.Alarm(
@@ -656,16 +482,6 @@ systemctl start video-streaming.service
 		new CfnOutput(this, 'DynamoDBTableName', {
 			value: this.streamTable.tableName,
 			description: 'DynamoDB table name for stream metadata',
-		})
-
-		new CfnOutput(this, 'VideoBucketName', {
-			value: this.videoBucket.bucketName,
-			description: 'S3 bucket name for video storage',
-		})
-
-		new CfnOutput(this, 'CloudFrontURL', {
-			value: this.distribution.distributionDomainName,
-			description: 'CloudFront distribution URL for video delivery',
 		})
 
 		new CfnOutput(this, 'VPCId', {
