@@ -1,18 +1,29 @@
 # Testing Kinesis Video Ingestion
 
-How to test the UDP → FFmpeg → Kinesis Video Streams pipeline.
+How to test the UDP → GStreamer (kvssink) → Kinesis Video Streams pipeline.
 
 ## Prerequisites
 
 - Stack deployed (`npm run cdk:prod:deploy`).
 - EC2 instances have `KINESIS_STREAM_PREFIX` set (e.g. `{stackName}-video`) so
   ingestion is enabled.
-- FFmpeg installed on your machine for sending UDP (and on the server via
-  user-data).
+- FFmpeg installed on your machine for sending UDP (used by the test scripts).
+  The server uses GStreamer and the AWS kvssink plugin (built from the Kinesis
+  Video C++ Producer SDK in user-data).
+
+## Pipeline overview
+
+The backend receives MPEG-TS over UDP, feeds it to a GStreamer pipeline that
+reads from stdin, demuxes TS, parses H.264, and sends it to Kinesis Video
+Streams via the **kvssink** plugin. Ingestion does not use Node’s PutMedia;
+kvssink handles the connection to Kinesis. The systemd service sets
+`GST_PLUGIN_PATH` and `LD_LIBRARY_PATH` so the Node-spawned `gst-launch-1.0`
+finds the kvssink plugin and its dependencies.
 
 ## 1. Unit tests
 
-Run backend tests (including KinesisVideoSender):
+Run backend tests (including KinesisVideoSender, which is retained for possible
+future use):
 
 ```bash
 cd backend && npm test
@@ -45,9 +56,9 @@ Or stream from a webcam:
 ./scripts/stream-webcam-to-udp.sh <instance-ip> 5000
 ```
 
-The backend receives UDP on that port, starts the pipeline for that port, and
-sends MKV to the Kinesis stream named `{KINESIS_STREAM_PREFIX}-{port}` (e.g.
-`video-streaming-video-5000`).
+The backend receives UDP on that port, starts the GStreamer pipeline for that
+port, and kvssink sends H.264 to the Kinesis stream named
+`{KINESIS_STREAM_PREFIX}-{port}` (e.g. `video-streaming-video-5000`).
 
 ## 3. Verify in AWS
 
@@ -68,8 +79,8 @@ sends MKV to the Kinesis stream named `{KINESIS_STREAM_PREFIX}-{port}` (e.g.
    sudo tail -f /var/log/video-streaming/application.log
    ```
 
-   Look for lines like “Kinesis ingestion started” and “PutMedia”/“FFmpeg”
-   messages.
+   Look for “Kinesis ingestion started” and “GStreamer” messages. There are no
+   “PutMedia” lines from the backend; kvssink sends directly to Kinesis.
 
 ## 4. End-to-end script
 
@@ -94,32 +105,32 @@ corresponding to the port used (e.g. 5000).
   `__KINESIS_STREAM_PREFIX__` in user-data when the stack is deployed; replace
   instances (or redeploy) if the service was created before that was added.
 
-- **No fragments in Kinesis / no video data received on Kinesis stream**  
+- **No fragments in Kinesis / kvssink not found**  
+  Ensure `GST_PLUGIN_PATH` and `LD_LIBRARY_PATH` are set in the systemd unit
+  (see user-data). The kvssink plugin is built from the Amazon Kinesis Video
+  Streams C++ Producer SDK during instance bootstrap. On the instance, verify:  
+  `GST_PLUGIN_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build LD_LIBRARY_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build:/opt/amazon-kinesis-video-streams-producer-sdk-cpp/open-source/local/lib gst-inspect-1.0 kvssink`  
+  If this fails, the SDK build in user-data may have failed; check
+  `/var/log/cloud-init-output.log`.
+
+- **No fragments in Kinesis (plugin loads)**  
   Ensure `KINESIS_STREAM_PREFIX` is set and the stack has Kinesis streams and
-  IAM for GetDataEndpoint/PutMedia. In application logs, confirm: **“PutMedia
-  connection established”** (HTTP 200), then **“PutMedia first fragment ACK”**
-  (Buffering/Received). If you see connection established but no first fragment
-  ACK, FFmpeg may not be producing MKV in time (the backend uses
-  `-flush_packets 1` to flush promptly). If you see **“PutMedia Error ACK”**
-  with e.g. `INVALID_MKV_DATA`, the MKV stream is being rejected. Check for
-  “PutMedia error”, “PutMedia HTTP error”, or “FFmpeg error” for failures.
+  IAM for the EC2 role (GetDataEndpoint, PutMedia). In application logs, look
+  for “Kinesis ingestion started” and any “GStreamer stderr” or “GStreamer
+  error” messages. Source must be valid MPEG-TS with H.264; the test scripts
+  produce compatible streams.
 
 - **Stream not starting**  
   Send UDP for at least a few seconds so the inactivity timer sees activity and
   emits `streamStart`. Port must be in 5000–5009.
 
-- **Invalid MKV / PutMedia errors**  
+- **Invalid or corrupt video**  
   Source must be valid MPEG-TS (e.g. H.264). The test scripts produce compatible
   streams; custom encoders must output MPEG-TS over UDP.
 
-- **Repeating “PutMedia Error ACK” or same fragment in logs**  
-  Repeated Error ACKs for the same fragment are throttled (logged once per 60s
-  per fragment). If Kinesis keeps rejecting the same fragment, the stream is
-  likely corrupt (e.g. out-of-order or lost UDP packets). Ensure the path to the
-  server preserves packet order and avoids loss where possible.
-
 - **Out-of-order or corrupt video**  
   UDP does not guarantee order. The pipeline buffers packets (default 128) and
-  feeds FFmpeg in receive order; it does not reorder by RTP or TS continuity.
-  For best results, send from a single source over a stable path. If the source
-  uses RTP, consider adding RTP sequence-based reordering in the pipeline.
+  feeds GStreamer stdin in receive order; it does not reorder by RTP or TS
+  continuity. For best results, send from a single source over a stable path. If
+  the source uses RTP, consider adding RTP sequence-based reordering in the
+  pipeline.

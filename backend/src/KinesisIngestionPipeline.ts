@@ -1,15 +1,19 @@
 import { spawn } from 'node:child_process'
 import type { Writable } from 'node:stream'
-import { KinesisVideoSender } from './KinesisVideoSender.ts'
 import { Logger } from './Logger.ts'
 
 export type KinesisIngestionPipelineConfig = {
 	streamNamePrefix: string
 	region: string
 	portRange: { start: number; end: number }
-	ffmpegPath?: string
+	gstLaunchPath?: string
 	/**
-	 * Max packets to buffer before writing to FFmpeg (0 = write immediately).
+	 * Path for GST_PLUGIN_PATH so the child process finds kvssink.
+	 * If not set, inherits process.env.GST_PLUGIN_PATH (e.g. from systemd).
+	 */
+	gstPluginPath?: string
+	/**
+	 * Max packets to buffer before writing to GStreamer stdin (0 = write immediately).
 	 * Packets are emitted in receive order; does not fix network reordering.
 	 * Default 128. Helps smooth bursts and applies backpressure.
 	 */
@@ -24,26 +28,21 @@ type ReorderState = {
 	buffer: Map<number, Buffer>
 }
 
-/** Per-port throttle for FFmpeg stderr warning categories. */
-type FfmpegStderrThrottle = { lastLog: Record<string, number> }
+/** Per-port throttle for GStreamer stderr warning categories. */
+type GstStderrThrottle = { lastLog: Record<string, number> }
 
 type PortPipeline = {
-	ffmpeg: ReturnType<typeof spawn>
-	sender: KinesisVideoSender
-	putMediaPromise: Promise<void>
+	gst: ReturnType<typeof spawn>
 	reorder: ReorderState
-	ffmpegStderrThrottle: FfmpegStderrThrottle
+	gstStderrThrottle: GstStderrThrottle
 }
 
-/** Throttle repeated FFmpeg stderr warnings (same category) per port. */
-const FFMPEG_STDERR_THROTTLE_MS = 60_000
-
-/** Progress line: size= 46683KiB time=00:03:24.86 bitrate=... speed=25.6x */
-const FFMPEG_PROGRESS_REGEX = /size=\s*\d+KiB\s+time=|\sspeed=\d+\.\d+x/
+/** Throttle repeated GStreamer stderr warnings (same category) per port. */
+const GST_STDERR_THROTTLE_MS = 60_000
 
 /**
- * Per-port pipeline: UDP packets -> FFmpeg (TS -> MKV) -> Kinesis Video PutMedia.
- * One FFmpeg process and one PutMedia connection per active port.
+ * Per-port pipeline: UDP packets -> GStreamer (TS -> H.264) -> kvssink -> Kinesis Video.
+ * One GStreamer process per active port; kvssink sends directly to Kinesis (no Node PutMedia).
  */
 export class KinesisIngestionPipeline {
 	private readonly config: KinesisIngestionPipelineConfig
@@ -66,34 +65,31 @@ export class KinesisIngestionPipeline {
 	}
 
 	/**
-	 * Logs FFmpeg stderr: skips progress lines, throttles repeated corrupt/DTS/non-monotonic warnings.
+	 * Logs GStreamer stderr; throttles repeated warnings per category.
 	 */
-	private logFfmpegStderr(
+	private logGstStderr(
 		port: number,
 		streamName: string,
 		text: string,
-		throttle: FfmpegStderrThrottle,
+		throttle: GstStderrThrottle,
 	): void {
 		const now = Date.now()
 		const lines = text.split(/\r?\n/)
 		for (const raw of lines) {
 			const line = raw.trim()
 			if (line.length === 0) continue
-			if (FFMPEG_PROGRESS_REGEX.test(line)) continue
-			if (/^Last message repeated \d+ times\s*$/.test(line)) continue
 
 			let category: string | null = null
-			if (/corrupt|corrupt input packet/i.test(line)) category = 'corrupt'
-			else if (/DTS .* out of order/i.test(line)) category = 'dts_order'
-			else if (/Non-monotonic DTS/i.test(line)) category = 'non_monotonic'
+			if (/error|ERROR/i.test(line)) category = 'error'
+			else if (/warning|WARN/i.test(line)) category = 'warning'
 
 			if (category !== null) {
 				const last = throttle.lastLog[category] ?? 0
-				if (now - last < FFMPEG_STDERR_THROTTLE_MS) continue
+				if (now - last < GST_STDERR_THROTTLE_MS) continue
 				throttle.lastLog[category] = now
 			}
 
-			this.logger.warn('FFmpeg stderr', {
+			this.logger.warn('GStreamer stderr', {
 				port,
 				streamName,
 				message: line.slice(0, 500),
@@ -102,7 +98,7 @@ export class KinesisIngestionPipeline {
 	}
 
 	/**
-	 * Starts the pipeline for a port: spawns FFmpeg and begins PutMedia.
+	 * Starts the pipeline for a port: spawns GStreamer with kvssink.
 	 * Idempotent: no-op if already running for this port.
 	 */
 	async start(port: number): Promise<void> {
@@ -110,77 +106,41 @@ export class KinesisIngestionPipeline {
 		if (this.activePipelines.has(port)) return
 
 		const streamName = this.streamNameForPort(port)
-		const sender = new KinesisVideoSender({
-			streamName,
-			region: this.config.region,
-		})
+		const gstLaunchPath = this.config.gstLaunchPath ?? 'gst-launch-1.0'
+		const region = this.config.region
 
-		const ffmpegPath = this.config.ffmpegPath ?? 'ffmpeg'
-		// MPEG-TS from stdin -> MKV to stdout (stream copy). discardcorrupt skips corrupt input packets.
-		// flush_packets 1 flushes after each packet so MKV clusters reach PutMedia promptly (avoids 256KB buffer).
-		const ffmpeg = spawn(
-			ffmpegPath,
-			[
-				'-fflags',
-				'+discardcorrupt',
-				'-f',
-				'mpegts',
-				'-i',
-				'pipe:0',
-				'-c',
-				'copy',
-				'-f',
-				'matroska',
-				'-flush_packets',
-				'1',
-				'pipe:1',
-			],
-			{
-				stdio: ['pipe', 'pipe', 'pipe'],
-			},
-		)
+		// TS from stdin -> tsdemux -> H.264 -> kvssink (sends to Kinesis)
+		const pipelineStr = `fdsrc fd=0 ! tsparse set-timestamps=true ! tsdemux name=d d.video_0 ! queue ! h264parse ! video/x-h264,stream-format=avc,alignment=au ! kvssink stream-name=${streamName} aws-region=${region} storage-size=128`
 
-		const ffmpegStderrThrottle: FfmpegStderrThrottle = {
-			lastLog: {},
+		const spawnEnv = { ...process.env }
+		if (
+			this.config.gstPluginPath !== undefined &&
+			this.config.gstPluginPath !== ''
+		) {
+			spawnEnv.GST_PLUGIN_PATH = this.config.gstPluginPath
 		}
-		ffmpeg.stderr?.on('data', (data: Buffer) => {
-			this.logFfmpegStderr(
-				port,
-				streamName,
-				data.toString(),
-				ffmpegStderrThrottle,
-			)
+
+		const gst = spawn(gstLaunchPath, ['-q', '-e', pipelineStr], {
+			stdio: ['pipe', 'ignore', 'pipe'],
+			env: spawnEnv,
 		})
-		ffmpeg.on('error', (err) => {
-			this.logger.error('FFmpeg error', err, { port, streamName })
+
+		const gstStderrThrottle: GstStderrThrottle = { lastLog: {} }
+		gst.stderr?.on('data', (data: Buffer) => {
+			this.logGstStderr(port, streamName, data.toString(), gstStderrThrottle)
+		})
+		gst.on('error', (err) => {
+			this.logger.error('GStreamer error', err, { port, streamName })
 			this.activePipelines.delete(port)
 		})
-		ffmpeg.on('exit', (code, signal) => {
-			this.logger.info('FFmpeg exited', {
+		gst.on('exit', (code, signal) => {
+			this.logger.info('GStreamer exited', {
 				port,
 				streamName,
 				code: code ?? undefined,
 				signal: signal ?? undefined,
 			})
 			this.activePipelines.delete(port)
-		})
-
-		const stdout = ffmpeg.stdout
-		if (stdout === null || stdout === undefined) {
-			ffmpeg.kill('SIGTERM')
-			throw new Error('FFmpeg stdout is not available')
-		}
-		const putMediaPromise = sender.putMedia(stdout).catch((err) => {
-			this.logger.error(
-				'PutMedia error',
-				err instanceof Error ? err : new Error(String(err)),
-				{
-					port,
-					streamName,
-				},
-			)
-			// Ensure FFmpeg is killed if PutMedia fails
-			ffmpeg.kill('SIGTERM')
 		})
 
 		const reorderBufferSize =
@@ -191,11 +151,9 @@ export class KinesisIngestionPipeline {
 			buffer: new Map(),
 		}
 		this.activePipelines.set(port, {
-			ffmpeg,
-			sender,
-			putMediaPromise,
+			gst,
 			reorder,
-			ffmpegStderrThrottle,
+			gstStderrThrottle,
 		})
 		this.logger.info('Kinesis ingestion started', {
 			port,
@@ -232,12 +190,12 @@ export class KinesisIngestionPipeline {
 	}
 
 	/**
-	 * Writes a UDP packet into the FFmpeg stdin for that port.
-	 * When reorderBufferSize > 0, packets are buffered and emitted in receive order (smooths bursts; does not fix network reordering).
+	 * Writes a UDP packet into the GStreamer stdin for that port.
+	 * When reorderBufferSize > 0, packets are buffered and emitted in receive order.
 	 */
 	writePacket(port: number, data: Buffer): void {
 		const pipeline = this.activePipelines.get(port)
-		const stdin = pipeline?.ffmpeg.stdin
+		const stdin = pipeline?.gst.stdin
 		if (stdin === undefined || stdin === null || stdin.writable !== true) return
 
 		const maxBuf = this.config.reorderBufferSize ?? DEFAULT_REORDER_BUFFER_SIZE
@@ -255,18 +213,17 @@ export class KinesisIngestionPipeline {
 	}
 
 	/**
-	 * Stops the pipeline for a port: flushes reorder buffer, closes FFmpeg stdin, waits for exit and PutMedia to finish.
+	 * Stops the pipeline for a port: flushes reorder buffer, closes stdin, waits for process exit.
 	 */
 	async stop(port: number): Promise<void> {
 		const pipeline = this.activePipelines.get(port)
 		if (!pipeline) return
 
 		this.activePipelines.delete(port)
-		const { ffmpeg, putMediaPromise, reorder } = pipeline
+		const { gst, reorder } = pipeline
 
-		const stdin = ffmpeg.stdin
+		const stdin = gst.stdin
 		if (stdin !== undefined && stdin !== null && stdin.writable === true) {
-			// Flush reorder buffer in sequence order before closing
 			while (reorder.buffer.has(reorder.nextToEmit)) {
 				const buf = reorder.buffer.get(reorder.nextToEmit)
 				reorder.buffer.delete(reorder.nextToEmit)
@@ -275,24 +232,22 @@ export class KinesisIngestionPipeline {
 			}
 			stdin.end()
 		}
+
 		try {
-			await Promise.race([
-				putMediaPromise,
-				new Promise<void>((resolve) => {
-					const t = setTimeout(resolve, 15_000)
-					ffmpeg.once('exit', () => {
-						clearTimeout(t)
-						resolve()
-					})
-				}),
-			])
+			await new Promise<void>((resolve) => {
+				const t = setTimeout(resolve, 15_000)
+				gst.once('exit', () => {
+					clearTimeout(t)
+					resolve()
+				})
+			})
 		} catch (err) {
 			this.logger.warn('Error waiting for pipeline stop', {
 				port,
 				error: err instanceof Error ? err.message : String(err),
 			})
 		}
-		ffmpeg.kill('SIGTERM')
+		gst.kill('SIGTERM')
 		this.logger.info('Kinesis ingestion stopped', { port })
 	}
 

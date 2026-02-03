@@ -10,7 +10,7 @@ import { UDPListener, type PacketHandler } from './UDPListener.ts'
  * - Listens for UDP packets on ports 5000-5009
  * - Tracks stream state (active/inactive)
  * - Updates DynamoDB with stream metadata
- * - Optionally sends UDP/MPEG-TS to Kinesis Video Streams (FFmpeg -> MKV -> PutMedia)
+ * - Optionally sends UDP/MPEG-TS to Kinesis Video Streams (GStreamer (TS -> H.264) -> kvssink -> Kinesis Video)
  */
 
 // Configuration
@@ -43,6 +43,7 @@ const kinesisIngestionPipeline = config.kinesisIngestionEnabled
 			streamNamePrefix: config.kinesisStreamPrefix,
 			region: config.awsRegion,
 			portRange: config.portRange,
+			gstPluginPath: process.env.GST_PLUGIN_PATH,
 		})
 	: null
 
@@ -72,7 +73,7 @@ const packetHandler: PacketHandler = {
 		// Update DynamoDB with last packet time
 		await streamMetadataService.updateLastPacketTime(port, timestamp)
 
-		// Feed packet to Kinesis ingestion (FFmpeg -> PutMedia) if enabled
+		// Feed packet to Kinesis ingestion (GStreamer -> kvssink) if enabled
 		if (kinesisIngestionPipeline) {
 			kinesisIngestionPipeline.writePacket(port, data)
 		}

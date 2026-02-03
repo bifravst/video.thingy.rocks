@@ -28,19 +28,22 @@ rm -rf aws awscliv2.zip
 # Verify AWS CLI installation
 aws --version
 
-# Install FFmpeg (static build; not in default AL2023 repos)
-FFMPEG_ARCH=$(uname -m)
-case "$FFMPEG_ARCH" in
-  x86_64) FFMPEG_ARCH="amd64" ;;
-  aarch64) FFMPEG_ARCH="arm64" ;;
-  *) echo "Unsupported arch for FFmpeg: $FFMPEG_ARCH"; exit 1 ;;
-esac
-curl -sL "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-${FFMPEG_ARCH}-static.tar.xz" -o /tmp/ffmpeg.tar.xz
-mkdir -p /tmp/ffmpeg
-tar -xf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg --strip-components=1
-mv /tmp/ffmpeg/ffmpeg /tmp/ffmpeg/ffprobe /usr/local/bin/
-rm -rf /tmp/ffmpeg /tmp/ffmpeg.tar.xz
-ffmpeg -version
+# Install GStreamer and build dependencies for kvssink
+yum install -y cmake gcc-c++ make git pkg-config m4
+yum install -y gstreamer1 gstreamer1-devel gstreamer1-plugins-base gstreamer1-plugins-base-devel gstreamer1-plugins-good gstreamer1-plugins-bad
+
+# Build Amazon Kinesis Video Streams C++ Producer SDK with GStreamer plugin (kvssink)
+KINESIS_SDK_DIR=/opt/amazon-kinesis-video-streams-producer-sdk-cpp
+KINESIS_SDK_TAG=v3.5.0
+git clone --depth 1 --branch "$KINESIS_SDK_TAG" https://github.com/awslabs/amazon-kinesis-video-streams-producer-sdk-cpp.git "$KINESIS_SDK_DIR"
+mkdir -p "$KINESIS_SDK_DIR/build"
+cd "$KINESIS_SDK_DIR/build"
+cmake .. -DBUILD_GSTREAMER_PLUGIN=ON -DBUILD_DEPENDENCIES=ON
+make -j"$(nproc)"
+# Verify kvssink is available
+export GST_PLUGIN_PATH="$KINESIS_SDK_DIR/build"
+export LD_LIBRARY_PATH="$KINESIS_SDK_DIR/build:$KINESIS_SDK_DIR/open-source/local/lib"
+gst-inspect-1.0 kvssink || { echo "kvssink plugin not found"; exit 1; }
 
 # Create application directory
 mkdir -p /opt/video-streaming
@@ -81,6 +84,8 @@ Environment="TABLE_NAME=__TABLE_NAME__"
 Environment="OUTPUT_DIR=/var/video-streams"
 Environment="TRANSCODING_OUTPUT_DIR=/tmp/video-streams/transcoding"
 Environment="KINESIS_STREAM_PREFIX=__KINESIS_STREAM_PREFIX__"
+Environment="GST_PLUGIN_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build"
+Environment="LD_LIBRARY_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build:/opt/amazon-kinesis-video-streams-producer-sdk-cpp/open-source/local/lib"
 ExecStart=/usr/bin/node --experimental-transform-types --no-warnings src/index.ts
 Restart=always
 RestartSec=10
