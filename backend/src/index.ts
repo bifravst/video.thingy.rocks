@@ -1,3 +1,4 @@
+import { KinesisIngestionPipeline } from './KinesisIngestionPipeline.ts'
 import { StreamMetadataService } from './StreamMetadataService.ts'
 import { StreamStateManager } from './StreamStateManager.ts'
 import { UDPListener, type PacketHandler } from './UDPListener.ts'
@@ -9,6 +10,7 @@ import { UDPListener, type PacketHandler } from './UDPListener.ts'
  * - Listens for UDP packets on ports 5000-5009
  * - Tracks stream state (active/inactive)
  * - Updates DynamoDB with stream metadata
+ * - Optionally sends UDP/MPEG-TS to Kinesis Video Streams (FFmpeg -> MKV -> PutMedia)
  */
 
 // Configuration
@@ -23,6 +25,8 @@ const config = {
 	dynamoDBTableName: process.env.TABLE_NAME ?? 'StreamMetadata',
 	awsRegion: process.env.AWS_REGION ?? 'eu-central-1',
 	segmentDuration: 6, // 6 seconds for HLS segments
+	kinesisStreamPrefix: process.env.KINESIS_STREAM_PREFIX ?? '',
+	kinesisIngestionEnabled: Boolean(process.env.KINESIS_STREAM_PREFIX),
 }
 
 const streamStateManager = new StreamStateManager({
@@ -34,20 +38,60 @@ const streamMetadataService = new StreamMetadataService({
 	region: config.awsRegion,
 })
 
+const kinesisIngestionPipeline = config.kinesisIngestionEnabled
+	? new KinesisIngestionPipeline({
+			streamNamePrefix: config.kinesisStreamPrefix,
+			region: config.awsRegion,
+			portRange: config.portRange,
+		})
+	: null
+
 // Set up packet handler
 const packetHandler: PacketHandler = {
 	onPacket: async (port, data, timestamp) => {
+		// Start Kinesis pipeline on first packet so it is ready before we write
+		const isFirstPacket = streamStateManager.getStreamState(port) === undefined
+		if (
+			kinesisIngestionPipeline &&
+			isFirstPacket &&
+			kinesisIngestionPipeline.isPortInRange(port)
+		) {
+			try {
+				await kinesisIngestionPipeline.start(port)
+			} catch (err) {
+				console.error(
+					`[Main] Error starting Kinesis ingestion for port ${port}:`,
+					err,
+				)
+			}
+		}
+
 		// Update stream state
 		streamStateManager.onPacketReceived(port, timestamp)
 
 		// Update DynamoDB with last packet time
 		await streamMetadataService.updateLastPacketTime(port, timestamp)
+
+		// Feed packet to Kinesis ingestion (FFmpeg -> PutMedia) if enabled
+		if (kinesisIngestionPipeline) {
+			kinesisIngestionPipeline.writePacket(port, data)
+		}
 	},
 
 	onStreamStart: async (port) => {
 		console.log(`[Main] Stream started on port ${port}`)
 
 		await streamMetadataService.updateStreamStatus(port, 'active')
+
+		// Pipeline already started on first packet; start here for stream resume
+		if (kinesisIngestionPipeline) {
+			void kinesisIngestionPipeline.start(port).catch((err) => {
+				console.error(
+					`[Main] Error starting Kinesis ingestion for port ${port}:`,
+					err,
+				)
+			})
+		}
 	},
 
 	onStreamStop: async (port, inactivityDuration) => {
@@ -56,6 +100,10 @@ const packetHandler: PacketHandler = {
 		)
 
 		await streamMetadataService.updateStreamStatus(port, 'inactive')
+
+		if (kinesisIngestionPipeline) {
+			await kinesisIngestionPipeline.stop(port)
+		}
 	},
 }
 
@@ -64,6 +112,18 @@ streamStateManager.on('streamStart', (port: number) => {
 	void packetHandler.onStreamStart(port).catch((err) => {
 		console.error(`[Main] Error handling stream start for port ${port}:`, err)
 	})
+})
+
+streamStateManager.on('streamResume', (port: number) => {
+	// Restart Kinesis pipeline when stream resumes after inactivity
+	if (kinesisIngestionPipeline) {
+		void kinesisIngestionPipeline.start(port).catch((err) => {
+			console.error(
+				`[Main] Error starting Kinesis ingestion on resume for port ${port}:`,
+				err,
+			)
+		})
+	}
 })
 
 streamStateManager.on(
@@ -91,6 +151,9 @@ const shutdown = async (): Promise<void> => {
 
 	await udpListener.stop()
 	streamStateManager.stop()
+	if (kinesisIngestionPipeline) {
+		await kinesisIngestionPipeline.stopAll()
+	}
 
 	console.log('[Main] Shutdown complete')
 	process.exit(0)
@@ -118,6 +181,15 @@ const start = async (): Promise<void> => {
 	console.log(`[Main] Output directory: ${config.outputDirectory}`)
 	console.log(`[Main] DynamoDB table: ${config.dynamoDBTableName}`)
 	console.log(`[Main] AWS region: ${config.awsRegion}`)
+	if (config.kinesisIngestionEnabled) {
+		console.log(
+			`[Main] Kinesis ingestion enabled (stream prefix: ${config.kinesisStreamPrefix})`,
+		)
+	} else {
+		console.log(
+			'[Main] Kinesis ingestion disabled (KINESIS_STREAM_PREFIX not set)',
+		)
+	}
 
 	try {
 		await udpListener.start()
@@ -136,4 +208,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 	})
 }
 
-export { streamMetadataService, streamStateManager, udpListener }
+export {
+	kinesisIngestionPipeline,
+	streamMetadataService,
+	streamStateManager,
+	udpListener,
+}

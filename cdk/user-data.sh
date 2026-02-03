@@ -28,36 +28,33 @@ rm -rf aws awscliv2.zip
 # Verify AWS CLI installation
 aws --version
 
+# Install FFmpeg (static build; not in default AL2023 repos)
+FFMPEG_ARCH=$(uname -m)
+case "$FFMPEG_ARCH" in
+  x86_64) FFMPEG_ARCH="amd64" ;;
+  aarch64) FFMPEG_ARCH="arm64" ;;
+  *) echo "Unsupported arch for FFmpeg: $FFMPEG_ARCH"; exit 1 ;;
+esac
+curl -sL "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-${FFMPEG_ARCH}-static.tar.xz" -o /tmp/ffmpeg.tar.xz
+mkdir -p /tmp/ffmpeg
+tar -xf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg --strip-components=1
+mv /tmp/ffmpeg/ffmpeg /tmp/ffmpeg/ffprobe /usr/local/bin/
+rm -rf /tmp/ffmpeg /tmp/ffmpeg.tar.xz
+ffmpeg -version
+
 # Create application directory
 mkdir -p /opt/video-streaming
-cd /opt/video-streaming
 
 # Create output directory for video streams
 mkdir -p /var/video-streams
 chmod 755 /var/video-streams
 
-# Copy application code (will be replaced with actual deployment mechanism)
-# For now, we'll use AWS Systems Manager Parameter Store or S3 to fetch the code
-# This is a placeholder that will be replaced in the CDK stack
+# Download application code from S3 (placeholders replaced by CDK)
+aws s3 sync s3://__CODE_BUCKET__/backend/ /opt/video-streaming/ --region __AWS_REGION__
 
-# Install application dependencies
-# Note: The actual code deployment will happen via CDK BucketDeployment or similar
-cat > package.json << 'EOF'
-{
-  "name": "video-streaming-backend",
-  "version": "1.0.0",
-  "type": "module",
-  "scripts": {
-    "start": "node --experimental-transform-types --no-warnings src/index.ts"
-  },
-  "dependencies": {
-    "@aws-sdk/client-s3": "^3.976.0",
-    "@aws-sdk/client-dynamodb": "^3.976.0",
-    "@aws-sdk/lib-dynamodb": "^3.976.0",
-    "@aws-sdk/client-cloudwatch": "^3.976.0"
-  }
-}
-EOF
+# Install dependencies from deployed package.json
+cd /opt/video-streaming
+npm install --production
 
 # Environment variables will be set by CDK
 # AWS_REGION - AWS region
@@ -83,6 +80,7 @@ Environment="AWS_REGION=__AWS_REGION__"
 Environment="TABLE_NAME=__TABLE_NAME__"
 Environment="OUTPUT_DIR=/var/video-streams"
 Environment="TRANSCODING_OUTPUT_DIR=/tmp/video-streams/transcoding"
+Environment="KINESIS_STREAM_PREFIX=__KINESIS_STREAM_PREFIX__"
 ExecStart=/usr/bin/node --experimental-transform-types --no-warnings src/index.ts
 Restart=always
 RestartSec=10
@@ -99,6 +97,9 @@ systemctl daemon-reload
 
 # Enable service to start on boot
 systemctl enable video-streaming.service
+
+# Start the application service immediately (before CloudWatch config so a later failure does not prevent start)
+systemctl start video-streaming.service
 
 # Configure CloudWatch Logs agent
 cat > /opt/aws/amazon-cloudwatch-agent/etc/cloudwatch-config.json << 'EOF'
@@ -138,14 +139,11 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/cloudwatch-config.json << 'EOF'
 }
 EOF
 
-# Start CloudWatch Logs agent
+# Start CloudWatch Logs agent (do not fail user-data if agent has issues)
 /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
   -a fetch-config \
   -m ec2 \
   -s \
-  -c file:/opt/aws/amazon-cloudwatch-agent/etc/cloudwatch-config.json
-
-# Note: Service will be started after code deployment
-# systemctl start video-streaming.service
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/cloudwatch-config.json || true
 
 echo "EC2 user data script completed successfully"

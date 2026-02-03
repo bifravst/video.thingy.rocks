@@ -13,6 +13,7 @@ import * as cognito from 'aws-cdk-lib/aws-cognito'
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb'
 import * as ec2 from 'aws-cdk-lib/aws-ec2'
 import * as iam from 'aws-cdk-lib/aws-iam'
+import * as kinesisvideo from 'aws-cdk-lib/aws-kinesisvideo'
 import * as logs from 'aws-cdk-lib/aws-logs'
 import * as s3 from 'aws-cdk-lib/aws-s3'
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment'
@@ -34,6 +35,7 @@ export class StreamingStack extends Stack {
 	public readonly ec2Role: iam.Role
 	public readonly autoScalingGroup: autoscaling.AutoScalingGroup
 	public readonly codeBucket: s3.Bucket
+	public readonly kinesisVideoStreams: kinesisvideo.CfnStream[] = []
 
 	constructor(
 		scope: Construct,
@@ -88,6 +90,27 @@ export class StreamingStack extends Stack {
 			billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
 			removalPolicy: RemovalPolicy.DESTROY,
 		})
+
+		// Kinesis Video Streams: one per UDP port (5000-5009)
+		const kinesisStreamPortStart = 5000
+		const kinesisStreamPortEnd = 5009
+		const kinesisStreamPrefix = `${this.stackName}-video`
+		for (
+			let port = kinesisStreamPortStart;
+			port <= kinesisStreamPortEnd;
+			port++
+		) {
+			const stream = new kinesisvideo.CfnStream(
+				this,
+				`KinesisVideoStream${port}`,
+				{
+					name: `${kinesisStreamPrefix}-${port}`,
+					dataRetentionInHours: 1,
+					mediaType: 'video/h264',
+				},
+			)
+			this.kinesisVideoStreams.push(stream)
+		}
 
 		// Create Cognito User Pool for authenticated access
 		this.userPool = new cognito.UserPool(this, 'UserPool', {
@@ -273,6 +296,19 @@ export class StreamingStack extends Stack {
 		// Grant DynamoDB permissions for stream metadata
 		this.streamTable.grantReadWriteData(this.ec2Role)
 
+		// Grant Kinesis Video Streams: GetDataEndpoint (control plane) and PutMedia (data plane)
+		this.ec2Role.addToPolicy(
+			new iam.PolicyStatement({
+				effect: iam.Effect.ALLOW,
+				actions: [
+					'kinesisvideo:GetDataEndpoint',
+					'kinesisvideo:DescribeStream',
+					'kinesisvideo:PutMedia',
+				],
+				resources: ['*'],
+			}),
+		)
+
 		// Grant CloudWatch permissions for metrics and logs
 		this.ec2Role.addToPolicy(
 			new iam.PolicyStatement({
@@ -333,21 +369,8 @@ export class StreamingStack extends Stack {
 		userDataScript = userDataScript
 			.replace(/__AWS_REGION__/g, this.region)
 			.replace(/__TABLE_NAME__/g, this.streamTable.tableName)
-
-		// Add code download commands to user data
-		const codeDownloadCommands = `
-# Download application code from S3
-aws s3 sync s3://${this.codeBucket.bucketName}/backend/ /opt/video-streaming/ --region ${this.region}
-
-# Install dependencies
-cd /opt/video-streaming
-npm install --production
-
-# Start the service
-systemctl start video-streaming.service
-`
-
-		userDataScript += codeDownloadCommands
+			.replace(/__KINESIS_STREAM_PREFIX__/g, kinesisStreamPrefix)
+			.replace(/__CODE_BUCKET__/g, this.codeBucket.bucketName)
 
 		const userData = ec2.UserData.custom(userDataScript)
 
