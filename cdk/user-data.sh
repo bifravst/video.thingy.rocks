@@ -19,7 +19,7 @@ node --version
 npm --version
 
 # Install AWS CLI v2
-curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+curl "https://awscli.amazonaws.com/awscli-exe-linux-arm64.zip" -o "awscliv2.zip"
 yum install -y unzip
 unzip awscliv2.zip
 ./aws/install
@@ -90,17 +90,22 @@ systemctl enable video-streaming.service
 systemctl start video-streaming.service
 
 # Build kvssink plugin (non-fatal: if this fails, app still runs with gst-launch-1.0; Kinesis ingestion will fail until kvssink is available)
-# Log full build output so failures can be diagnosed (e.g. build/ only containing CMake files)
+# Log full build output so failures can be diagnosed (e.g. build/ empty or only CMake files)
 KINESIS_SDK_DIR=/opt/amazon-kinesis-video-streams-producer-sdk-cpp
 KINESIS_SDK_TAG=v3.5.0
 KINESIS_BUILD_LOG=/var/log/kinesis-sdk-build.log
 if ! (
+  rm -rf "$KINESIS_SDK_DIR"
   git clone --depth 1 --branch "$KINESIS_SDK_TAG" https://github.com/awslabs/amazon-kinesis-video-streams-producer-sdk-cpp.git "$KINESIS_SDK_DIR"
+  [ -f "$KINESIS_SDK_DIR/CMakeLists.txt" ] || { echo "Clone failed: CMakeLists.txt missing"; exit 1; }
   mkdir -p "$KINESIS_SDK_DIR/build"
   cd "$KINESIS_SDK_DIR/build"
+  # Limit make to 2 jobs to avoid OOM during log4cplus/SDK build (compiler can use ~1–2 GB per job)
   { cmake .. -DBUILD_GSTREAMER_PLUGIN=ON -DBUILD_DEPENDENCIES=ON 2>&1
-    make -j"$(nproc)" 2>&1
+    make -j2 2>&1
   } | tee "$KINESIS_BUILD_LOG"
+  echo "--- build dir contents after make ---" >> "$KINESIS_BUILD_LOG"
+  ls -la "$KINESIS_SDK_DIR/build" >> "$KINESIS_BUILD_LOG" 2>&1
   export GST_PLUGIN_PATH="$KINESIS_SDK_DIR/build"
   export LD_LIBRARY_PATH="$KINESIS_SDK_DIR/build"
   gst-inspect-1.0 kvssink

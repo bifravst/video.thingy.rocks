@@ -383,10 +383,12 @@ export class StreamingStack extends Stack {
 		// Create Launch Template explicitly (AWS is deprecating Launch Configurations)
 		const launchTemplate = new ec2.LaunchTemplate(this, 'LaunchTemplate', {
 			instanceType: ec2.InstanceType.of(
-				ec2.InstanceClass.C5,
+				ec2.InstanceClass.R8G,
 				ec2.InstanceSize.XLARGE,
 			),
-			machineImage: ec2.MachineImage.latestAmazonLinux2023(),
+			machineImage: ec2.MachineImage.latestAmazonLinux2023({
+				cpuType: ec2.AmazonLinuxCpuType.ARM_64,
+			}),
 			role: this.ec2Role,
 			securityGroup: this.udpSecurityGroup,
 			userData,

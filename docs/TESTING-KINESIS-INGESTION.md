@@ -146,7 +146,14 @@ escaping the bang (e.g. in bash: `gst-launch-1.0 -e fdsrc fd=0 \! fakesink`).
   download failed" / "Connection timed out"** when building the SDK usually
   means the instance cannot reach the internet on port 80 (e.g. security group
   only allowed 443); the stack allows TCP 80 egress so dependency tarballs (e.g.
-  from ftp.gnu.org) can be downloaded during bootstrap.
+  from ftp.gnu.org) can be downloaded during bootstrap. If **`build/` is empty**
+  (no `libgstkvssink.so`, not even `CMakeCache.txt`), the clone or cmake step
+  likely failed; check `kinesis-sdk-build.log` and ensure the instance has
+  outbound HTTP/HTTPS. Redeploying with a clean instance runs the build from
+  scratch (user-data removes the SDK dir before cloning). **"Killed signal
+  terminated program cc1plus"** means the build ran out of memory (OOM);
+  user-data uses `make -j2` to limit memory use. On very small instances, run
+  the build manually with `make -j1`.
 
 - **No fragments in Kinesis (plugin loads)**  
   Ensure `KINESIS_STREAM_PREFIX` is set and the stack has Kinesis streams and
