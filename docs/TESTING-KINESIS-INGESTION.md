@@ -94,6 +94,20 @@ on Kinesis:
 After it runs, use the console (step 3) to confirm fragments for the stream
 corresponding to the port used (e.g. 5000).
 
+## Verify GStreamer (minimal pipeline)
+
+On the server (or wherever you run GStreamer), confirm a minimal pipeline works.
+Use **filesrc** (same as the app); **fdsrc fd=0** can trigger shell history
+expansion (`!`) or parser errors on some systems:
+
+```bash
+# Recommended: same pattern as the app (stdin via /dev/stdin)
+echo -n "" | gst-launch-1.0 -e filesrc location=/dev/stdin ! fakesink
+```
+
+If you must use `fdsrc`, avoid history expansion by running in a script or
+escaping the bang (e.g. in bash: `gst-launch-1.0 -e fdsrc fd=0 \! fakesink`).
+
 ## Troubleshooting
 
 - **Only “Updated last packet time” in logs, no Kinesis upload**  
@@ -105,13 +119,34 @@ corresponding to the port used (e.g. 5000).
   `__KINESIS_STREAM_PREFIX__` in user-data when the stack is deployed; replace
   instances (or redeploy) if the service was created before that was added.
 
+- **"erroneous pipeline: syntax error" when testing GStreamer**  
+  See **Verify GStreamer (minimal pipeline)** above. Use
+  `filesrc location=/dev/stdin ! fakesink`; avoid `fdsrc fd=0 ! …` in
+  interactive shells (the `!` can be expanded by the shell).
+
+- **no element "kvssink"**  
+  GStreamer can’t find the kvssink plugin because `GST_PLUGIN_PATH` (and usually
+  `LD_LIBRARY_PATH`) are not set for that process. When you run the pipeline
+  **manually** on the server, set the same environment as the systemd service,
+  for example:  
+  `GST_PLUGIN_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build LD_LIBRARY_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build gst-launch-1.0 -e filesrc location=/dev/stdin ! … ! kvssink …`  
+  The app process gets these from the service; only manual runs need them set in
+  the shell.
+
 - **No fragments in Kinesis / kvssink not found**  
   Ensure `GST_PLUGIN_PATH` and `LD_LIBRARY_PATH` are set in the systemd unit
   (see user-data). The kvssink plugin is built from the Amazon Kinesis Video
   Streams C++ Producer SDK during instance bootstrap. On the instance, verify:  
-  `GST_PLUGIN_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build LD_LIBRARY_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build:/opt/amazon-kinesis-video-streams-producer-sdk-cpp/open-source/local/lib gst-inspect-1.0 kvssink`  
-  If this fails, the SDK build in user-data may have failed; check
-  `/var/log/cloud-init-output.log`.
+  `GST_PLUGIN_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build LD_LIBRARY_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build gst-inspect-1.0 kvssink`  
+  If this fails, the SDK build in user-data may have failed. Check
+  `/var/log/cloud-init-output.log` and **`/var/log/kinesis-sdk-build.log`**
+  (full cmake/make output). If `build/` only contains `CMakeCache.txt` and
+  `CMakeFiles`, `make` did not complete; install build deps (e.g. `autoconf`,
+  `automake`, `libcurl-devel`) and re-run the build or redeploy. **"Each
+  download failed" / "Connection timed out"** when building the SDK usually
+  means the instance cannot reach the internet on port 80 (e.g. security group
+  only allowed 443); the stack allows TCP 80 egress so dependency tarballs (e.g.
+  from ftp.gnu.org) can be downloaded during bootstrap.
 
 - **No fragments in Kinesis (plugin loads)**  
   Ensure `KINESIS_STREAM_PREFIX` is set and the stack has Kinesis streams and

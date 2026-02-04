@@ -28,24 +28,12 @@ rm -rf aws awscliv2.zip
 # Verify AWS CLI installation
 aws --version
 
-# Install GStreamer and build dependencies for kvssink
-yum install -y cmake gcc-c++ make git pkg-config m4
-yum install -y gstreamer1 gstreamer1-devel gstreamer1-plugins-base gstreamer1-plugins-base-devel gstreamer1-plugins-good gstreamer1-plugins-bad
+# Install GStreamer and build deps before the app starts so gst-launch-1.0 is on PATH
+# autoconf/automake needed by SDK when BUILD_DEPENDENCIES=ON (log4cplus); libcurl-devel for SDK
+yum install -y cmake gcc-c++ make git pkg-config m4 autoconf automake libcurl-devel
+yum install -y gstreamer1 gstreamer1-devel gstreamer1-plugins-base gstreamer1-plugins-base-devel gstreamer1-plugins-good gstreamer1-plugins-bad-free
 
-# Build Amazon Kinesis Video Streams C++ Producer SDK with GStreamer plugin (kvssink)
-KINESIS_SDK_DIR=/opt/amazon-kinesis-video-streams-producer-sdk-cpp
-KINESIS_SDK_TAG=v3.5.0
-git clone --depth 1 --branch "$KINESIS_SDK_TAG" https://github.com/awslabs/amazon-kinesis-video-streams-producer-sdk-cpp.git "$KINESIS_SDK_DIR"
-mkdir -p "$KINESIS_SDK_DIR/build"
-cd "$KINESIS_SDK_DIR/build"
-cmake .. -DBUILD_GSTREAMER_PLUGIN=ON -DBUILD_DEPENDENCIES=ON
-make -j"$(nproc)"
-# Verify kvssink is available
-export GST_PLUGIN_PATH="$KINESIS_SDK_DIR/build"
-export LD_LIBRARY_PATH="$KINESIS_SDK_DIR/build:$KINESIS_SDK_DIR/open-source/local/lib"
-gst-inspect-1.0 kvssink || { echo "kvssink plugin not found"; exit 1; }
-
-# Create application directory
+# Create application directory and deploy code so the service always gets installed and started
 mkdir -p /opt/video-streaming
 
 # Create output directory for video streams
@@ -59,16 +47,11 @@ aws s3 sync s3://__CODE_BUCKET__/backend/ /opt/video-streaming/ --region __AWS_R
 cd /opt/video-streaming
 npm install --production
 
-# Environment variables will be set by CDK
-# AWS_REGION - AWS region
-# TABLE_NAME - DynamoDB table name
-# OUTPUT_DIR - Output directory for video streams
-
 # Create log directory for application
 mkdir -p /var/log/video-streaming
 chmod 755 /var/log/video-streaming
 
-# Create systemd service file
+# Create systemd service file (service must exist even if kvssink build fails later)
 cat > /etc/systemd/system/video-streaming.service << 'EOF'
 [Unit]
 Description=Video Streaming UDP Listener Service
@@ -85,7 +68,7 @@ Environment="OUTPUT_DIR=/var/video-streams"
 Environment="TRANSCODING_OUTPUT_DIR=/tmp/video-streams/transcoding"
 Environment="KINESIS_STREAM_PREFIX=__KINESIS_STREAM_PREFIX__"
 Environment="GST_PLUGIN_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build"
-Environment="LD_LIBRARY_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build:/opt/amazon-kinesis-video-streams-producer-sdk-cpp/open-source/local/lib"
+Environment="LD_LIBRARY_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build"
 ExecStart=/usr/bin/node --experimental-transform-types --no-warnings src/index.ts
 Restart=always
 RestartSec=10
@@ -103,8 +86,27 @@ systemctl daemon-reload
 # Enable service to start on boot
 systemctl enable video-streaming.service
 
-# Start the application service immediately (before CloudWatch config so a later failure does not prevent start)
+# Start the application service immediately so the app is always running
 systemctl start video-streaming.service
+
+# Build kvssink plugin (non-fatal: if this fails, app still runs with gst-launch-1.0; Kinesis ingestion will fail until kvssink is available)
+# Log full build output so failures can be diagnosed (e.g. build/ only containing CMake files)
+KINESIS_SDK_DIR=/opt/amazon-kinesis-video-streams-producer-sdk-cpp
+KINESIS_SDK_TAG=v3.5.0
+KINESIS_BUILD_LOG=/var/log/kinesis-sdk-build.log
+if ! (
+  git clone --depth 1 --branch "$KINESIS_SDK_TAG" https://github.com/awslabs/amazon-kinesis-video-streams-producer-sdk-cpp.git "$KINESIS_SDK_DIR"
+  mkdir -p "$KINESIS_SDK_DIR/build"
+  cd "$KINESIS_SDK_DIR/build"
+  { cmake .. -DBUILD_GSTREAMER_PLUGIN=ON -DBUILD_DEPENDENCIES=ON 2>&1
+    make -j"$(nproc)" 2>&1
+  } | tee "$KINESIS_BUILD_LOG"
+  export GST_PLUGIN_PATH="$KINESIS_SDK_DIR/build"
+  export LD_LIBRARY_PATH="$KINESIS_SDK_DIR/build"
+  gst-inspect-1.0 kvssink
+); then
+  echo "WARNING: kvssink build failed or skipped; Kinesis ingestion will not work until the plugin is available. Check $KINESIS_BUILD_LOG and /var/log/cloud-init-output.log."
+fi
 
 # Configure CloudWatch Logs agent
 cat > /opt/aws/amazon-cloudwatch-agent/etc/cloudwatch-config.json << 'EOF'
