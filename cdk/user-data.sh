@@ -18,12 +18,14 @@ yum install -y nodejs
 node --version
 npm --version
 
-# Install AWS CLI v2
-curl "https://awscli.amazonaws.com/awscli-exe-linux-arm64.zip" -o "awscliv2.zip"
+# Install AWS CLI v2 (unzip first; use -f so curl fails on HTTP errors; use /tmp for predictable path)
 yum install -y unzip
-unzip awscliv2.zip
-./aws/install
-rm -rf aws awscliv2.zip
+yum remove awscli -y
+
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o /tmp/awscliv2.zip
+unzip -q -o /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install
+rm -rf /tmp/aws /tmp/awscliv2.zip
 
 # Verify AWS CLI installation
 aws --version
@@ -94,6 +96,7 @@ systemctl start video-streaming.service
 KINESIS_SDK_DIR=/opt/amazon-kinesis-video-streams-producer-sdk-cpp
 KINESIS_SDK_TAG=v3.5.0
 KINESIS_BUILD_LOG=/var/log/kinesis-sdk-build.log
+yum install -y perl
 if ! (
   rm -rf "$KINESIS_SDK_DIR"
   git clone --depth 1 --branch "$KINESIS_SDK_TAG" https://github.com/awslabs/amazon-kinesis-video-streams-producer-sdk-cpp.git "$KINESIS_SDK_DIR"
