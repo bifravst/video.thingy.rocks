@@ -53,6 +53,12 @@ npm install --production
 mkdir -p /var/log/video-streaming
 chmod 755 /var/log/video-streaming
 
+# Kinesis Video SDK (kvssink) requires a log4cplus config file; default path "../kvs_log_configuration"
+# fails when CWD is /opt/video-streaming. Create it so we can pass an absolute path via log-config.
+# INFO level to avoid noisy DEBUG in production.
+printf '%s\n' 'log4cplus.rootLogger=INFO, KvsConsoleAppender' > /opt/video-streaming/kvs_log_configuration
+chmod 644 /opt/video-streaming/kvs_log_configuration
+
 # Create systemd service file (service must exist even if kvssink build fails later)
 cat > /etc/systemd/system/video-streaming.service << 'EOF'
 [Unit]

@@ -105,8 +105,12 @@ export class KinesisIngestionPipeline {
 
 		// TS from stdin -> tsdemux -> H.264 -> kvssink (sends to Kinesis)
 		// Use filesrc location=/dev/stdin instead of fdsrc fd=0 (same effect on Linux; some gst-launch parsers fail on fdsrc fd=0)
-		// Quote kvssink values so hyphens in stream name are not parsed as minus by the grammar
-		const pipelineStr = `filesrc location=/dev/stdin ! tsparse set-timestamps=true ! tsdemux name=d d.video_0 ! queue ! h264parse ! capsfilter caps="video/x-h264,stream-format=avc,alignment=au" ! kvssink stream-name="${streamName.replace(/"/g, '\\"')}" aws-region="${region.replace(/"/g, '\\"')}" storage-size=128`
+		// Quote kvssink values so hyphens in stream name are not parsed as minus by the grammar.
+		// log-config: KVS C++ SDK requires a log4cplus config file; default "../kvs_log_configuration" fails when CWD is app dir. Use absolute path (EC2 user-data creates it) or env override for local.
+		const logConfigPath =
+			process.env.KVS_LOG_CONFIG_PATH ??
+			'/opt/video-streaming/kvs_log_configuration'
+		const pipelineStr = `filesrc location=/dev/stdin ! tsparse set-timestamps=true ! tsdemux name=d d.video_0 ! queue ! h264parse ! capsfilter caps="video/x-h264,stream-format=avc,alignment=au" ! kvssink stream-name="${streamName.replace(/"/g, '\\"')}" aws-region="${region.replace(/"/g, '\\"')}" storage-size=128 log-config="${logConfigPath.replace(/"/g, '\\"')}"`
 
 		// Run via sh so we can pass pipeline from file: "$(cat "$PIPELINE_FILE")" gives gst-launch one exact argument with no Node->argv encoding
 		const shellCmd = `gst-launch-1.0 ${pipelineStr}`

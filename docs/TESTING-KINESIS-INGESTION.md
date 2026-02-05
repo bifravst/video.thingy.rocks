@@ -18,7 +18,11 @@ reads from stdin, demuxes TS, parses H.264, and sends it to Kinesis Video
 Streams via the **kvssink** plugin. Ingestion does not use Node’s PutMedia;
 kvssink handles the connection to Kinesis. The systemd service sets
 `GST_PLUGIN_PATH` and `LD_LIBRARY_PATH` so the Node-spawned `gst-launch-1.0`
-finds the kvssink plugin and its dependencies.
+finds the kvssink plugin and its dependencies. The KVS C++ SDK requires a
+log4cplus config file; the pipeline passes its path via the `log-config`
+property (default on EC2: `/opt/video-streaming/kvs_log_configuration`, created
+in user-data). For local runs, set `KVS_LOG_CONFIG_PATH` to the path of
+`backend/kvs_log_configuration` (or an absolute path to it).
 
 ## 1. Unit tests
 
