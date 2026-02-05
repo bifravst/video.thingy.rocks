@@ -43,7 +43,6 @@ const kinesisIngestionPipeline = config.kinesisIngestionEnabled
 			streamNamePrefix: config.kinesisStreamPrefix,
 			region: config.awsRegion,
 			portRange: config.portRange,
-			gstPluginPath: process.env.GST_PLUGIN_PATH,
 		})
 	: null
 

@@ -1,7 +1,5 @@
 import { spawn } from 'node:child_process'
-import { unlinkSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+
 import type { Writable } from 'node:stream'
 import { Logger } from './Logger.ts'
 
@@ -9,12 +7,6 @@ export type KinesisIngestionPipelineConfig = {
 	streamNamePrefix: string
 	region: string
 	portRange: { start: number; end: number }
-	gstLaunchPath?: string
-	/**
-	 * Path for GST_PLUGIN_PATH so the child process finds kvssink.
-	 * If not set, inherits process.env.GST_PLUGIN_PATH (e.g. from systemd).
-	 */
-	gstPluginPath?: string
 	/**
 	 * Max packets to buffer before writing to GStreamer stdin (0 = write immediately).
 	 * Packets are emitted in receive order; does not fix network reordering.
@@ -38,8 +30,6 @@ type PortPipeline = {
 	gst: ReturnType<typeof spawn>
 	reorder: ReorderState
 	gstStderrThrottle: GstStderrThrottle
-	/** Temp file holding the pipeline string (for cleanup on stop). */
-	pipelineFilePath: string
 }
 
 /** Throttle repeated GStreamer stderr warnings (same category) per port. */
@@ -111,7 +101,6 @@ export class KinesisIngestionPipeline {
 		if (this.activePipelines.has(port)) return
 
 		const streamName = this.streamNameForPort(port)
-		const gstLaunchPath = this.config.gstLaunchPath ?? 'gst-launch-1.0'
 		const region = this.config.region
 
 		// TS from stdin -> tsdemux -> H.264 -> kvssink (sends to Kinesis)
@@ -119,31 +108,17 @@ export class KinesisIngestionPipeline {
 		// Quote kvssink values so hyphens in stream name are not parsed as minus by the grammar
 		const pipelineStr = `filesrc location=/dev/stdin ! tsparse set-timestamps=true ! tsdemux name=d d.video_0 ! queue ! h264parse ! capsfilter caps="video/x-h264,stream-format=avc,alignment=au" ! kvssink stream-name="${streamName.replace(/"/g, '\\"')}" aws-region="${region.replace(/"/g, '\\"')}" storage-size=128`
 
-		// Write pipeline to a temp file and run gst-launch by reading it; avoids quoting/encoding issues when passing the pipeline as a single argument from Node.
-		const pipelineFilePath = join(tmpdir(), `gst-pipeline-${port}.txt`)
-		writeFileSync(pipelineFilePath, pipelineStr, 'utf8')
-
-		const spawnEnv: NodeJS.ProcessEnv = {
-			...process.env,
-			PIPELINE_FILE: pipelineFilePath,
-			...(this.config.gstPluginPath !== undefined
-				? { GST_PLUGIN_PATH: this.config.gstPluginPath }
-				: {}),
-		}
-
 		// Run via sh so we can pass pipeline from file: "$(cat "$PIPELINE_FILE")" gives gst-launch one exact argument with no Node->argv encoding
-		const shellCmd = `exec "${gstLaunchPath}" -q -e "$(cat "$PIPELINE_FILE")"`
+		const shellCmd = `gst-launch-1.0 ${pipelineStr}`
 		this.logger.info('GStreamer command', {
 			port,
 			streamName,
-			gstLaunchPath,
-			pipelineFilePath,
 			pipelineStr,
 			shellCmd,
 		})
 		const gst = spawn('sh', ['-c', shellCmd], {
 			stdio: ['pipe', 'ignore', 'pipe'],
-			env: spawnEnv,
+			env: process.env,
 		})
 
 		// Prevent EPIPE from crashing the process when GStreamer exits early (e.g. pipeline syntax error)
@@ -187,7 +162,6 @@ export class KinesisIngestionPipeline {
 			gst,
 			reorder,
 			gstStderrThrottle,
-			pipelineFilePath,
 		})
 		this.logger.info('Kinesis ingestion started', {
 			port,
@@ -254,14 +228,10 @@ export class KinesisIngestionPipeline {
 		if (!pipeline) return
 
 		this.activePipelines.delete(port)
-		const { gst, reorder, pipelineFilePath: pathToRemove } = pipeline
+		const { gst, reorder } = pipeline
 
 		const stdin = gst.stdin
-		try {
-			unlinkSync(pathToRemove)
-		} catch {
-			// Ignore if file already removed or missing
-		}
+
 		if (stdin !== undefined && stdin !== null && stdin.writable === true) {
 			while (reorder.buffer.has(reorder.nextToEmit)) {
 				const buf = reorder.buffer.get(reorder.nextToEmit)
