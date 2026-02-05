@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
 
+import { fromNodeProviderChain } from '@aws-sdk/credential-providers'
 import type { Writable } from 'node:stream'
 import { Logger } from './Logger.ts'
 
@@ -120,9 +121,65 @@ export class KinesisIngestionPipeline {
 			pipelineStr,
 			shellCmd,
 		})
+		// Ensure GStreamer child gets plugin/lib path; systemd sets these for the process, but when
+		// run by hand KINESIS_* can be set and we pass them through so kvssink and its .so deps are found.
+		const env = { ...process.env }
+		if (env.KINESIS_GST_PLUGIN_PATH !== undefined) {
+			env.GST_PLUGIN_PATH = env.KINESIS_GST_PLUGIN_PATH
+		}
+		if (env.KINESIS_LD_LIBRARY_PATH !== undefined) {
+			env.LD_LIBRARY_PATH = env.KINESIS_LD_LIBRARY_PATH
+		}
+		// kvssink (C++ SDK) does not use the same credential chain as Node; it often fails to find
+		// credentials (e.g. "Could not find any AWS credentials!"). Resolve credentials in Node
+		// (env, IMDS on EC2, etc.) and pass them to the child so the C++ plugin finds them.
+		// Use a longer IMDS timeout and retries (default is 1s and 0), and retry resolution a few
+		// times so we tolerate IMDS not being ready at process start (e.g. right after boot).
+		const credentialProvider = fromNodeProviderChain({
+			timeout: 10_000,
+			maxRetries: 5,
+		})
+		const maxResolutionAttempts = 3
+		const resolutionDelayMs = 2000
+		let credentials: Awaited<
+			ReturnType<ReturnType<typeof fromNodeProviderChain>>
+		>
+		try {
+			for (let attempt = 1; attempt <= maxResolutionAttempts; attempt++) {
+				try {
+					credentials = await credentialProvider()
+					break
+				} catch (e) {
+					if (attempt === maxResolutionAttempts) throw e
+					this.logger.warn('Credentials not yet available, retrying', {
+						port,
+						streamName,
+						attempt,
+						nextAttemptInMs: resolutionDelayMs,
+					})
+					await new Promise((r) => setTimeout(r, resolutionDelayMs))
+				}
+			}
+			env.AWS_ACCESS_KEY_ID = credentials!.accessKeyId
+			env.AWS_SECRET_ACCESS_KEY = credentials!.secretAccessKey
+			if (
+				credentials!.sessionToken !== undefined &&
+				credentials!.sessionToken !== ''
+			) {
+				env.AWS_SESSION_TOKEN = credentials!.sessionToken
+			}
+			env.AWS_REGION = region
+		} catch (err) {
+			this.logger.error(
+				'Failed to resolve AWS credentials for kvssink',
+				err instanceof Error ? err : new Error(String(err)),
+				{ port, streamName },
+			)
+			return
+		}
 		const gst = spawn('sh', ['-c', shellCmd], {
 			stdio: ['pipe', 'ignore', 'pipe'],
-			env: process.env,
+			env,
 		})
 
 		// Prevent EPIPE from crashing the process when GStreamer exits early (e.g. pipeline syntax error)

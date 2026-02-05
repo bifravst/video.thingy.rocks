@@ -1,0 +1,7 @@
+# log4cplus config for Kinesis Video producer (gstkvssink).
+# Use standard log4cplus appenders; KvsConsoleAppender is SDK-specific and not
+# always registered when the GStreamer plugin loads the config (causes "Invalid appender").
+log4cplus.rootLogger=INFO, STDOUT
+log4cplus.appender.STDOUT=log4cplus::ConsoleAppender
+log4cplus.appender.STDOUT.layout=log4cplus::PatternLayout
+log4cplus.appender.STDOUT.layout.ConversionPattern=%d{%H:%M:%S} [%t] - %m%n

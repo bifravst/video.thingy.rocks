@@ -55,8 +55,13 @@ chmod 755 /var/log/video-streaming
 
 # Kinesis Video SDK (kvssink) requires a log4cplus config file; default path "../kvs_log_configuration"
 # fails when CWD is /opt/video-streaming. Create it so we can pass an absolute path via log-config.
-# INFO level to avoid noisy DEBUG in production.
-printf '%s\n' 'log4cplus.rootLogger=INFO, KvsConsoleAppender' > /opt/video-streaming/kvs_log_configuration
+# Use standard log4cplus appenders (STDOUT); KvsConsoleAppender is not always registered by the plugin.
+cat > /opt/video-streaming/kvs_log_configuration << 'KVSCONF'
+log4cplus.rootLogger=INFO, STDOUT
+log4cplus.appender.STDOUT=log4cplus::ConsoleAppender
+log4cplus.appender.STDOUT.layout=log4cplus::PatternLayout
+log4cplus.appender.STDOUT.layout.ConversionPattern=%d{%H:%M:%S} [%t] - %m%n
+KVSCONF
 chmod 644 /opt/video-streaming/kvs_log_configuration
 
 # Create systemd service file (service must exist even if kvssink build fails later)
