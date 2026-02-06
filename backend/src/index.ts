@@ -73,7 +73,7 @@ const kinesisIngestionPipeline = config.kinesisIngestionEnabled
 // Set up packet handler
 const packetHandler: PacketHandler = {
 	onPacket: async (port, data, timestamp) => {
-		// Start Kinesis pipeline on first packet so it is ready before we write
+		// Start Kinesis pipeline on first packet; pass this packet so it is written to stdin immediately after spawn (fdsrc needs data when it first reads).
 		const isFirstPacket = streamStateManager.getStreamState(port) === undefined
 		if (
 			kinesisIngestionPipeline &&
@@ -81,7 +81,7 @@ const packetHandler: PacketHandler = {
 			kinesisIngestionPipeline.isPortInRange(port)
 		) {
 			try {
-				await kinesisIngestionPipeline.start(port)
+				await kinesisIngestionPipeline.start(port, data)
 			} catch (err) {
 				console.error(
 					`[Main] Error starting Kinesis ingestion for port ${port}:`,
@@ -96,9 +96,13 @@ const packetHandler: PacketHandler = {
 		// Update DynamoDB with last packet time
 		await streamMetadataService.updateLastPacketTime(port, timestamp)
 
-		// Feed packet to Kinesis ingestion (GStreamer -> kvssink) if enabled
+		// Feed packet to Kinesis ingestion (GStreamer -> kvssink) if enabled (first packet was already written in start(port, data)).
 		if (kinesisIngestionPipeline) {
-			kinesisIngestionPipeline.writePacket(port, data)
+			const skipFirst =
+				isFirstPacket && kinesisIngestionPipeline.isPortInRange(port)
+			if (!skipFirst) {
+				kinesisIngestionPipeline.writePacket(port, data)
+			}
 		}
 	},
 

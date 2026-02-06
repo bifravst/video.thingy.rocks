@@ -232,7 +232,9 @@ escaping the bang (e.g. in bash: `gst-launch-1.0 -e fdsrc fd=0 \! fakesink`).
      directory. Re-run the build or redeploy with a new instance if needed.
 
 ```bash
+# App uses fdsrc fd=0 (filesrc location=/dev/stdin fails when stdin is a pipe from Node spawn).
+# In an interactive shell, escape ! or run from a script to avoid history expansion.
 GST_PLUGIN_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build \
 LD_LIBRARY_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build \
-gst-launch-1.0 filesrc location=/dev/stdin ! tsparse set-timestamps=true ! tsdemux name=d d.video_0 ! queue ! h264parse ! capsfilter caps="video/x-h264,stream-format=avc,alignment=au" ! kvssink stream-name="video-streaming-video-5000" aws-region="eu-central-1" storage-size=128 log-config="/opt/video-streaming/kvs_log_configuration"
+gst-launch-1.0 fdsrc fd=0 ! tsparse set-timestamps=true ! tsdemux name=d d. ! queue ! h264parse ! capsfilter caps="video/x-h264,stream-format=avc,alignment=au" ! kvssink stream-name="video-streaming-video-5000" aws-region="eu-central-1" storage-size=128 log-config="/opt/video-streaming/kvs_log_configuration"
 ```

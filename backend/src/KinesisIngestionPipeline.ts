@@ -1,7 +1,10 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
+import * as fs from 'node:fs'
+import * as os from 'node:os'
+import * as path from 'node:path'
+import type { Writable } from 'node:stream'
 
 import { fromNodeProviderChain } from '@aws-sdk/credential-providers'
-import type { Writable } from 'node:stream'
 import { Logger } from './Logger.ts'
 
 export type KinesisIngestionPipelineConfig = {
@@ -29,8 +32,12 @@ type GstStderrThrottle = { lastLog: Record<string, number> }
 
 type PortPipeline = {
 	gst: ReturnType<typeof spawn>
+	/** Stream we write TS to (stdin pipe or FIFO). */
+	inputStream: Writable
 	reorder: ReorderState
 	gstStderrThrottle: GstStderrThrottle
+	/** FIFO path when using filesrc; unlink on stop. */
+	fifoPath?: string
 }
 
 /** Throttle repeated GStreamer stderr warnings (same category) per port. */
@@ -99,8 +106,9 @@ export class KinesisIngestionPipeline {
 	 * Starts the pipeline for a port: spawns GStreamer with kvssink.
 	 * Idempotent: no-op if already running for this port.
 	 * Concurrent calls for the same port are deduped (single credential fetch + spawn).
+	 * Optional initialData is written to stdin immediately after spawn so fdsrc has data when it first reads.
 	 */
-	async start(port: number): Promise<void> {
+	async start(port: number, initialData?: Buffer): Promise<void> {
 		if (!this.isPortInRange(port)) return
 		if (this.activePipelines.has(port)) return
 
@@ -110,7 +118,7 @@ export class KinesisIngestionPipeline {
 			return
 		}
 
-		const promise = this.runStartForPort(port).finally(() => {
+		const promise = this.runStartForPort(port, initialData).finally(() => {
 			this.pendingStarts.delete(port)
 		})
 		this.pendingStarts.set(port, promise)
@@ -119,8 +127,12 @@ export class KinesisIngestionPipeline {
 
 	/**
 	 * Single-run start logic for a port (credentials + spawn). Call only via start() so dedupe applies.
+	 * If initialData is provided, it is written to stdin immediately after spawn so fdsrc has data when it first reads.
 	 */
-	private async runStartForPort(port: number): Promise<void> {
+	private async runStartForPort(
+		port: number,
+		initialData?: Buffer,
+	): Promise<void> {
 		if (this.activePipelines.has(port)) return
 
 		const streamName = this.streamNameForPort(port)
@@ -180,12 +192,33 @@ export class KinesisIngestionPipeline {
 			env.LD_LIBRARY_PATH = env.KINESIS_LD_LIBRARY_PATH
 		}
 
-		console.log('env', env)
-
 		const logConfigPath =
 			process.env.KVS_LOG_CONFIG_PATH ??
 			'/opt/video-streaming/kvs_log_configuration'
-		const pipelineStr = `filesrc location=/dev/stdin ! tsparse set-timestamps=true ! tsdemux name=d d.video_0 ! queue ! h264parse ! capsfilter caps="video/x-h264,stream-format=avc,alignment=au" ! kvssink stream-name="${streamName.replace(/"/g, '\\"')}" aws-region="${region.replace(/"/g, '\\"')}" storage-size=128 log-config="${logConfigPath.replace(/"/g, '\\"')}"`
+
+		// Use a FIFO so GStreamer reads via filesrc (real path). filesrc blocks until we open for write, so data is ready when it reads; avoids fdsrc "not-linked" / stream error with pipes.
+		const fifoPath = path.join(
+			os.tmpdir(),
+			`kinesis-${port}-${process.pid}-${Date.now()}.fifo`,
+		)
+		const mkfifo = spawnSync('mkfifo', [fifoPath], { encoding: 'binary' })
+		if (
+			(mkfifo.error ?? (mkfifo.status !== 0 && mkfifo.status !== null)) !==
+			undefined
+		) {
+			this.logger.error(
+				'Failed to create FIFO for GStreamer',
+				mkfifo.error ??
+					new Error(
+						mkfifo.stderr?.toString() ?? `mkfifo exit ${mkfifo.status}`,
+					),
+				{ port, streamName, fifoPath },
+			)
+			return
+		}
+
+		// tsdemux creates pads like video_0_0c00 (template video_%01x_%05x), not "video_0". Use "d." to link to any pad so delayed linking succeeds regardless of PID.
+		const pipelineStr = `filesrc location="${fifoPath}" ! capsfilter caps="video/mpegts,systemstream=(boolean)true" ! queue ! tsparse set-timestamps=true ! tsdemux name=d d. ! queue ! h264parse ! capsfilter caps="video/x-h264,stream-format=avc,alignment=au" ! kvssink stream-name="${streamName}" aws-region="${region}" storage-size=128 log-config="${logConfigPath}"`
 		const shellCmd = `gst-launch-1.0 ${pipelineStr}`
 		this.logger.info('GStreamer command', {
 			port,
@@ -194,14 +227,29 @@ export class KinesisIngestionPipeline {
 			shellCmd,
 		})
 		const gst = spawn('sh', ['-c', shellCmd], {
-			stdio: ['pipe', 'ignore', 'pipe'],
+			stdio: ['ignore', 'pipe', 'pipe'],
 			env,
 		})
 
-		// Prevent EPIPE from crashing the process when GStreamer exits early (e.g. pipeline syntax error)
-		gst.stdin?.on('error', (err: NodeJS.ErrnoException) => {
+		// Open FIFO for writing (blocks until GStreamer filesrc opens for read); then write initial data so pipeline has data when it starts.
+		const inputStream = await new Promise<Writable>((resolve, reject) => {
+			fs.open(fifoPath, 'w', (err, fd) => {
+				if (err) {
+					reject(err)
+					return
+				}
+				const w = fs.createWriteStream('', { fd, autoClose: true })
+				const data = initialData ?? Buffer.alloc(0)
+				if (data.length > 0) {
+					w.write(data, (e) => (e ? reject(e) : resolve(w)))
+				} else {
+					resolve(w)
+				}
+			})
+		})
+		inputStream.on('error', (err: NodeJS.ErrnoException) => {
 			if (err.code !== 'EPIPE') {
-				this.logger.warn('GStreamer stdin error', {
+				this.logger.warn('GStreamer FIFO write error', {
 					port,
 					streamName,
 					code: err.code,
@@ -211,6 +259,16 @@ export class KinesisIngestionPipeline {
 		})
 
 		const gstStderrThrottle: GstStderrThrottle = { lastLog: {} }
+		gst.stdout?.on('data', (data: Buffer) => {
+			const text = data.toString().trim()
+			if (text.length > 0) {
+				this.logger.info('GStreamer stdout', {
+					port,
+					streamName,
+					message: text.slice(0, 1000),
+				})
+			}
+		})
 		gst.stderr?.on('data', (data: Buffer) => {
 			this.logGstStderr(port, streamName, data.toString(), gstStderrThrottle)
 		})
@@ -237,8 +295,10 @@ export class KinesisIngestionPipeline {
 		}
 		this.activePipelines.set(port, {
 			gst,
+			inputStream,
 			reorder,
 			gstStderrThrottle,
+			fifoPath,
 		})
 		this.logger.info('Kinesis ingestion started', {
 			port,
@@ -280,13 +340,13 @@ export class KinesisIngestionPipeline {
 	 */
 	writePacket(port: number, data: Buffer): void {
 		const pipeline = this.activePipelines.get(port)
-		const stdin = pipeline?.gst.stdin
-		if (stdin === undefined || stdin === null || stdin.writable !== true) return
+		const inputStream = pipeline?.inputStream
+		if (inputStream?.writable !== true) return
 
 		const maxBuf = this.config.reorderBufferSize ?? DEFAULT_REORDER_BUFFER_SIZE
 		if (maxBuf <= 0) {
-			const ok = stdin.write(data)
-			if (!ok) stdin.once('drain', () => {})
+			const ok = inputStream.write(data)
+			if (!ok) inputStream.once('drain', () => {})
 			return
 		}
 
@@ -294,7 +354,7 @@ export class KinesisIngestionPipeline {
 		const { reorder } = pipeline
 		reorder.nextSeq += 1
 		reorder.buffer.set(reorder.nextSeq, data)
-		this.drain(port, stdin)
+		this.drain(port, inputStream)
 	}
 
 	/**
@@ -305,18 +365,27 @@ export class KinesisIngestionPipeline {
 		if (!pipeline) return
 
 		this.activePipelines.delete(port)
-		const { gst, reorder } = pipeline
+		const { gst, inputStream, reorder, fifoPath } = pipeline
 
-		const stdin = gst.stdin
-
-		if (stdin !== undefined && stdin !== null && stdin.writable === true) {
+		if (inputStream.writable) {
 			while (reorder.buffer.has(reorder.nextToEmit)) {
 				const buf = reorder.buffer.get(reorder.nextToEmit)
 				reorder.buffer.delete(reorder.nextToEmit)
 				reorder.nextToEmit += 1
-				if (buf !== undefined) stdin.write(buf)
+				if (buf !== undefined) inputStream.write(buf)
 			}
-			stdin.end()
+			inputStream.end()
+		}
+		if (fifoPath !== undefined) {
+			try {
+				fs.unlinkSync(fifoPath)
+			} catch (e) {
+				this.logger.warn('Failed to unlink FIFO', {
+					port,
+					fifoPath,
+					message: e instanceof Error ? e.message : String(e),
+				})
+			}
 		}
 
 		try {
