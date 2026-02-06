@@ -1,7 +1,31 @@
+import { fromNodeProviderChain } from '@aws-sdk/credential-providers'
 import { KinesisIngestionPipeline } from './KinesisIngestionPipeline.ts'
 import { StreamMetadataService } from './StreamMetadataService.ts'
 import { StreamStateManager } from './StreamStateManager.ts'
 import { UDPListener, type PacketHandler } from './UDPListener.ts'
+
+const ensureAwsCredentials = async (): Promise<void> => {
+	const credentialProvider = fromNodeProviderChain({
+		timeout: 10_000,
+		maxRetries: 2,
+	})
+	try {
+		await credentialProvider()
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err)
+		console.error(
+			'[Main] AWS credentials could not be loaded. The service needs credentials for DynamoDB (and for Kinesis if enabled).',
+		)
+		console.error(
+			'[Main] Locally: set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_REGION (or use AWS_PROFILE).',
+		)
+		console.error(
+			'[Main] On EC2: ensure the instance has an IAM role and IMDS is not disabled (AWS_EC2_METADATA_DISABLED must be unset or false).',
+		)
+		console.error('[Main] Error:', msg)
+		throw err
+	}
+}
 
 /**
  * Main entry point for the UDP video ingestion service.
@@ -192,6 +216,7 @@ const start = async (): Promise<void> => {
 	}
 
 	try {
+		await ensureAwsCredentials()
 		await udpListener.start()
 		console.log('[Main] Service started successfully')
 	} catch (error) {

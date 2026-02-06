@@ -44,6 +44,8 @@ export class KinesisIngestionPipeline {
 	private readonly config: KinesisIngestionPipelineConfig
 	private readonly logger: Logger
 	private readonly activePipelines: Map<number, PortPipeline> = new Map()
+	/** Dedupe concurrent start(port) so only one credential fetch + spawn runs per port. */
+	private readonly pendingStarts: Map<number, Promise<void>> = new Map()
 
 	constructor(config: KinesisIngestionPipelineConfig) {
 		this.config = config
@@ -96,45 +98,36 @@ export class KinesisIngestionPipeline {
 	/**
 	 * Starts the pipeline for a port: spawns GStreamer with kvssink.
 	 * Idempotent: no-op if already running for this port.
+	 * Concurrent calls for the same port are deduped (single credential fetch + spawn).
 	 */
 	async start(port: number): Promise<void> {
 		if (!this.isPortInRange(port)) return
 		if (this.activePipelines.has(port)) return
 
+		const existing = this.pendingStarts.get(port)
+		if (existing !== undefined) {
+			await existing
+			return
+		}
+
+		const promise = this.runStartForPort(port).finally(() => {
+			this.pendingStarts.delete(port)
+		})
+		this.pendingStarts.set(port, promise)
+		await promise
+	}
+
+	/**
+	 * Single-run start logic for a port (credentials + spawn). Call only via start() so dedupe applies.
+	 */
+	private async runStartForPort(port: number): Promise<void> {
+		if (this.activePipelines.has(port)) return
+
 		const streamName = this.streamNameForPort(port)
 		const region = this.config.region
 
-		// TS from stdin -> tsdemux -> H.264 -> kvssink (sends to Kinesis)
-		// Use filesrc location=/dev/stdin instead of fdsrc fd=0 (same effect on Linux; some gst-launch parsers fail on fdsrc fd=0)
-		// Quote kvssink values so hyphens in stream name are not parsed as minus by the grammar.
-		// log-config: KVS C++ SDK requires a log4cplus config file; default "../kvs_log_configuration" fails when CWD is app dir. Use absolute path (EC2 user-data creates it) or env override for local.
-		const logConfigPath =
-			process.env.KVS_LOG_CONFIG_PATH ??
-			'/opt/video-streaming/kvs_log_configuration'
-		const pipelineStr = `filesrc location=/dev/stdin ! tsparse set-timestamps=true ! tsdemux name=d d.video_0 ! queue ! h264parse ! capsfilter caps="video/x-h264,stream-format=avc,alignment=au" ! kvssink stream-name="${streamName.replace(/"/g, '\\"')}" aws-region="${region.replace(/"/g, '\\"')}" storage-size=128 log-config="${logConfigPath.replace(/"/g, '\\"')}"`
-
-		// Run via sh so we can pass pipeline from file: "$(cat "$PIPELINE_FILE")" gives gst-launch one exact argument with no Node->argv encoding
-		const shellCmd = `gst-launch-1.0 ${pipelineStr}`
-		this.logger.info('GStreamer command', {
-			port,
-			streamName,
-			pipelineStr,
-			shellCmd,
-		})
-		// Ensure GStreamer child gets plugin/lib path; systemd sets these for the process, but when
-		// run by hand KINESIS_* can be set and we pass them through so kvssink and its .so deps are found.
-		const env = { ...process.env }
-		if (env.KINESIS_GST_PLUGIN_PATH !== undefined) {
-			env.GST_PLUGIN_PATH = env.KINESIS_GST_PLUGIN_PATH
-		}
-		if (env.KINESIS_LD_LIBRARY_PATH !== undefined) {
-			env.LD_LIBRARY_PATH = env.KINESIS_LD_LIBRARY_PATH
-		}
-		// kvssink (C++ SDK) does not use the same credential chain as Node; it often fails to find
-		// credentials (e.g. "Could not find any AWS credentials!"). Resolve credentials in Node
-		// (env, IMDS on EC2, etc.) and pass them to the child so the C++ plugin finds them.
-		// Use a longer IMDS timeout and retries (default is 1s and 0), and retry resolution a few
-		// times so we tolerate IMDS not being ready at process start (e.g. right after boot).
+		// Resolve credentials before any GStreamer setup or spawn. kvssink (C++ SDK) does not use
+		// the same credential chain as Node; we pass them via env so the child finds them.
 		const credentialProvider = fromNodeProviderChain({
 			timeout: 10_000,
 			maxRetries: 5,
@@ -160,15 +153,6 @@ export class KinesisIngestionPipeline {
 					await new Promise((r) => setTimeout(r, resolutionDelayMs))
 				}
 			}
-			env.AWS_ACCESS_KEY_ID = credentials!.accessKeyId
-			env.AWS_SECRET_ACCESS_KEY = credentials!.secretAccessKey
-			if (
-				credentials!.sessionToken !== undefined &&
-				credentials!.sessionToken !== ''
-			) {
-				env.AWS_SESSION_TOKEN = credentials!.sessionToken
-			}
-			env.AWS_REGION = region
 		} catch (err) {
 			this.logger.error(
 				'Failed to resolve AWS credentials for kvssink',
@@ -177,6 +161,38 @@ export class KinesisIngestionPipeline {
 			)
 			return
 		}
+
+		// Build env with credentials and plugin paths; only then build pipeline and spawn.
+		const env = { ...process.env }
+		env.AWS_ACCESS_KEY_ID = credentials!.accessKeyId
+		env.AWS_SECRET_ACCESS_KEY = credentials!.secretAccessKey
+		if (
+			credentials!.sessionToken !== undefined &&
+			credentials!.sessionToken !== ''
+		) {
+			env.AWS_SESSION_TOKEN = credentials!.sessionToken
+		}
+		env.AWS_REGION = region
+		if (env.KINESIS_GST_PLUGIN_PATH !== undefined) {
+			env.GST_PLUGIN_PATH = env.KINESIS_GST_PLUGIN_PATH
+		}
+		if (env.KINESIS_LD_LIBRARY_PATH !== undefined) {
+			env.LD_LIBRARY_PATH = env.KINESIS_LD_LIBRARY_PATH
+		}
+
+		console.log('env', env)
+
+		const logConfigPath =
+			process.env.KVS_LOG_CONFIG_PATH ??
+			'/opt/video-streaming/kvs_log_configuration'
+		const pipelineStr = `filesrc location=/dev/stdin ! tsparse set-timestamps=true ! tsdemux name=d d.video_0 ! queue ! h264parse ! capsfilter caps="video/x-h264,stream-format=avc,alignment=au" ! kvssink stream-name="${streamName.replace(/"/g, '\\"')}" aws-region="${region.replace(/"/g, '\\"')}" storage-size=128 log-config="${logConfigPath.replace(/"/g, '\\"')}"`
+		const shellCmd = `gst-launch-1.0 ${pipelineStr}`
+		this.logger.info('GStreamer command', {
+			port,
+			streamName,
+			pipelineStr,
+			shellCmd,
+		})
 		const gst = spawn('sh', ['-c', shellCmd], {
 			stdio: ['pipe', 'ignore', 'pipe'],
 			env,
