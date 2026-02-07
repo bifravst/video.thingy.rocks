@@ -15,6 +15,7 @@
     "prepare": "husky && check-node-version --package",
     "cdk:bootstrap": "node --experimental-transform-types --no-warnings ./cdk/bootstrap.ts",
     "cdk:prod:deploy": "node --experimental-transform-types --no-warnings ./cdk/deploy-to-production.ts",
+    "cdk:prod:destroy": "node --experimental-transform-types --no-warnings ./cdk/deploy-to-production.ts --destroy",
     "cdk:prod:diff": "node --experimental-transform-types --no-warnings ./cdk/deploy-to-production.ts --diff"
   },
   "repository": {

@@ -12,6 +12,7 @@ import * as cloudwatch_actions from 'aws-cdk-lib/aws-cloudwatch-actions'
 import * as cognito from 'aws-cdk-lib/aws-cognito'
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb'
 import * as ec2 from 'aws-cdk-lib/aws-ec2'
+import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2'
 import * as iam from 'aws-cdk-lib/aws-iam'
 import * as kinesisvideo from 'aws-cdk-lib/aws-kinesisvideo'
 import * as logs from 'aws-cdk-lib/aws-logs'
@@ -36,6 +37,7 @@ export class StreamingStack extends Stack {
 	public readonly autoScalingGroup: autoscaling.AutoScalingGroup
 	public readonly codeBucket: s3.Bucket
 	public readonly kinesisVideoStreams: kinesisvideo.CfnStream[] = []
+	public readonly networkLoadBalancer: elbv2.NetworkLoadBalancer
 
 	constructor(
 		scope: Construct,
@@ -422,6 +424,98 @@ export class StreamingStack extends Stack {
 		cfnAsg.healthCheckType = 'EC2'
 		cfnAsg.healthCheckGracePeriod = Duration.minutes(5).toSeconds()
 
+		// Allocate Elastic IP for fixed IPv4 address
+		const publicSubnets = this.vpc.selectSubnets({
+			subnetType: ec2.SubnetType.PUBLIC,
+		}).subnets
+
+		if (publicSubnets.length === 0) {
+			throw new Error('No public subnets available for NLB deployment')
+		}
+
+		const eip = new ec2.CfnEIP(this, 'NLB-EIP', {
+			domain: 'vpc',
+		})
+
+		// Create Network Load Balancer with fixed IPv4 address
+		// Note: We don't specify vpcSubnets here because we use subnetMappings below
+		// Note: Using IPv4 only because UDP with instance targets doesn't support dual-stack
+		this.networkLoadBalancer = new elbv2.NetworkLoadBalancer(
+			this,
+			'VideoStreamingNLB',
+			{
+				vpc: this.vpc,
+				internetFacing: true,
+				ipAddressType: elbv2.IpAddressType.IPV4,
+				crossZoneEnabled: false,
+			},
+		)
+
+		// Associate EIP with NLB through subnet mapping
+		// This replaces the default subnet selection with our custom mapping
+		// IPv6 address will be automatically assigned from the subnet's IPv6 CIDR
+		const cfnNlb = this.networkLoadBalancer.node
+			.defaultChild as elbv2.CfnLoadBalancer
+		cfnNlb.subnets = undefined // Clear the default subnets property
+		cfnNlb.subnetMappings = [
+			{
+				subnetId: publicSubnets[0]!.subnetId,
+				allocationId: eip.attrAllocationId,
+				// IPv6 address is automatically assigned by AWS from the subnet's IPv6 CIDR block
+			},
+		]
+
+		// Create target groups for UDP ports 5000-5009
+		const targetGroups: elbv2.NetworkTargetGroup[] = []
+		for (let port = 5000; port <= 5009; port++) {
+			const targetGroup = new elbv2.NetworkTargetGroup(
+				this,
+				`TargetGroup${port}`,
+				{
+					vpc: this.vpc,
+					port,
+					protocol: elbv2.Protocol.UDP,
+					targetType: elbv2.TargetType.INSTANCE,
+					healthCheck: {
+						protocol: elbv2.Protocol.TCP,
+						port: port.toString(),
+						healthyThresholdCount: 2,
+						unhealthyThresholdCount: 2,
+						interval: Duration.seconds(10),
+						timeout: Duration.seconds(10),
+					},
+					deregistrationDelay: Duration.seconds(30),
+					preserveClientIp: true,
+				},
+			)
+
+			// Enable stickiness for single active instance pattern
+			targetGroup.setAttribute('stickiness.enabled', 'true')
+			targetGroup.setAttribute('stickiness.type', 'source_ip')
+
+			targetGroups.push(targetGroup)
+		}
+
+		// Create UDP listeners for ports 5000-5009
+		for (let i = 0; i < targetGroups.length; i++) {
+			const port = 5000 + i
+			const targetGroup = targetGroups[i]
+			if (!targetGroup) {
+				throw new Error(`Target group for port ${port} is undefined`)
+			}
+			this.networkLoadBalancer.addListener(`UDPListener${port}`, {
+				port,
+				protocol: elbv2.Protocol.UDP,
+				defaultAction: elbv2.NetworkListenerAction.forward([targetGroup]),
+			})
+		}
+
+		// Attach all target groups to the Auto Scaling Group
+		// This enables automatic registration/deregistration of instances
+		for (const targetGroup of targetGroups) {
+			this.autoScalingGroup.attachToNetworkTargetGroup(targetGroup)
+		}
+
 		// Create SNS topic for alarm notifications
 		const alarmTopic = new sns.Topic(this, 'AlarmTopic', {
 			displayName: 'Video Streaming Alarms',
@@ -528,6 +622,17 @@ export class StreamingStack extends Stack {
 		new CfnOutput(this, 'LogGroups', {
 			value: `${this.stackName}/*`,
 			description: 'CloudWatch Logs log groups for EC2 instances',
+		})
+
+		// NLB Outputs
+		new CfnOutput(this, 'NLBDnsName', {
+			value: this.networkLoadBalancer.loadBalancerDnsName,
+			description: `Network Load Balancer DNS name for UDP video streaming (ports 5000-5009) - deployed in AZ: ${publicSubnets[0]!.availabilityZone}`,
+		})
+
+		new CfnOutput(this, 'NLBIPv4Address', {
+			value: eip.ref,
+			description: `NLB fixed IPv4 address (Elastic IP) in AZ: ${publicSubnets[0]!.availabilityZone}`,
 		})
 	}
 }
