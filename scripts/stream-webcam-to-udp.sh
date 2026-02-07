@@ -1,22 +1,21 @@
 #!/bin/bash
 # Stream webcam video to UDP endpoint
-# Usage: ./scripts/stream-webcam-to-udp.sh <instance-ip> <port>
+# Usage: ./scripts/stream-webcam-to-udp.sh <port>
 
 set -e
 
 # Check arguments
-if [ $# -lt 2 ]; then
-  echo "Usage: $0 <instance-ip> <port>"
+if [ $# -lt 1 ]; then
+  echo "Usage: $0 <port>"
   echo ""
-  echo "Example: $0 3.123.45.67 5000"
+  echo "Example: $0 5000"
   echo ""
   echo "Available ports: 5000-5009"
   exit 1
 fi
 
-INSTANCE_IP=$1
-PORT=$2
-
+PORT=$1
+TARGET=video.thingy.rocks
 # Validate port range
 if [ "$PORT" -lt 5000 ] || [ "$PORT" -gt 5009 ]; then
   echo "Error: Port must be between 5000 and 5009"
@@ -50,7 +49,7 @@ fi
 
 echo ""
 echo "Streaming Configuration:"
-echo "  Target: $INSTANCE_IP:$PORT"
+echo "  Target: $TARGET:$PORT"
 echo "  Video: 1280x720 @ 30fps"
 echo "  Codec: H.264"
 echo "  Format: MPEG-TS over UDP"
@@ -73,4 +72,4 @@ ffmpeg \
   -pix_fmt yuv420p \
   -g 60 \
   -f mpegts \
-  "udp://${INSTANCE_IP}:${PORT}?pkt_size=1316"
+  "udp://${TARGET}:${PORT}?pkt_size=1316"
