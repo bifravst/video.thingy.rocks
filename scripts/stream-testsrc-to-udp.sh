@@ -44,6 +44,7 @@ echo ""
 # Using H.264 encoding with MPEG-TS container
 ffmpeg \
   -f lavfi -i testsrc=size=1280x720:rate=30 \
+  -vf "drawtext='text=%{localtime\:%X.%N}:fontsize=32:fontcolor=white'" \
   -c:v libx264 \
   -preset ultrafast \
   -tune zerolatency \

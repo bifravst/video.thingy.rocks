@@ -231,6 +231,23 @@ escaping the bang (e.g. in bash: `gst-launch-1.0 -e fdsrc fd=0 \! fakesink`).
      `libgstkvssink.so` and the other built libraries exist in the build
      directory. Re-run the build or redeploy with a new instance if needed.
 
+  5. **CONTINUITY: Mismatch** – tsdemux reports gaps in the MPEG-TS continuity
+     counter when packets are lost or reordered on UDP. Reduce loss (better
+     network, lower bitrate) or accept occasional warnings; the backend's
+     reorder buffer can skip missing packets to avoid stalls, which may cause
+     these warnings.
+
+  6. **status 0x30000005 / "Could not write to resource"** – Kinesis Video
+     rejects frames with overlapping or out-of-order timestamps. Often caused by
+     the same loss/jitter that triggers CONTINUITY warnings. Improve network
+     conditions or use a source with more stable timing; the pipeline may still
+     upload after an initial burst of errors.
+
+  7. **"Failed to submit ACK" / status 0x52000047** – The producer failed to
+     submit a fragment ACK (RECEIVED/PERSISTED) to the service. Can be transient
+     (network, service latency) or due to timestamp/stream state. Ingestion may
+     continue; if persistent, check network and AWS service health.
+
 ```bash
 # App uses fdsrc fd=0 (filesrc location=/dev/stdin fails when stdin is a pipe from Node spawn).
 # In an interactive shell, escape ! or run from a script to avoid history expansion.

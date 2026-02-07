@@ -17,6 +17,10 @@ export type KinesisIngestionPipelineConfig = {
 	 * Default 128. Helps smooth bursts and applies backpressure.
 	 */
 	reorderBufferSize?: number
+	/**
+	 * When true, log GStreamer/KVS stdout and stderr. Disabled by default to avoid noisy logs.
+	 */
+	logGstreamerOutput?: boolean
 }
 
 const DEFAULT_REORDER_BUFFER_SIZE = 128
@@ -30,18 +34,24 @@ type ReorderState = {
 /** Per-port throttle for GStreamer stderr warning categories. */
 type GstStderrThrottle = { lastLog: Record<string, number> }
 
+/** Per-port throttle for noisy GStreamer/KVS stdout lines (CONTINUITY, 0x30000005, etc.). */
+type GstStdoutThrottle = { lastLog: Record<string, number> }
+
 type PortPipeline = {
 	gst: ReturnType<typeof spawn>
 	/** Stream we write TS to (stdin pipe or FIFO). */
 	inputStream: Writable
 	reorder: ReorderState
 	gstStderrThrottle: GstStderrThrottle
+	gstStdoutThrottle: GstStdoutThrottle
 	/** FIFO path when using filesrc; unlink on stop. */
 	fifoPath?: string
 }
 
 /** Throttle repeated GStreamer stderr warnings (same category) per port. */
 const GST_STDERR_THROTTLE_MS = 60_000
+/** Throttle noisy stdout (CONTINUITY, KVS 0x30000005, "Could not write to resource") per port. */
+const GST_STDOUT_THROTTLE_MS = 60_000
 
 /**
  * Per-port pipeline: UDP packets -> GStreamer (TS -> H.264) -> kvssink -> Kinesis Video.
@@ -78,6 +88,7 @@ export class KinesisIngestionPipeline {
 		text: string,
 		throttle: GstStderrThrottle,
 	): void {
+		if (this.config.logGstreamerOutput !== true) return
 		const now = Date.now()
 		const lines = text.split(/\r?\n/)
 		for (const raw of lines) {
@@ -98,6 +109,51 @@ export class KinesisIngestionPipeline {
 				port,
 				streamName,
 				message: line.slice(0, 500),
+			})
+		}
+	}
+
+	/**
+	 * Logs GStreamer stdout; throttles noisy lines (CONTINUITY, KVS 0x30000005, "Could not write to resource").
+	 */
+	private logGstStdout(
+		port: number,
+		streamName: string,
+		text: string,
+		throttle: GstStdoutThrottle,
+	): void {
+		if (this.config.logGstreamerOutput !== true) return
+		const now = Date.now()
+		const lines = text.split(/\r?\n/)
+		for (const raw of lines) {
+			const line = raw.trim()
+			if (line.length === 0) continue
+			if (/streamLatencyPressure/i.test(line)) continue
+			if (/droppedFrame callback/i.test(line)) continue
+			if (/viewItemRemoved.*Reporting a dropped frame\/fragment/i.test(line))
+				continue
+			if (/Failed to submit ACK|0x52000047|status code: 0x52/i.test(line))
+				continue
+
+			let category: string | null = null
+			if (/CONTINUITY:\s*Mismatch/i.test(line)) category = 'continuity'
+			else if (
+				/0x30000005|putKinesisVideoFrame.*Failed|Put frame.*failed/i.test(line)
+			)
+				category = 'kvs_putframe'
+			else if (/Could not write to resource/i.test(line))
+				category = 'write_resource'
+
+			if (category !== null) {
+				const last = throttle.lastLog[category] ?? 0
+				if (now - last < GST_STDOUT_THROTTLE_MS) continue
+				throttle.lastLog[category] = now
+			}
+
+			this.logger.info('GStreamer stdout', {
+				port,
+				streamName,
+				message: line.slice(0, 1000),
 			})
 		}
 	}
@@ -201,18 +257,27 @@ export class KinesisIngestionPipeline {
 			os.tmpdir(),
 			`kinesis-${port}-${process.pid}-${Date.now()}.fifo`,
 		)
-		const mkfifo = spawnSync('mkfifo', [fifoPath], { encoding: 'binary' })
-		if (
-			(mkfifo.error ?? (mkfifo.status !== 0 && mkfifo.status !== null)) !==
-			undefined
-		) {
+		const mkfifo = spawnSync('mkfifo', [fifoPath], {
+			encoding: 'utf8',
+			timeout: 5000,
+		})
+		const failed =
+			mkfifo.error != null || (mkfifo.status != null && mkfifo.status !== 0)
+		if (failed) {
+			const stderrStr = mkfifo.stderr != null ? String(mkfifo.stderr) : ''
+			const msg =
+				mkfifo.error?.message ??
+				(stderrStr.trim() || `mkfifo exit code ${mkfifo.status ?? 'unknown'}`)
 			this.logger.error(
 				'Failed to create FIFO for GStreamer',
-				mkfifo.error ??
-					new Error(
-						mkfifo.stderr?.toString() ?? `mkfifo exit ${mkfifo.status}`,
-					),
-				{ port, streamName, fifoPath },
+				mkfifo.error ?? new Error(msg),
+				{
+					port,
+					streamName,
+					fifoPath,
+					exitCode: mkfifo.status ?? undefined,
+					stderr: stderrStr.slice(0, 500) || undefined,
+				},
 			)
 			return
 		}
@@ -259,14 +324,11 @@ export class KinesisIngestionPipeline {
 		})
 
 		const gstStderrThrottle: GstStderrThrottle = { lastLog: {} }
+		const gstStdoutThrottle: GstStdoutThrottle = { lastLog: {} }
 		gst.stdout?.on('data', (data: Buffer) => {
-			const text = data.toString().trim()
-			if (text.length > 0) {
-				this.logger.info('GStreamer stdout', {
-					port,
-					streamName,
-					message: text.slice(0, 1000),
-				})
+			const text = data.toString()
+			if (text.trim().length > 0) {
+				this.logGstStdout(port, streamName, text, gstStdoutThrottle)
 			}
 		})
 		gst.stderr?.on('data', (data: Buffer) => {
@@ -298,6 +360,7 @@ export class KinesisIngestionPipeline {
 			inputStream,
 			reorder,
 			gstStderrThrottle,
+			gstStdoutThrottle,
 			fifoPath,
 		})
 		this.logger.info('Kinesis ingestion started', {

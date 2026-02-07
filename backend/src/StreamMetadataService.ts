@@ -26,7 +26,7 @@ export class StreamMetadataService {
 	private readonly docClient: DynamoDBDocumentClient
 	private readonly tableName: string
 	private readonly lastUpdateTimes: Map<number, number> = new Map()
-	private readonly updateThrottleMs = 1_000 // 1 seconds
+	private readonly updateThrottleMs = 15_000 // 15 seconds
 
 	constructor(config: StreamMetadataServiceConfig) {
 		const client = new DynamoDBClient({
@@ -108,10 +108,6 @@ export class StreamMetadataService {
 						':updatedAt': isoNow,
 					},
 				}),
-			)
-
-			console.log(
-				`[StreamMetadataService] Updated last packet time for port ${port}`,
 			)
 		} catch (error) {
 			console.error(

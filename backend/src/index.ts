@@ -51,6 +51,9 @@ const config = {
 	segmentDuration: 6, // 6 seconds for HLS segments
 	kinesisStreamPrefix: process.env.KINESIS_STREAM_PREFIX ?? '',
 	kinesisIngestionEnabled: Boolean(process.env.KINESIS_STREAM_PREFIX),
+	kinesisLogGstreamerOutput:
+		process.env.KINESIS_INGESTION_LOG_GSTREAMER === 'true' ||
+		process.env.KINESIS_INGESTION_LOG_GSTREAMER === '1',
 }
 
 const streamStateManager = new StreamStateManager({
@@ -67,6 +70,7 @@ const kinesisIngestionPipeline = config.kinesisIngestionEnabled
 			streamNamePrefix: config.kinesisStreamPrefix,
 			region: config.awsRegion,
 			portRange: config.portRange,
+			logGstreamerOutput: config.kinesisLogGstreamerOutput,
 		})
 	: null
 
