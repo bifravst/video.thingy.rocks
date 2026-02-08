@@ -107,7 +107,7 @@ export class StreamingStack extends Stack {
 				`KinesisVideoStream${port}`,
 				{
 					name: `${kinesisStreamPrefix}-${port}`,
-					dataRetentionInHours: 1,
+					dataRetentionInHours: Duration.days(30).toHours(),
 					mediaType: 'video/h264',
 				},
 			)
