@@ -49,6 +49,8 @@
     "typescript": "5.9.3"
   },
   "dependencies": {
+    "@aws-sdk/client-kinesis-video": "3.987.0",
+    "aws4": "1.13.2",
     "constructs": "10.4.5"
   },
   "engines": {
