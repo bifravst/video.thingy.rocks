@@ -6,7 +6,7 @@ set -e
 
 # Check arguments
 if [ $# -lt 1 ]; then
-  echo "Usage: $0 <port>"
+  echo "Usage: $0 <port> [<device> (optional)]"
   echo ""
   echo "Example: $0 5000"
   echo ""
@@ -15,6 +15,7 @@ if [ $# -lt 1 ]; then
 fi
 
 PORT=$1
+VIDEO_DEVICE=${2:-/dev/video0}
 TARGET=video.thingy.rocks
 # Validate port range
 if [ "$PORT" -lt 5000 ] || [ "$PORT" -gt 5009 ]; then
@@ -30,7 +31,6 @@ if ! command -v ffmpeg &> /dev/null; then
 fi
 
 # Detect video device
-VIDEO_DEVICE="/dev/video0"
 if [ "$(uname)" = "Darwin" ]; then
   # macOS uses AVFoundation
   VIDEO_INPUT="-f avfoundation -i 0"
