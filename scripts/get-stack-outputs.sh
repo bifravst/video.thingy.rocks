@@ -27,8 +27,5 @@ echo "$OUTPUTS" | jq -r '.[] | "\(.OutputKey): \(.OutputValue)"'
 echo ""
 echo "Environment Variables for .envrc:"
 echo "=================================="
-echo "export COGNITO_USER_POOL_URL=\"$(echo "$OUTPUTS" | jq -r '.[] | select(.OutputKey=="UserPoolURL") | .OutputValue')\""
-echo "export COGNITO_USER_POOL_CLIENT_ID=\"$(echo "$OUTPUTS" | jq -r '.[] | select(.OutputKey=="UserPoolClientId") | .OutputValue')\""
-echo "export COGNITO_IDENTITY_POOL_ID=\"$(echo "$OUTPUTS" | jq -r '.[] | select(.OutputKey=="IdentityPoolId") | .OutputValue')\""
 echo "export TABLE_NAME=\"$(echo "$OUTPUTS" | jq -r '.[] | select(.OutputKey=="DynamoDBTableName") | .OutputValue')\""
 echo "

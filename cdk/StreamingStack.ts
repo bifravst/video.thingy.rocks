@@ -9,7 +9,6 @@ import {
 import * as autoscaling from 'aws-cdk-lib/aws-autoscaling'
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch'
 import * as cloudwatch_actions from 'aws-cdk-lib/aws-cloudwatch-actions'
-import * as cognito from 'aws-cdk-lib/aws-cognito'
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb'
 import * as ec2 from 'aws-cdk-lib/aws-ec2'
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2'
@@ -27,11 +26,6 @@ import { fileURLToPath } from 'node:url'
 export class StreamingStack extends Stack {
 	public readonly vpc: ec2.Vpc
 	public readonly streamTable: dynamodb.Table
-	public readonly userPool: cognito.UserPool
-	public readonly userPoolClient: cognito.UserPoolClient
-	public readonly identityPool: cognito.CfnIdentityPool
-	public readonly unauthRole: iam.Role
-	public readonly authRole: iam.Role
 	public readonly udpSecurityGroup: ec2.SecurityGroup
 	public readonly ec2Role: iam.Role
 	public readonly autoScalingGroup: autoscaling.AutoScalingGroup
@@ -113,157 +107,6 @@ export class StreamingStack extends Stack {
 			)
 			this.kinesisVideoStreams.push(stream)
 		}
-
-		// Create Cognito User Pool for authenticated access
-		this.userPool = new cognito.UserPool(this, 'UserPool', {
-			userPoolName: `${this.stackName}-users`,
-			selfSignUpEnabled: true,
-			signInAliases: {
-				email: true,
-			},
-			autoVerify: {
-				email: true,
-			},
-			standardAttributes: {
-				email: {
-					required: true,
-					mutable: true,
-				},
-			},
-			passwordPolicy: {
-				minLength: 8,
-				requireLowercase: true,
-				requireUppercase: true,
-				requireDigits: true,
-				requireSymbols: false,
-			},
-			accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
-			removalPolicy: RemovalPolicy.DESTROY,
-			// Email configuration - use Cognito default for now
-			// To use custom SES: configure email property with SES settings
-			email: cognito.UserPoolEmail.withCognito('noreply@verificationemail.com'),
-			// Verification messages
-			userVerification: {
-				emailSubject: 'Verify your email for Video Streaming',
-				emailBody: 'Thank you for signing up! Your verification code is {####}',
-				emailStyle: cognito.VerificationEmailStyle.CODE,
-			},
-		})
-
-		// Create User Pool Client for frontend
-		this.userPoolClient = this.userPool.addClient('WebClient', {
-			userPoolClientName: `${this.stackName}-web-client`,
-			authFlows: {
-				userPassword: true,
-				userSrp: true,
-			},
-			oAuth: {
-				flows: {
-					authorizationCodeGrant: true,
-					implicitCodeGrant: true,
-				},
-				scopes: [
-					cognito.OAuthScope.EMAIL,
-					cognito.OAuthScope.OPENID,
-					cognito.OAuthScope.PROFILE,
-				],
-				callbackUrls: [
-					'http://localhost:8080/auth/callback',
-					'https://video.thingy.rocks/auth/callback',
-				],
-				logoutUrls: ['http://localhost:8080/', 'https://video.thingy.rocks/'],
-			},
-			preventUserExistenceErrors: true,
-		})
-
-		// Add domain for hosted UI
-		this.userPool.addDomain('UserPoolDomain', {
-			cognitoDomain: {
-				domainPrefix: `${this.stackName}-${this.account}`.toLowerCase(),
-			},
-		})
-
-		this.identityPool = new cognito.CfnIdentityPool(
-			this,
-			'StreamViewerIdentityPool',
-			{
-				allowUnauthenticatedIdentities: true,
-				identityPoolName: `${this.stackName}-viewers`,
-				cognitoIdentityProviders: [
-					{
-						clientId: this.userPoolClient.userPoolClientId,
-						providerName: this.userPool.userPoolProviderName,
-					},
-				],
-			},
-		)
-
-		// Create IAM role for unauthenticated users with read-only DynamoDB access
-		this.unauthRole = new iam.Role(this, 'UnauthRole', {
-			assumedBy: new iam.FederatedPrincipal(
-				'cognito-identity.amazonaws.com',
-				{
-					StringEquals: {
-						'cognito-identity.amazonaws.com:aud': this.identityPool.ref,
-					},
-					'ForAnyValue:StringLike': {
-						'cognito-identity.amazonaws.com:amr': 'unauthenticated',
-					},
-				},
-				'sts:AssumeRoleWithWebIdentity',
-			),
-		})
-
-		// Grant read-only access to StreamMetadata table
-		this.streamTable.grantReadData(this.unauthRole)
-		// Also grant Scan permission for listing all streams
-		this.unauthRole.addToPolicy(
-			new iam.PolicyStatement({
-				effect: iam.Effect.ALLOW,
-				actions: ['dynamodb:Scan'],
-				resources: [this.streamTable.tableArn],
-			}),
-		)
-
-		// Create IAM role for authenticated users with read-only DynamoDB access
-		this.authRole = new iam.Role(this, 'AuthRole', {
-			assumedBy: new iam.FederatedPrincipal(
-				'cognito-identity.amazonaws.com',
-				{
-					StringEquals: {
-						'cognito-identity.amazonaws.com:aud': this.identityPool.ref,
-					},
-					'ForAnyValue:StringLike': {
-						'cognito-identity.amazonaws.com:amr': 'authenticated',
-					},
-				},
-				'sts:AssumeRoleWithWebIdentity',
-			),
-		})
-
-		// Grant read-only access to StreamMetadata table for authenticated users
-		this.streamTable.grantReadData(this.authRole)
-		// Also grant Scan permission for listing all streams
-		this.authRole.addToPolicy(
-			new iam.PolicyStatement({
-				effect: iam.Effect.ALLOW,
-				actions: ['dynamodb:Scan'],
-				resources: [this.streamTable.tableArn],
-			}),
-		)
-
-		// Attach the roles to the identity pool
-		new cognito.CfnIdentityPoolRoleAttachment(
-			this,
-			'IdentityPoolRoleAttachment',
-			{
-				identityPoolId: this.identityPool.ref,
-				roles: {
-					unauthenticated: this.unauthRole.roleArn,
-					authenticated: this.authRole.roleArn,
-				},
-			},
-		)
 
 		this.udpSecurityGroup = new ec2.SecurityGroup(this, 'UDPSecurityGroup', {
 			vpc: this.vpc,
@@ -539,28 +382,6 @@ export class StreamingStack extends Stack {
 		})
 		packetLossAlarm.addAlarmAction(new cloudwatch_actions.SnsAction(alarmTopic))
 
-		// Alarm for DynamoDB throttling
-		const dynamoThrottleAlarm = new cloudwatch.Alarm(
-			this,
-			'DynamoThrottleAlarm',
-			{
-				alarmName: `${Stack.of(this).stackName}-DynamoDBThrottling`,
-				alarmDescription: 'Alarm when DynamoDB requests are throttled',
-				metric: this.streamTable.metricUserErrors({
-					statistic: 'Sum',
-					period: Duration.minutes(5),
-				}),
-				threshold: 5,
-				evaluationPeriods: 2,
-				comparisonOperator:
-					cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
-				treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-			},
-		)
-		dynamoThrottleAlarm.addAlarmAction(
-			new cloudwatch_actions.SnsAction(alarmTopic),
-		)
-
 		// Alarm for EC2 CPU usage >80%
 		const cpuMetric = new cloudwatch.Metric({
 			namespace: 'AWS/EC2',
@@ -584,26 +405,6 @@ export class StreamingStack extends Stack {
 		cpuAlarm.addAlarmAction(new cloudwatch_actions.SnsAction(alarmTopic))
 
 		// CDK Outputs
-		new CfnOutput(this, 'UserPoolId', {
-			value: this.userPool.userPoolId,
-			description: 'Cognito User Pool ID',
-		})
-
-		new CfnOutput(this, 'UserPoolURL', {
-			value: `https://cognito-idp.${this.region}.amazonaws.com/${this.userPool.userPoolId}/`,
-			description: 'Cognito User Pool URL for OIDC',
-		})
-
-		new CfnOutput(this, 'UserPoolClientId', {
-			value: this.userPoolClient.userPoolClientId,
-			description: 'Cognito User Pool Client ID',
-		})
-
-		new CfnOutput(this, 'IdentityPoolId', {
-			value: this.identityPool.ref,
-			description: 'Cognito Identity Pool ID for frontend',
-		})
-
 		new CfnOutput(this, 'DynamoDBTableName', {
 			value: this.streamTable.tableName,
 			description: 'DynamoDB table name for stream metadata',
