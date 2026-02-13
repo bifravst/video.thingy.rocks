@@ -273,11 +273,8 @@ export class StreamingStack extends Stack {
 			},
 		)
 
-		// Configure health check separately to avoid deprecation warnings
 		const cfnAsg = this.autoScalingGroup.node
 			.defaultChild as autoscaling.CfnAutoScalingGroup
-		cfnAsg.healthCheckType = 'EC2'
-		cfnAsg.healthCheckGracePeriod = Duration.minutes(5).toSeconds()
 
 		const eip = new ec2.CfnEIP(this, 'NLB-EIP', {
 			domain: 'vpc',
@@ -355,6 +352,12 @@ export class StreamingStack extends Stack {
 		for (const targetGroup of targetGroups) {
 			this.autoScalingGroup.attachToNetworkTargetGroup(targetGroup)
 		}
+
+		// Use ELB health check so ASG only considers instances ready when they pass NLB
+		// target group health checks. Prevents terminating old instances before new ones
+		// can receive traffic.
+		cfnAsg.healthCheckType = 'ELB'
+		cfnAsg.healthCheckGracePeriod = Duration.minutes(5).toSeconds()
 
 		// Create SNS topic for alarm notifications
 		const alarmTopic = new sns.Topic(this, 'AlarmTopic', {
