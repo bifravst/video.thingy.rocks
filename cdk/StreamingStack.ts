@@ -225,6 +225,14 @@ export class StreamingStack extends Stack {
 
 		const userData = ec2.UserData.custom(userDataScript)
 
+		const publicSubnets = this.vpc.selectSubnets({
+			subnetType: ec2.SubnetType.PUBLIC,
+		}).subnets
+		if (publicSubnets.length === 0) {
+			throw new Error('No public subnets available')
+		}
+		const primarySubnet = publicSubnets[0]!
+
 		// Create Launch Template explicitly (AWS is deprecating Launch Configurations)
 		const launchTemplate = new ec2.LaunchTemplate(this, 'LaunchTemplate', {
 			instanceType: ec2.InstanceType.of(
@@ -247,9 +255,7 @@ export class StreamingStack extends Stack {
 			'UDPListenerASG',
 			{
 				vpc: this.vpc,
-				vpcSubnets: {
-					subnetType: ec2.SubnetType.PUBLIC,
-				},
+				vpcSubnets: { subnets: [primarySubnet] },
 				launchTemplate,
 				minCapacity: 2,
 				maxCapacity: 10,
@@ -267,22 +273,11 @@ export class StreamingStack extends Stack {
 		cfnAsg.healthCheckType = 'EC2'
 		cfnAsg.healthCheckGracePeriod = Duration.minutes(5).toSeconds()
 
-		// Allocate Elastic IP for fixed IPv4 address
-		const publicSubnets = this.vpc.selectSubnets({
-			subnetType: ec2.SubnetType.PUBLIC,
-		}).subnets
-
-		if (publicSubnets.length === 0) {
-			throw new Error('No public subnets available for NLB deployment')
-		}
-
 		const eip = new ec2.CfnEIP(this, 'NLB-EIP', {
 			domain: 'vpc',
 		})
 
 		// Create Network Load Balancer with fixed IPv4 address
-		// Note: We don't specify vpcSubnets here because we use subnetMappings below
-		// Note: Using IPv4 only because UDP with instance targets doesn't support dual-stack
 		this.networkLoadBalancer = new elbv2.NetworkLoadBalancer(
 			this,
 			'VideoStreamingNLB',
@@ -294,17 +289,13 @@ export class StreamingStack extends Stack {
 			},
 		)
 
-		// Associate EIP with NLB through subnet mapping
-		// This replaces the default subnet selection with our custom mapping
-		// IPv6 address will be automatically assigned from the subnet's IPv6 CIDR
 		const cfnNlb = this.networkLoadBalancer.node
 			.defaultChild as elbv2.CfnLoadBalancer
-		cfnNlb.subnets = undefined // Clear the default subnets property
+		cfnNlb.subnets = undefined
 		cfnNlb.subnetMappings = [
 			{
-				subnetId: publicSubnets[0]!.subnetId,
+				subnetId: primarySubnet.subnetId,
 				allocationId: eip.attrAllocationId,
-				// IPv6 address is automatically assigned by AWS from the subnet's IPv6 CIDR block
 			},
 		]
 
@@ -435,12 +426,12 @@ export class StreamingStack extends Stack {
 		// NLB Outputs
 		new CfnOutput(this, 'NLBDnsName', {
 			value: this.networkLoadBalancer.loadBalancerDnsName,
-			description: `Network Load Balancer DNS name for UDP video streaming (ports 5000-5009) - deployed in AZ: ${publicSubnets[0]!.availabilityZone}`,
+			description: `Network Load Balancer DNS name for UDP video streaming (ports 5000-5009)`,
 		})
 
 		new CfnOutput(this, 'NLBIPv4Address', {
 			value: eip.ref,
-			description: `NLB fixed IPv4 address (Elastic IP) in AZ: ${publicSubnets[0]!.availabilityZone}`,
+			description: `NLB fixed IPv4 address (Elastic IP) in ${primarySubnet.availabilityZone}`,
 		})
 	}
 }
