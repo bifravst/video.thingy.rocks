@@ -82,7 +82,7 @@ Environment="TRANSCODING_OUTPUT_DIR=/tmp/video-streams/transcoding"
 Environment="KINESIS_STREAM_PREFIX=__KINESIS_STREAM_PREFIX__"
 Environment="GST_PLUGIN_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build"
 Environment="LD_LIBRARY_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build"
-ExecStart=/usr/bin/node --experimental-transform-types --no-warnings src/index.ts
+ExecStart=/usr/bin/node --max-old-space-size=16384 --experimental-transform-types --no-warnings src/index.ts
 Restart=always
 RestartSec=10
 StandardOutput=append:/var/log/video-streaming/application.log
