@@ -405,9 +405,16 @@ export class StreamingStack extends Stack {
 		cpuAlarm.addAlarmAction(new cloudwatch_actions.SnsAction(alarmTopic))
 
 		// CDK Outputs
-		new CfnOutput(this, 'DynamoDBTableName', {
+		new CfnOutput(this, 'StreamMetadataTableName', {
 			value: this.streamTable.tableName,
 			description: 'DynamoDB table name for stream metadata',
+			exportName: `${this.stackName}:StreamMetadataTableName`,
+		})
+
+		new CfnOutput(this, 'StreamMetadataTableArn', {
+			value: this.streamTable.tableArn,
+			description: 'DynamoDB table ARN for stream metadata',
+			exportName: `${this.stackName}:StreamMetadataTableArn`,
 		})
 
 		new CfnOutput(this, 'VPCId', {
