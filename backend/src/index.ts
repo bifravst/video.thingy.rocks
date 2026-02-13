@@ -1,4 +1,5 @@
 import { fromNodeProviderChain } from '@aws-sdk/credential-providers'
+import { HealthServer } from './HealthServer.ts'
 import { KinesisIngestionPipeline } from './KinesisIngestionPipeline.ts'
 import { StreamMetadataService } from './StreamMetadataService.ts'
 import { StreamStateManager } from './StreamStateManager.ts'
@@ -177,10 +178,13 @@ const udpListener = new UDPListener({
 
 udpListener.setPacketHandler(packetHandler)
 
+const healthServer = new HealthServer()
+
 // Graceful shutdown handler
 const shutdown = async (): Promise<void> => {
 	console.log('[Main] Shutting down...')
 
+	await healthServer.stop()
 	await udpListener.stop()
 	streamStateManager.stop()
 	if (kinesisIngestionPipeline) {
@@ -225,6 +229,7 @@ const start = async (): Promise<void> => {
 
 	try {
 		await ensureAwsCredentials()
+		await healthServer.start()
 		await udpListener.start()
 		console.log('[Main] Service started successfully')
 	} catch (error) {

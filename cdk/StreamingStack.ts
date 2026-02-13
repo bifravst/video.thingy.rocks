@@ -120,6 +120,12 @@ export class StreamingStack extends Stack {
 			ec2.Port.udpRange(5000, 5009),
 			'Allow UDP video ingestion on ports 5000-5009',
 		)
+		// Allow TCP health checks from NLB (originates within VPC)
+		this.udpSecurityGroup.addIngressRule(
+			ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
+			ec2.Port.tcp(9999),
+			'Allow NLB TCP health checks on port 9999',
+		)
 
 		// Allow HTTPS egress for AWS service communication
 		this.udpSecurityGroup.addEgressRule(
@@ -312,7 +318,7 @@ export class StreamingStack extends Stack {
 					targetType: elbv2.TargetType.INSTANCE,
 					healthCheck: {
 						protocol: elbv2.Protocol.TCP,
-						port: port.toString(),
+						port: '9999',
 						healthyThresholdCount: 2,
 						unhealthyThresholdCount: 2,
 						interval: Duration.seconds(10),
