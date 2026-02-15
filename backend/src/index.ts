@@ -98,8 +98,13 @@ const packetHandler: PacketHandler = {
 		// Update stream state
 		streamStateManager.onPacketReceived(port, timestamp)
 
-		// Update DynamoDB with last packet time
-		await streamMetadataService.updateLastPacketTime(port, timestamp)
+		// Update DynamoDB with last packet time (throttled; errors are logged in service)
+		try {
+			await streamMetadataService.updateLastPacketTime(port, timestamp)
+		} catch (err) {
+			console.error(`[Main] Error updating DynamoDB for port ${port}:`, err)
+			// Do not rethrow: one DynamoDB failure must not block packet processing
+		}
 
 		// Feed packet to Kinesis ingestion (GStreamer -> kvssink) if enabled (first packet was already written in start(port, data)).
 		if (kinesisIngestionPipeline) {
@@ -167,6 +172,47 @@ streamStateManager.on(
 		})
 	},
 )
+
+// Auto-restart Kinesis pipeline when GStreamer exits unexpectedly (e.g. crash, OOM, Kinesis network issues)
+// Restart is throttled to avoid storms if GStreamer keeps failing
+const pipelineRestartThrottleMs = 10_000 // min delay between restarts per port
+const lastPipelineRestartByPort = new Map<number, number>()
+if (kinesisIngestionPipeline) {
+	kinesisIngestionPipeline.on(
+		'pipelineExited',
+		({
+			port,
+			code,
+			signal,
+		}: {
+			port: number
+			code: number | null
+			signal: string | null
+		}) => {
+			// Only restart if stream is still active (still receiving packets)
+			const state = streamStateManager.getStreamState(port)
+			if (state?.status !== 'active') return
+			if (!kinesisIngestionPipeline?.isPortInRange(port)) return
+
+			const now = Date.now()
+			const lastRestart = lastPipelineRestartByPort.get(port) ?? 0
+			const delay = Math.max(0, pipelineRestartThrottleMs - (now - lastRestart))
+
+			console.warn(
+				`[Main] GStreamer exited unexpectedly for port ${port} (code=${code}, signal=${signal}). Restarting in ${delay}ms...`,
+			)
+			setTimeout(() => {
+				lastPipelineRestartByPort.set(port, Date.now())
+				void kinesisIngestionPipeline?.start(port).catch((err) => {
+					console.error(
+						`[Main] Error restarting Kinesis ingestion for port ${port}:`,
+						err,
+					)
+				})
+			}, delay)
+		},
+	)
+}
 
 // Initialize UDP listener
 const udpListener = new UDPListener({

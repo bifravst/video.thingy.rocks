@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -57,7 +58,7 @@ const GST_STDOUT_THROTTLE_MS = 60_000
  * Per-port pipeline: UDP packets -> GStreamer (TS -> H.264) -> kvssink -> Kinesis Video.
  * One GStreamer process per active port; kvssink sends directly to Kinesis (no Node PutMedia).
  */
-export class KinesisIngestionPipeline {
+export class KinesisIngestionPipeline extends EventEmitter {
 	private readonly config: KinesisIngestionPipelineConfig
 	private readonly logger: Logger
 	private readonly activePipelines: Map<number, PortPipeline> = new Map()
@@ -65,6 +66,7 @@ export class KinesisIngestionPipeline {
 	private readonly pendingStarts: Map<number, Promise<void>> = new Map()
 
 	constructor(config: KinesisIngestionPipelineConfig) {
+		super()
 		this.config = config
 		this.logger = new Logger('KinesisIngestionPipeline')
 	}
@@ -339,13 +341,20 @@ export class KinesisIngestionPipeline {
 			this.activePipelines.delete(port)
 		})
 		gst.on('exit', (code, signal) => {
+			// Emit before delete: if port was in activePipelines, this was an unexpected exit
+			// (intentional stop() removes from map before killing the process)
+			const wasUnexpected = this.activePipelines.has(port)
 			this.logger.info('GStreamer exited', {
 				port,
 				streamName,
 				code: code ?? undefined,
 				signal: signal ?? undefined,
+				unexpected: wasUnexpected,
 			})
 			this.activePipelines.delete(port)
+			if (wasUnexpected) {
+				this.emit('pipelineExited', { port, code, signal })
+			}
 		})
 
 		const reorderBufferSize =
