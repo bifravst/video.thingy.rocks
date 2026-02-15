@@ -27,19 +27,18 @@ fi
 
 echo ""
 echo "Running Instances:"
-echo "=================="
 echo "$INSTANCES" | while IFS=$'\t' read -r instance_id public_ip private_ip launch_time; do
+  echo "=================="
   echo "Instance ID: $instance_id"
   echo "  Public IP:  $public_ip"
   echo "  Private IP: $private_ip"
   echo "  Launched:   $launch_time"
   echo ""
+  echo "To SSH into this instance, run:"
+  echo "  aws ssm start-session --region ${REGION:-eu-central-1} --target $instance_id"
+  echo ""
+  echo "To stream webcam to this instance:"
+  echo "  ./scripts/stream-webcam-to-udp.sh $public_ip 5000"
+  echo ""
 done
 
-# Get first instance IP for easy copying
-FIRST_IP=$(echo "$INSTANCES" | head -1 | awk '{print $2}')
-
-echo "To stream webcam to this instance:"
-echo "  ./scripts/stream-webcam-to-udp.sh $FIRST_IP 5000"
-echo ""
-echo "Available ports: 5000-5009"
