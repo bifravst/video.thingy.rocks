@@ -39,6 +39,9 @@ const ensureAwsCredentials = async (): Promise<void> => {
  * - Optionally sends UDP/MPEG-TS to Kinesis Video Streams (GStreamer (TS -> H.264) -> kvssink -> Kinesis Video)
  */
 
+const KINESIS_MIN_BYTES_BEFORE_START =
+	Number(process.env.KINESIS_MIN_BYTES_BEFORE_START ?? 10) * 1024 * 1024 // 10 MB default
+
 // Configuration
 const config = {
 	portRange: { start: 5000, end: 5009 },
@@ -56,6 +59,7 @@ const config = {
 	kinesisLogGstreamerOutput:
 		process.env.KINESIS_INGESTION_LOG_GSTREAMER === 'true' ||
 		process.env.KINESIS_INGESTION_LOG_GSTREAMER === '1',
+	kinesisMinBytesBeforeStart: KINESIS_MIN_BYTES_BEFORE_START,
 }
 
 const streamStateManager = new StreamStateManager({
@@ -79,6 +83,15 @@ const kinesisIngestionPipeline = config.kinesisIngestionEnabled
 /** Ports for which this instance holds the Kinesis lock (only holder may send to Kinesis). */
 const kinesisLockHeldForPorts = new Set<number>()
 
+/**
+ * Per-port buffer of packets before we start GStreamer. We wait until at least
+ * kinesisMinBytesBeforeStart (10 MB) to avoid treating port scans as video streams.
+ */
+const preStartBufferByPort = new Map<
+	number,
+	{ chunks: Buffer[]; totalBytes: number }
+>()
+
 /** Resolved at startup; used by packet handler for lock acquisition and DynamoDB updates. */
 let instanceId = 'local'
 
@@ -88,30 +101,42 @@ const createPacketHandler = (): PacketHandler => ({
 		const isFirstPacket = streamState === undefined
 		const isResume = streamState?.status === 'inactive'
 
-		// Try to acquire Kinesis lock on first packet or stream resume (we released on stop)
+		let packetAlreadyInInitialData = false
+		// Buffer packets until we have enough data, then acquire Kinesis lock and start GStreamer.
+		// This prevents port scans (small random payloads) from being treated as video streams.
 		if (
 			kinesisIngestionPipeline &&
 			kinesisIngestionPipeline.isPortInRange(port) &&
 			!kinesisLockHeldForPorts.has(port) &&
 			(isFirstPacket || isResume)
 		) {
-			try {
-				const acquired = await streamMetadataService.tryAcquireKinesisLock(
-					port,
-					instanceId,
-				)
-				if (acquired) {
-					kinesisLockHeldForPorts.add(port)
-					await kinesisIngestionPipeline.start(
+			let buf = preStartBufferByPort.get(port)
+			if (!buf) {
+				buf = { chunks: [], totalBytes: 0 }
+				preStartBufferByPort.set(port, buf)
+			}
+			buf.chunks.push(data)
+			buf.totalBytes += data.length
+
+			if (buf.totalBytes >= config.kinesisMinBytesBeforeStart) {
+				preStartBufferByPort.delete(port)
+				const initialData = Buffer.concat(buf.chunks)
+				packetAlreadyInInitialData = true
+				try {
+					const acquired = await streamMetadataService.tryAcquireKinesisLock(
 						port,
-						isFirstPacket ? data : undefined,
+						instanceId,
+					)
+					if (acquired) {
+						kinesisLockHeldForPorts.add(port)
+						await kinesisIngestionPipeline.start(port, initialData)
+					}
+				} catch (err) {
+					console.error(
+						`[Main] Error acquiring Kinesis lock / starting ingestion for port ${port}:`,
+						err,
 					)
 				}
-			} catch (err) {
-				console.error(
-					`[Main] Error acquiring Kinesis lock / starting ingestion for port ${port}:`,
-					err,
-				)
 			}
 		}
 
@@ -130,13 +155,13 @@ const createPacketHandler = (): PacketHandler => ({
 			}
 		}
 
-		// Feed packet to Kinesis only if we hold the lock
-		if (kinesisIngestionPipeline && kinesisLockHeldForPorts.has(port)) {
-			const skipFirst =
-				isFirstPacket && kinesisIngestionPipeline.isPortInRange(port)
-			if (!skipFirst) {
-				kinesisIngestionPipeline.writePacket(port, data)
-			}
+		// Feed packet to Kinesis only if we hold the lock. Skip if this packet was passed as initialData.
+		if (
+			kinesisIngestionPipeline &&
+			kinesisLockHeldForPorts.has(port) &&
+			!packetAlreadyInInitialData
+		) {
+			kinesisIngestionPipeline.writePacket(port, data)
 		}
 	},
 
@@ -159,6 +184,8 @@ const createPacketHandler = (): PacketHandler => ({
 			`[Main] Stream stopped on port ${port} after ${inactivityDuration}ms`,
 		)
 
+		preStartBufferByPort.delete(port)
+
 		if (kinesisLockHeldForPorts.has(port)) {
 			await streamMetadataService.releaseKinesisLock(port, instanceId)
 			kinesisLockHeldForPorts.delete(port)
@@ -177,18 +204,6 @@ streamStateManager.on('streamStart', (port: number) => {
 	void packetHandler.onStreamStart(port).catch((err) => {
 		console.error(`[Main] Error handling stream start for port ${port}:`, err)
 	})
-})
-
-streamStateManager.on('streamResume', (port: number) => {
-	// Restart Kinesis pipeline when stream resumes after inactivity
-	if (kinesisIngestionPipeline) {
-		void kinesisIngestionPipeline.start(port).catch((err) => {
-			console.error(
-				`[Main] Error starting Kinesis ingestion on resume for port ${port}:`,
-				err,
-			)
-		})
-	}
 })
 
 streamStateManager.on(
@@ -260,6 +275,7 @@ const shutdown = async (): Promise<void> => {
 	await healthServer.stop()
 	await udpListener.stop()
 	streamStateManager.stop()
+	preStartBufferByPort.clear()
 	for (const port of kinesisLockHeldForPorts) {
 		await streamMetadataService.releaseKinesisLock(port, instanceId)
 	}
@@ -299,6 +315,9 @@ const start = async (): Promise<void> => {
 	if (config.kinesisIngestionEnabled) {
 		console.log(
 			`[Main] Kinesis ingestion enabled (stream prefix: ${config.kinesisStreamPrefix})`,
+		)
+		console.log(
+			`[Main] GStreamer starts after ${config.kinesisMinBytesBeforeStart / 1024 / 1024} MB received (KINESIS_MIN_BYTES_BEFORE_START)`,
 		)
 	} else {
 		console.log(
