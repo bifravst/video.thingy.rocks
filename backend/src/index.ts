@@ -104,11 +104,13 @@ const createPacketHandler = (): PacketHandler => ({
 		let packetAlreadyInInitialData = false
 		// Buffer packets until we have enough data, then acquire Kinesis lock and start GStreamer.
 		// This prevents port scans (small random payloads) from being treated as video streams.
+		// Include preStartBufferByPort.has(port) so we keep buffering (and eventually try the lock)
+		// on packets 2..N until we hit the threshold; otherwise we only enter on first packet.
 		if (
 			kinesisIngestionPipeline &&
 			kinesisIngestionPipeline.isPortInRange(port) &&
 			!kinesisLockHeldForPorts.has(port) &&
-			(isFirstPacket || isResume)
+			(isFirstPacket || isResume || preStartBufferByPort.has(port))
 		) {
 			let buf = preStartBufferByPort.get(port)
 			if (!buf) {
