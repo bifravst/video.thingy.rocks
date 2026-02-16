@@ -1,6 +1,7 @@
 import {
 	CfnOutput,
 	Duration,
+	Fn,
 	RemovalPolicy,
 	Size,
 	Stack,
@@ -22,6 +23,7 @@ import * as logs from 'aws-cdk-lib/aws-logs'
 import * as s3 from 'aws-cdk-lib/aws-s3'
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment'
 import * as sns from 'aws-cdk-lib/aws-sns'
+import * as sns_subscriptions from 'aws-cdk-lib/aws-sns-subscriptions'
 import type { Construct } from 'constructs'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -399,6 +401,51 @@ export class StreamingStack extends Stack {
 			topicName: 'video-streaming-alarms',
 		})
 
+		// Topic and Lambda for restarting ingestion when UDPTrafficNoKinesisIngestionAlarm fires (after 10 min)
+		const restartIngestionTopic = new sns.Topic(this, 'RestartIngestionTopic', {
+			displayName: 'Video Streaming Restart Ingestion',
+			topicName: 'video-streaming-restart-ingestion',
+		})
+		const restartIngestionLambda = new lambdanode.NodejsFunction(
+			this,
+			'RestartIngestionOnAlarm',
+			{
+				entry: join(
+					__dirname,
+					'..',
+					'lambda',
+					'restart-ingestion-on-alarm',
+					'index.ts',
+				),
+				runtime: lambda.Runtime.NODEJS_22_X,
+				handler: 'handler',
+				environment: {
+					AUTO_SCALING_GROUP_NAME: this.autoScalingGroup.autoScalingGroupName,
+				},
+				timeout: Duration.seconds(60),
+				bundling: {
+					format: lambdanode.OutputFormat.ESM,
+				},
+			},
+		)
+		restartIngestionLambda.addToRolePolicy(
+			new iam.PolicyStatement({
+				effect: iam.Effect.ALLOW,
+				actions: ['autoscaling:DescribeAutoScalingGroups'],
+				resources: ['*'],
+			}),
+		)
+		restartIngestionLambda.addToRolePolicy(
+			new iam.PolicyStatement({
+				effect: iam.Effect.ALLOW,
+				actions: ['ec2:RebootInstances'],
+				resources: ['*'],
+			}),
+		)
+		restartIngestionTopic.addSubscription(
+			new sns_subscriptions.LambdaSubscription(restartIngestionLambda),
+		)
+
 		// Alarm for high packet loss (>5%)
 		const packetLossAlarm = new cloudwatch.Alarm(this, 'PacketLossAlarm', {
 			alarmName: `${Stack.of(this).stackName}-HighPacketLoss`,
@@ -437,6 +484,92 @@ export class StreamingStack extends Stack {
 			treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
 		})
 		cpuAlarm.addAlarmAction(new cloudwatch_actions.SnsAction(alarmTopic))
+
+		// Composite alarm: NLB UDP traffic > 1 MB/s but no PutMedia ingestion on any Kinesis stream
+		const oneMebibytePerSecondBytesPerMinute = 1024 * 1024 * 60 // 1 MiB/s * 60s
+		const nlbUdpBytesAlarm = new cloudwatch.Alarm(
+			this,
+			'NLBUDPBytesHighAlarm',
+			{
+				alarmName: `${Stack.of(this).stackName}-NLB-UDP-Bytes-Gt-1MBps`,
+				alarmDescription:
+					'NLB ProcessedBytes_UDP exceeds 1 MB/s (bytes per minute threshold)',
+				metric: new cloudwatch.Metric({
+					namespace: 'AWS/NetworkELB',
+					metricName: 'ProcessedBytes_UDP',
+					dimensionsMap: {
+						LoadBalancer: Fn.select(
+							1,
+							Fn.split(
+								'loadbalancer/',
+								this.networkLoadBalancer.loadBalancerArn,
+							),
+						),
+					},
+					statistic: 'Sum',
+					period: Duration.minutes(1),
+				}),
+				threshold: oneMebibytePerSecondBytesPerMinute,
+				evaluationPeriods: 5,
+				comparisonOperator:
+					cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+				treatMissingData: cloudwatch.TreatMissingData.BREACHING,
+			},
+		)
+
+		const kvsIncomingMetrics: Record<string, cloudwatch.IMetric> = {}
+		this.kinesisVideoStreams.forEach((_, i) => {
+			const port = kinesisStreamPortStart + i
+			const streamName = `${kinesisStreamPrefix}-${port}`
+			kvsIncomingMetrics[`s${i}`] = new cloudwatch.Metric({
+				namespace: 'AWS/KinesisVideo',
+				metricName: 'PutMedia.IncomingBytes',
+				dimensionsMap: { StreamName: streamName },
+				statistic: 'Sum',
+				period: Duration.minutes(1),
+			})
+		})
+		const kvsIncomingSum = new cloudwatch.MathExpression({
+			expression: this.kinesisVideoStreams.map((_, i) => `s${i}`).join('+'),
+			usingMetrics: kvsIncomingMetrics,
+			period: Duration.minutes(1),
+			label: 'PutMedia Incoming Bytes (all streams)',
+		})
+		const kvsNoIngestionAlarm = new cloudwatch.Alarm(
+			this,
+			'KVSNoPutMediaIngestionAlarm',
+			{
+				alarmName: `${Stack.of(this).stackName}-KVS-PutMedia-Incoming-Zero`,
+				alarmDescription:
+					'Sum of PutMedia.IncomingBytes across all Kinesis Video Streams is 0',
+				metric: kvsIncomingSum,
+				threshold: 0,
+				evaluationPeriods: 5,
+				comparisonOperator:
+					cloudwatch.ComparisonOperator.LESS_THAN_OR_EQUAL_TO_THRESHOLD,
+				treatMissingData: cloudwatch.TreatMissingData.BREACHING,
+			},
+		)
+
+		const udpTrafficNoIngestionAlarm = new cloudwatch.CompositeAlarm(
+			this,
+			'UDPTrafficNoKinesisIngestionAlarm',
+			{
+				alarmRule: cloudwatch.AlarmRule.allOf(
+					cloudwatch.AlarmRule.not(nlbUdpBytesAlarm),
+					kvsNoIngestionAlarm,
+				),
+				alarmDescription:
+					'NLB UDP processed bytes > 1 MB/s but PutMedia incoming data across all Kinesis Video Streams is 0',
+				compositeAlarmName: `${Stack.of(this).stackName}-UDP-Traffic-No-KVS-Ingestion`,
+			},
+		)
+		udpTrafficNoIngestionAlarm.addAlarmAction(
+			new cloudwatch_actions.SnsAction(alarmTopic),
+		)
+		udpTrafficNoIngestionAlarm.addAlarmAction(
+			new cloudwatch_actions.SnsAction(restartIngestionTopic),
+		)
 
 		// CDK Outputs
 		new CfnOutput(this, 'StreamMetadataTableName', {
