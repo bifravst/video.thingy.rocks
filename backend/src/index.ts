@@ -1,5 +1,6 @@
 import { fromNodeProviderChain } from '@aws-sdk/credential-providers'
 import { HealthServer } from './HealthServer.ts'
+import { resolveInstanceId } from './InstanceId.ts'
 import { KinesisIngestionPipeline } from './KinesisIngestionPipeline.ts'
 import { StreamMetadataService } from './StreamMetadataService.ts'
 import { StreamStateManager } from './StreamStateManager.ts'
@@ -75,39 +76,62 @@ const kinesisIngestionPipeline = config.kinesisIngestionEnabled
 		})
 	: null
 
-// Set up packet handler
-const packetHandler: PacketHandler = {
+/** Ports for which this instance holds the Kinesis lock (only holder may send to Kinesis). */
+const kinesisLockHeldForPorts = new Set<number>()
+
+/** Resolved at startup; used by packet handler for lock acquisition and DynamoDB updates. */
+let instanceId = 'local'
+
+const createPacketHandler = (): PacketHandler => ({
 	onPacket: async (port, data, timestamp) => {
-		// Start Kinesis pipeline on first packet; pass this packet so it is written to stdin immediately after spawn (fdsrc needs data when it first reads).
-		const isFirstPacket = streamStateManager.getStreamState(port) === undefined
+		const streamState = streamStateManager.getStreamState(port)
+		const isFirstPacket = streamState === undefined
+		const isResume = streamState?.status === 'inactive'
+
+		// Try to acquire Kinesis lock on first packet or stream resume (we released on stop)
 		if (
 			kinesisIngestionPipeline &&
-			isFirstPacket &&
-			kinesisIngestionPipeline.isPortInRange(port)
+			kinesisIngestionPipeline.isPortInRange(port) &&
+			!kinesisLockHeldForPorts.has(port) &&
+			(isFirstPacket || isResume)
 		) {
 			try {
-				await kinesisIngestionPipeline.start(port, data)
+				const acquired = await streamMetadataService.tryAcquireKinesisLock(
+					port,
+					instanceId,
+				)
+				if (acquired) {
+					kinesisLockHeldForPorts.add(port)
+					await kinesisIngestionPipeline.start(
+						port,
+						isFirstPacket ? data : undefined,
+					)
+				}
 			} catch (err) {
 				console.error(
-					`[Main] Error starting Kinesis ingestion for port ${port}:`,
+					`[Main] Error acquiring Kinesis lock / starting ingestion for port ${port}:`,
 					err,
 				)
 			}
 		}
 
-		// Update stream state
 		streamStateManager.onPacketReceived(port, timestamp)
 
-		// Update DynamoDB with last packet time (throttled; errors are logged in service)
-		try {
-			await streamMetadataService.updateLastPacketTime(port, timestamp)
-		} catch (err) {
-			console.error(`[Main] Error updating DynamoDB for port ${port}:`, err)
-			// Do not rethrow: one DynamoDB failure must not block packet processing
+		// Only update DynamoDB lastPacketTime if we hold the lock
+		if (kinesisLockHeldForPorts.has(port)) {
+			try {
+				await streamMetadataService.updateLastPacketTime(
+					port,
+					timestamp,
+					instanceId,
+				)
+			} catch (err) {
+				console.error(`[Main] Error updating DynamoDB for port ${port}:`, err)
+			}
 		}
 
-		// Feed packet to Kinesis ingestion (GStreamer -> kvssink) if enabled (first packet was already written in start(port, data)).
-		if (kinesisIngestionPipeline) {
+		// Feed packet to Kinesis only if we hold the lock
+		if (kinesisIngestionPipeline && kinesisLockHeldForPorts.has(port)) {
 			const skipFirst =
 				isFirstPacket && kinesisIngestionPipeline.isPortInRange(port)
 			if (!skipFirst) {
@@ -119,10 +143,8 @@ const packetHandler: PacketHandler = {
 	onStreamStart: async (port) => {
 		console.log(`[Main] Stream started on port ${port}`)
 
-		await streamMetadataService.updateStreamStatus(port, 'active')
-
-		// Pipeline already started on first packet; start here for stream resume
-		if (kinesisIngestionPipeline) {
+		// Resume Kinesis pipeline only if we hold the lock (e.g. stream resume after brief inactivity)
+		if (kinesisIngestionPipeline && kinesisLockHeldForPorts.has(port)) {
 			void kinesisIngestionPipeline.start(port).catch((err) => {
 				console.error(
 					`[Main] Error starting Kinesis ingestion for port ${port}:`,
@@ -137,13 +159,18 @@ const packetHandler: PacketHandler = {
 			`[Main] Stream stopped on port ${port} after ${inactivityDuration}ms`,
 		)
 
-		await streamMetadataService.updateStreamStatus(port, 'inactive')
+		if (kinesisLockHeldForPorts.has(port)) {
+			await streamMetadataService.releaseKinesisLock(port, instanceId)
+			kinesisLockHeldForPorts.delete(port)
+		}
 
 		if (kinesisIngestionPipeline) {
 			await kinesisIngestionPipeline.stop(port)
 		}
 	},
-}
+})
+
+const packetHandler = createPacketHandler()
 
 // Set up stream state event handlers
 streamStateManager.on('streamStart', (port: number) => {
@@ -233,6 +260,10 @@ const shutdown = async (): Promise<void> => {
 	await healthServer.stop()
 	await udpListener.stop()
 	streamStateManager.stop()
+	for (const port of kinesisLockHeldForPorts) {
+		await streamMetadataService.releaseKinesisLock(port, instanceId)
+	}
+	kinesisLockHeldForPorts.clear()
 	if (kinesisIngestionPipeline) {
 		await kinesisIngestionPipeline.stopAll()
 	}
@@ -256,7 +287,9 @@ process.on('SIGTERM', () => {
 
 // Start the service
 const start = async (): Promise<void> => {
+	instanceId = await resolveInstanceId()
 	console.log('[Main] Starting UDP video ingestion service...')
+	console.log(`[Main] Instance ID: ${instanceId}`)
 	console.log(
 		`[Main] Listening on ports ${config.portRange.start}-${config.portRange.end}`,
 	)

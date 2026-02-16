@@ -12,8 +12,12 @@ import * as cloudwatch_actions from 'aws-cdk-lib/aws-cloudwatch-actions'
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb'
 import * as ec2 from 'aws-cdk-lib/aws-ec2'
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2'
+import * as events from 'aws-cdk-lib/aws-events'
+import * as target from 'aws-cdk-lib/aws-events-targets'
 import * as iam from 'aws-cdk-lib/aws-iam'
 import * as kinesisvideo from 'aws-cdk-lib/aws-kinesisvideo'
+import * as lambda from 'aws-cdk-lib/aws-lambda'
+import * as lambdanode from 'aws-cdk-lib/aws-lambda-nodejs'
 import * as logs from 'aws-cdk-lib/aws-logs'
 import * as s3 from 'aws-cdk-lib/aws-s3'
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment'
@@ -358,6 +362,36 @@ export class StreamingStack extends Stack {
 		// can receive traffic.
 		cfnAsg.healthCheckType = 'ELB'
 		cfnAsg.healthCheckGracePeriod = Duration.minutes(5).toSeconds()
+
+		// Lambda: set streams to inactive when marked active but no frame in 5 minutes
+		const streamCleanupLambda = new lambdanode.NodejsFunction(
+			this,
+			'StreamInactivityCleanup',
+			{
+				entry: join(
+					__dirname,
+					'..',
+					'lambda',
+					'stream-inactivity-cleanup',
+					'index.ts',
+				),
+				runtime: lambda.Runtime.NODEJS_22_X,
+				handler: 'handler',
+				environment: {
+					TABLE_NAME: this.streamTable.tableName,
+				},
+				timeout: Duration.seconds(30),
+				bundling: {
+					format: lambdanode.OutputFormat.ESM,
+				},
+			},
+		)
+		this.streamTable.grantReadWriteData(streamCleanupLambda)
+
+		new events.Rule(this, 'StreamCleanupSchedule', {
+			schedule: events.Schedule.rate(Duration.minutes(1)),
+			targets: [new target.LambdaFunction(streamCleanupLambda)],
+		})
 
 		// Create SNS topic for alarm notifications
 		const alarmTopic = new sns.Topic(this, 'AlarmTopic', {
