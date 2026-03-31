@@ -52,7 +52,7 @@
   "dependencies": {
     "@aws-sdk/client-kinesis-video": "3.990.0",
     "aws4": "1.13.2",
-    "constructs": "10.4.5"
+    "constructs": "10.6.0"
   },
   "engines": {
     "node": ">=24",
