@@ -90,7 +90,11 @@ export class UDPListener extends EventEmitter {
 		const backoffMs = Math.pow(2, retryCount) * 1000 // Exponential backoff
 
 		return new Promise((resolve, reject) => {
-			const socket = dgram.createSocket('udp4')
+			// udp6 with ipv6Only:false is dual-stack on Linux: IPv4 packets arrive
+			// as ::ffff:<v4-addr>. The NLB target group is IPv6, so the NLB forwards
+			// every packet over IPv6 to the instance (IPv4 clients are translated via
+			// the source-NAT prefix).
+			const socket = dgram.createSocket({ type: 'udp6', ipv6Only: false })
 
 			socket.on('error', (err) => {
 				this.logger.warn('Error on port', {
@@ -113,7 +117,11 @@ export class UDPListener extends EventEmitter {
 							await this.bindPort(port, retryCount + 1)
 							resolve()
 						} catch (retryErr) {
-							reject(retryErr)
+							reject(
+								retryErr instanceof Error
+									? retryErr
+									: new Error(String(retryErr)),
+							)
 						}
 					})()
 				} else {

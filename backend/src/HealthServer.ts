@@ -16,7 +16,7 @@ export class HealthServer {
 			this.server = net.createServer((socket) => {
 				socket.end()
 			})
-			this.server.listen(HEALTH_PORT, '0.0.0.0', () => {
+			this.server.listen(HEALTH_PORT, '::', () => {
 				resolve()
 			})
 		})

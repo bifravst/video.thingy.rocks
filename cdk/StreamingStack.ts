@@ -52,17 +52,14 @@ export class StreamingStack extends Stack {
 		})
 
 		this.vpc = new ec2.Vpc(this, 'StreamingVPC', {
-			natGateways: 1,
+			ipProtocol: ec2.IpProtocol.DUAL_STACK,
+			natGateways: 0,
 			subnetConfiguration: [
 				{
 					cidrMask: 24,
 					name: 'Public',
 					subnetType: ec2.SubnetType.PUBLIC,
-				},
-				{
-					cidrMask: 24,
-					name: 'Private',
-					subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+					ipv6AssignAddressOnCreation: true,
 				},
 			],
 			availabilityZones: Array.from(props?.availabilityZones ?? []).slice(0, 2),
@@ -120,17 +117,28 @@ export class StreamingStack extends Stack {
 			allowAllOutbound: false,
 		})
 
-		// Allow UDP ingress on ports 5000-5009
+		// Allow UDP ingress on ports 5000-5009 (NLB forwards as IPv6 to instances since
+		// the target group is IPv6, so IPv6 ingress is required even for IPv4 clients)
 		this.udpSecurityGroup.addIngressRule(
 			ec2.Peer.anyIpv4(),
 			ec2.Port.udpRange(5000, 5009),
 			'Allow UDP video ingestion on ports 5000-5009',
+		)
+		this.udpSecurityGroup.addIngressRule(
+			ec2.Peer.anyIpv6(),
+			ec2.Port.udpRange(5000, 5009),
+			'Allow UDP video ingestion on ports 5000-5009 (IPv6)',
 		)
 		// Allow TCP health checks from NLB (originates within VPC)
 		this.udpSecurityGroup.addIngressRule(
 			ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
 			ec2.Port.tcp(9999),
 			'Allow NLB TCP health checks on port 9999',
+		)
+		this.udpSecurityGroup.addIngressRule(
+			ec2.Peer.anyIpv6(),
+			ec2.Port.tcp(9999),
+			'Allow NLB TCP health checks on port 9999 (IPv6)',
 		)
 
 		// Allow HTTPS egress for AWS service communication
@@ -261,6 +269,19 @@ export class StreamingStack extends Stack {
 			associatePublicIpAddress: true,
 		})
 
+		// NLB IPv6 target groups with instance targets require the instance's primary
+		// network interface to have a primary IPv6 address.
+		const cfnLaunchTemplate = launchTemplate.node
+			.defaultChild as ec2.CfnLaunchTemplate
+		cfnLaunchTemplate.addPropertyOverride(
+			'LaunchTemplateData.NetworkInterfaces.0.PrimaryIpv6',
+			true,
+		)
+		cfnLaunchTemplate.addPropertyOverride(
+			'LaunchTemplateData.NetworkInterfaces.0.Ipv6AddressCount',
+			1,
+		)
+
 		// Create Auto Scaling Group with Launch Template
 		this.autoScalingGroup = new autoscaling.AutoScalingGroup(
 			this,
@@ -286,14 +307,17 @@ export class StreamingStack extends Stack {
 			domain: 'vpc',
 		})
 
-		// Create Network Load Balancer with fixed IPv4 address
+		// Create Network Load Balancer with fixed IPv4 address and IPv6 (dual-stack).
+		// UDP listeners on a dual-stack NLB require source-NAT IPv6 prefixes so
+		// IPv6 client traffic can be translated to IPv4 toward instance targets.
 		this.networkLoadBalancer = new elbv2.NetworkLoadBalancer(
 			this,
 			'VideoStreamingNLB',
 			{
 				vpc: this.vpc,
 				internetFacing: true,
-				ipAddressType: elbv2.IpAddressType.IPV4,
+				ipAddressType: elbv2.IpAddressType.DUAL_STACK,
+				enablePrefixForIpv6SourceNat: true,
 				crossZoneEnabled: false,
 			},
 		)
@@ -305,6 +329,7 @@ export class StreamingStack extends Stack {
 			{
 				subnetId: primarySubnet.subnetId,
 				allocationId: eip.attrAllocationId,
+				sourceNatIpv6Prefix: 'auto_assigned',
 			},
 		]
 
@@ -319,6 +344,7 @@ export class StreamingStack extends Stack {
 					port,
 					protocol: elbv2.Protocol.UDP,
 					targetType: elbv2.TargetType.INSTANCE,
+					ipAddressType: elbv2.TargetGroupIpAddressType.IPV6,
 					healthCheck: {
 						protocol: elbv2.Protocol.TCP,
 						port: '9999',
@@ -398,13 +424,11 @@ export class StreamingStack extends Stack {
 		// Create SNS topic for alarm notifications
 		const alarmTopic = new sns.Topic(this, 'AlarmTopic', {
 			displayName: 'Video Streaming Alarms',
-			topicName: 'video-streaming-alarms',
 		})
 
 		// Topic and Lambda for restarting ingestion when UDPTrafficNoKinesisIngestionAlarm fires (after 10 min)
 		const restartIngestionTopic = new sns.Topic(this, 'RestartIngestionTopic', {
 			displayName: 'Video Streaming Restart Ingestion',
-			topicName: 'video-streaming-restart-ingestion',
 		})
 		const restartIngestionLambda = new lambdanode.NodejsFunction(
 			this,
@@ -602,7 +626,7 @@ export class StreamingStack extends Stack {
 		// NLB Outputs
 		new CfnOutput(this, 'NLBDnsName', {
 			value: this.networkLoadBalancer.loadBalancerDnsName,
-			description: `Network Load Balancer DNS name for UDP video streaming (ports 5000-5009)`,
+			description: `Network Load Balancer DNS name for UDP video streaming (ports 5000-5009). Dual-stack: resolves to both A (IPv4) and AAAA (IPv6) records.`,
 		})
 
 		new CfnOutput(this, 'NLBIPv4Address', {

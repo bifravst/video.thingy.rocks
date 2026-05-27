@@ -43,7 +43,7 @@ echo ""
 echo "Step 2: Verifying stack deployment..."
 echo ""
 
-STACK_NAME="${STACK_PREFIX:-video}-streaming"
+STACK_NAME="${STACK_PREFIX:-video}-streaming-2026-05"
 STACK_STATUS=$(aws cloudformation describe-stacks \
   --stack-name "$STACK_NAME" \
   --query "Stacks[0].StackStatus" \
