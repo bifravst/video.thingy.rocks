@@ -46,7 +46,7 @@
     "fast-check": "4.8.0",
     "husky": "9.1.7",
     "lint-staged": "17.0.5",
-    "prettier": "3.8.3",
+    "prettier": "3.9.6",
     "typescript": "6.0.3"
   },
   "dependencies": {
