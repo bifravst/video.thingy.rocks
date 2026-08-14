@@ -12,7 +12,7 @@
     "test:generate-packets": "node --experimental-transform-types --no-warnings ./test/udp-packet-generator.ts",
     "test:udp-to-s3": "node --experimental-transform-types --no-warnings ./test/integration/udp-to-s3-flow.spec.ts",
     "test:offline-online-transition": "node --experimental-transform-types --no-warnings ./test/integration/offline-online-transitions.spec.ts",
-    "prepare": "husky && check-node-version --package",
+    "prepare": "husky && case \"$npm_command\" in install|ci) check-node-version --package ;; esac",
     "cdk:bootstrap": "node --experimental-transform-types --no-warnings ./cdk/bootstrap.ts",
     "cdk:prod:deploy": "node --experimental-transform-types --no-warnings ./cdk/deploy-to-production.ts",
     "cdk:prod:destroy": "node --experimental-transform-types --no-warnings ./cdk/deploy-to-production.ts --destroy",
@@ -55,8 +55,8 @@
     "constructs": "10.8.1"
   },
   "engines": {
-    "node": ">=24 <25",
-    "npm": ">=11 <12"
+    "node": ">=24.19.0 <25",
+    "npm": ">=12.0.2 <13"
   },
   "lint-staged": {
     "*.{md,json,yaml,yml}": [
