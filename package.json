@@ -24,11 +24,11 @@
   },
   "devDependencies": {
     "@aws-cdk/toolkit-lib": "1.38.2",
-    "@aws-sdk/client-auto-scaling": "3.1110.0",
-    "@aws-sdk/client-dynamodb": "3.1110.0",
-    "@aws-sdk/client-ec2": "3.1110.0",
-    "@aws-sdk/client-iam": "3.1110.0",
-    "@aws-sdk/lib-dynamodb": "3.1110.0",
+    "@aws-sdk/client-auto-scaling": "3.1111.0",
+    "@aws-sdk/client-dynamodb": "3.1111.0",
+    "@aws-sdk/client-ec2": "3.1111.0",
+    "@aws-sdk/client-iam": "3.1111.0",
+    "@aws-sdk/lib-dynamodb": "3.1111.0",
     "@bifravst/ci": "2.1.3",
     "@bifravst/eslint-config-typescript": "7.0.34",
     "@bifravst/from-env": "3.0.2",
@@ -50,7 +50,7 @@
     "typescript": "npm:@typescript/typescript6@6.0.2"
   },
   "dependencies": {
-    "@aws-sdk/client-kinesis-video": "3.1110.0",
+    "@aws-sdk/client-kinesis-video": "3.1111.0",
     "aws4": "1.13.2",
     "constructs": "10.8.1"
   },
