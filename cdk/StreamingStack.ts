@@ -403,7 +403,7 @@ export class StreamingStack extends Stack {
 					'stream-inactivity-cleanup',
 					'index.ts',
 				),
-				runtime: lambda.Runtime.NODEJS_22_X,
+				runtime: lambda.Runtime.NODEJS_24_X,
 				handler: 'handler',
 				environment: {
 					TABLE_NAME: this.streamTable.tableName,
@@ -441,7 +441,7 @@ export class StreamingStack extends Stack {
 					'restart-ingestion-on-alarm',
 					'index.ts',
 				),
-				runtime: lambda.Runtime.NODEJS_22_X,
+				runtime: lambda.Runtime.NODEJS_24_X,
 				handler: 'handler',
 				environment: {
 					AUTO_SCALING_GROUP_NAME: this.autoScalingGroup.autoScalingGroupName,
