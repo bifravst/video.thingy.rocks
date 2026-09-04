@@ -2,7 +2,7 @@
   "name": "restart-ingestion-on-alarm",
   "type": "module",
   "dependencies": {
-    "@aws-sdk/client-auto-scaling": "^3.1111.0",
-    "@aws-sdk/client-ec2": "^3.1111.0"
+    "@aws-sdk/client-auto-scaling": "^3.1124.0",
+    "@aws-sdk/client-ec2": "^3.1124.0"
   }
 }
