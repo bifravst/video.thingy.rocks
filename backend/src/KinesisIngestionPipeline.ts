@@ -595,6 +595,37 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	}
 
 	/**
+	 * Resolves once GStreamer's stdout reports the pipeline reached PLAYING - gst-launch-1.0
+	 * prints "Setting pipeline to PLAYING ..." by default once udpsrc and the rest of the
+	 * pipeline have been set up, so this is a real (if best-effort) readiness signal instead
+	 * of a blind fixed sleep. Not a byte-for-byte guarantee the udpsrc bind() syscall itself
+	 * succeeded - a bulletproof check would need programmatic GStreamer bindings rather than
+	 * a spawned gst-launch-1.0 process - but it's a meaningful improvement, and
+	 * SRTP_STARTUP_GRACE_MS still bounds the wait as a fallback in case the message never
+	 * appears (e.g. output format differs across GStreamer versions, or gets swallowed by
+	 * stdout buffering).
+	 */
+	private async waitForSrtpPipelineReady(
+		gst: ReturnType<typeof spawn>,
+	): Promise<void> {
+		return new Promise((resolve) => {
+			let settled = false
+			const finish = (): void => {
+				if (settled) return
+				settled = true
+				gst.stdout?.off('data', onStdout)
+				clearTimeout(timer)
+				resolve()
+			}
+			const onStdout = (data: Buffer): void => {
+				if (/Setting pipeline to PLAYING/i.test(data.toString())) finish()
+			}
+			gst.stdout?.on('data', onStdout)
+			const timer = setTimeout(finish, SRTP_STARTUP_GRACE_MS)
+		})
+	}
+
+	/**
 	 * Single-run start logic for an SRTP port (credentials + spawn). Call only via start() so
 	 * dedupe applies. `initialDatagrams` are individually-received UDP datagrams buffered
 	 * before this port's Kinesis lock was acquired; they are replayed (each as its own
@@ -650,6 +681,10 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			stdio: ['ignore', 'pipe', 'pipe'],
 			env,
 		})
+
+		// Best-effort readiness signal instead of a blind fixed sleep: start listening now
+		// (before any awaits) so an early message isn't missed. See waitForSrtpPipelineReady.
+		const pipelineReady = this.waitForSrtpPipelineReady(gst)
 
 		const relaySocket = dgram.createSocket('udp4')
 		relaySocket.on('error', (err) => {
@@ -725,10 +760,10 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		this.activePipelines.set(port, pipeline)
 
 		// Unlike the FIFO path (whose fs.open() blocks until filesrc opens for read), there is
-		// no OS-level handshake for udpsrc binding a port, so we always wait a bit before
-		// sending anything - live packets queue in pendingQueue (via writePacket) during this
-		// window instead of racing udpsrc's bind.
-		await new Promise((resolve) => setTimeout(resolve, SRTP_STARTUP_GRACE_MS))
+		// no OS-level handshake for udpsrc binding a port - wait for GStreamer's own readiness
+		// signal (or the fallback timeout) before sending anything. Live packets queue in
+		// pendingQueue (via writePacket) during this window instead of racing udpsrc's bind.
+		await pipelineReady
 
 		// A stop()/crash during the wait above deletes or replaces this port's pipeline entry
 		// (see stop() and the gst 'error'/'exit' handlers above) - if that happened, this

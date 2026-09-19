@@ -96,6 +96,18 @@ export class StreamingStack extends Stack {
 		// so nothing needs to arbitrate between them beyond the existing per-port Kinesis
 		// lock (see StreamMetadataService). Stream names are plain device numbers ("1".."10"),
 		// matching backend/src/KinesisIngestionPipeline.ts's streamNameForPort().
+		//
+		// IMPORTANT, by explicit design choice:
+		// - Kinesis Video Stream names cannot be changed in place (no rename API), so this is
+		//   a genuinely destructive migration for any already-deployed stack: deploying this
+		//   change replaces every existing stream (old logical IDs/names deleted, these new
+		//   ones created), discarding up to 30 days of retained media in the old streams and
+		//   breaking anything that referenced the old names. There is no way to preserve
+		//   history across this rename - export anything that matters before deploying.
+		// - Physical names are bare numbers, not stack-qualified, even though STACK_PREFIX
+		//   (see cdk/stackName.ts) supports naming multiple stacks. Two stacks deployed to the
+		//   same AWS account + region will collide on these names. This design assumes a
+		//   single deployed stack per account/region - do not deploy a second one alongside it.
 		const STREAM_COUNT = 10
 		const srtpPortRangeStart = 6000
 		const srtpPortRangeEnd = srtpPortRangeStart + STREAM_COUNT - 1

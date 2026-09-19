@@ -7,6 +7,11 @@ import { StreamMetadataService } from './StreamMetadataService.ts'
 import { StreamStateManager } from './StreamStateManager.ts'
 import { UDPListener, type PacketHandler } from './UDPListener.ts'
 
+/** Parses a boolean feature-flag env var: only "true"/"1" enable it. Boolean(str) would
+ * treat any non-empty string - including the literal "false" or "0" - as enabled. */
+const isEnvFlagEnabled = (value: string | undefined): boolean =>
+	value === 'true' || value === '1'
+
 const ensureAwsCredentials = async (): Promise<void> => {
 	const credentialProvider = fromNodeProviderChain({
 		timeout: 10_000,
@@ -56,17 +61,19 @@ const config = {
 	dynamoDBTableName: process.env.TABLE_NAME ?? 'StreamMetadata',
 	awsRegion: process.env.AWS_REGION ?? 'eu-central-1',
 	segmentDuration: 6, // 6 seconds for HLS segments
-	kinesisIngestionEnabled: Boolean(process.env.KINESIS_INGESTION_ENABLED),
-	kinesisLogGstreamerOutput:
-		process.env.KINESIS_INGESTION_LOG_GSTREAMER === 'true' ||
-		process.env.KINESIS_INGESTION_LOG_GSTREAMER === '1',
+	kinesisIngestionEnabled: isEnvFlagEnabled(
+		process.env.KINESIS_INGESTION_ENABLED,
+	),
+	kinesisLogGstreamerOutput: isEnvFlagEnabled(
+		process.env.KINESIS_INGESTION_LOG_GSTREAMER,
+	),
 	kinesisMinBytesBeforeStart: KINESIS_MIN_BYTES_BEFORE_START,
 	srtpPortRange: {
 		start: Number(process.env.SRTP_PORT_RANGE_START ?? 6000),
 		end: Number(process.env.SRTP_PORT_RANGE_END ?? 6009),
 	},
 	srtpKeyParameterPrefix: process.env.SRTP_KEY_PARAMETER_PREFIX ?? '',
-	srtpIngestionEnabled: Boolean(process.env.SRTP_INGESTION_ENABLED),
+	srtpIngestionEnabled: isEnvFlagEnabled(process.env.SRTP_INGESTION_ENABLED),
 }
 
 const streamStateManager = new StreamStateManager({
@@ -107,6 +114,39 @@ const kinesisIngestionPipeline = config.kinesisIngestionEnabled
 const kinesisLockHeldForPorts = new Set<number>()
 
 /**
+ * Serializes async work per port. UDPListener dispatches onPacket() fire-and-forget (see
+ * backend/src/UDPListener.ts), so without this, multiple onPacket calls for the same port
+ * can run concurrently and interleave: a later packet's writePacket() call can overtake an
+ * earlier one still awaiting bookkeeping (the throttled DynamoDB heartbeat, or the
+ * lock-acquire + pipeline-start sequence) - corrupting SRTP packet order, or reaching
+ * writePacket() before the pipeline has actually finished starting and silently dropping
+ * the packet (no pipeline registered yet). Running each port's tasks one at a time, in
+ * arrival order, closes both.
+ */
+const packetQueueTailByPort = new Map<number, Promise<void>>()
+
+const runSerializedPerPort = async (
+	port: number,
+	task: () => Promise<void>,
+): Promise<void> => {
+	const previous = packetQueueTailByPort.get(port) ?? Promise.resolve()
+	const next = previous
+		.catch(() => {})
+		.then(async () => {
+			try {
+				await task()
+			} catch (err) {
+				console.error(
+					`[Main] Unhandled error processing packet for port ${port}:`,
+					err,
+				)
+			}
+		})
+	packetQueueTailByPort.set(port, next)
+	return next
+}
+
+/**
  * Per-port buffer of packets before we start GStreamer. We wait until at least
  * kinesisMinBytesBeforeStart (10 MB) to avoid treating port scans as video streams.
  */
@@ -114,6 +154,15 @@ const preStartBufferByPort = new Map<
 	number,
 	{ chunks: Buffer[]; totalBytes: number }
 >()
+
+/**
+ * Minimum time between Kinesis start attempts for the same port after a failure. Without
+ * this, a persistent failure (missing SRTP key, bad credentials, missing plugin) would
+ * retry on literally the next packet after being re-armed - re-acquiring the lock, failing
+ * again, releasing it, and re-arming again - hammering DynamoDB and logs at line rate.
+ */
+const START_RETRY_BACKOFF_MS = 30_000
+const nextStartAttemptAllowedAtByPort = new Map<number, number>()
 
 /** Resolved at startup; used by packet handler for lock acquisition and DynamoDB updates. */
 let instanceId = 'local'
@@ -153,7 +202,10 @@ const startPipelineOrReleaseLock = async (
 		)
 		failed = true
 	}
-	if (!failed) return
+	if (!failed) {
+		nextStartAttemptAllowedAtByPort.delete(port)
+		return
+	}
 
 	console.error(
 		`[Main] Kinesis ingestion pipeline failed to start for port ${port}; releasing lock`,
@@ -165,11 +217,16 @@ const startPipelineOrReleaseLock = async (
 		console.error(`[Main] Error releasing Kinesis lock for port ${port}:`, err)
 	}
 
-	// Re-arm the pre-start buffer so subsequent packets can trigger another attempt.
-	// onPacket only re-enters the buffering/lock-acquire path while isFirstPacket/isResume/
-	// preStartBufferByPort.has(port) holds - none of which are true once the stream is
-	// already 'active' with no buffer entry, so without this a failed start here would
-	// strand the port until a full inactivity/resume cycle happens on its own.
+	// Back off before the next attempt for this port - without this, re-arming the buffer
+	// below lets a persistent failure (missing key, bad credentials, missing plugin) retry
+	// on literally the next packet, hammering DynamoDB and logs at line rate.
+	nextStartAttemptAllowedAtByPort.set(port, Date.now() + START_RETRY_BACKOFF_MS)
+
+	// Re-arm the pre-start buffer so subsequent packets can trigger another attempt once the
+	// backoff above elapses. onPacket only re-enters the buffering/lock-acquire path while
+	// isFirstPacket/isResume/preStartBufferByPort.has(port) holds - none of which are true
+	// once the stream is already 'active' with no buffer entry, so without this a failed
+	// start here would strand the port until a full inactivity/resume cycle happens on its own.
 	const chunks =
 		initialData === undefined
 			? []
@@ -182,8 +239,12 @@ const startPipelineOrReleaseLock = async (
 
 const createPacketHandler = (
 	rangeConfig: PacketHandlerRangeConfig,
-): PacketHandler => ({
-	onPacket: async (port, data, timestamp) => {
+): PacketHandler => {
+	const processPacket = async (
+		port: number,
+		data: Buffer,
+		timestamp: Date,
+	): Promise<void> => {
 		const streamState = streamStateManager.getStreamState(port)
 		const isFirstPacket = streamState === undefined
 		const isResume = streamState?.status === 'inactive'
@@ -207,7 +268,20 @@ const createPacketHandler = (
 			buf.chunks.push(data)
 			buf.totalBytes += data.length
 
-			if (buf.totalBytes >= rangeConfig.minBytesBeforeStart) {
+			// Cap buffered bytes while a port is backing off after a failed start (see
+			// startPipelineOrReleaseLock) - a long backoff window against a high-bitrate
+			// source shouldn't retain unbounded memory just because we're not retrying yet.
+			const maxBufferedBytes = rangeConfig.minBytesBeforeStart * 2
+			while (buf.totalBytes > maxBufferedBytes && buf.chunks.length > 0) {
+				const dropped = buf.chunks.shift()
+				if (dropped !== undefined) buf.totalBytes -= dropped.length
+			}
+
+			const backoffUntil = nextStartAttemptAllowedAtByPort.get(port) ?? 0
+			if (
+				buf.totalBytes >= rangeConfig.minBytesBeforeStart &&
+				Date.now() >= backoffUntil
+			) {
 				preStartBufferByPort.delete(port)
 				const initialData: Buffer | Buffer[] = rangeConfig.isSrtp
 					? buf.chunks
@@ -254,39 +328,46 @@ const createPacketHandler = (
 		) {
 			kinesisIngestionPipeline.writePacket(port, data)
 		}
-	},
+	}
 
-	onStreamStart: async (port) => {
-		console.log(`[Main] Stream started on port ${port}`)
+	return {
+		onPacket: async (port, data, timestamp) =>
+			runSerializedPerPort(port, async () =>
+				processPacket(port, data, timestamp),
+			),
 
-		// Resume Kinesis pipeline only if we hold the lock (e.g. stream resume after brief inactivity)
-		if (kinesisIngestionPipeline && kinesisLockHeldForPorts.has(port)) {
-			void startPipelineOrReleaseLock(port).catch((err) => {
-				console.error(
-					`[Main] Error starting Kinesis ingestion for port ${port}:`,
-					err,
-				)
-			})
-		}
-	},
+		onStreamStart: async (port) => {
+			console.log(`[Main] Stream started on port ${port}`)
 
-	onStreamStop: async (port, inactivityDuration) => {
-		console.log(
-			`[Main] Stream stopped on port ${port} after ${inactivityDuration}ms`,
-		)
+			// Resume Kinesis pipeline only if we hold the lock (e.g. stream resume after brief inactivity)
+			if (kinesisIngestionPipeline && kinesisLockHeldForPorts.has(port)) {
+				void startPipelineOrReleaseLock(port).catch((err) => {
+					console.error(
+						`[Main] Error starting Kinesis ingestion for port ${port}:`,
+						err,
+					)
+				})
+			}
+		},
 
-		preStartBufferByPort.delete(port)
+		onStreamStop: async (port, inactivityDuration) => {
+			console.log(
+				`[Main] Stream stopped on port ${port} after ${inactivityDuration}ms`,
+			)
 
-		if (kinesisLockHeldForPorts.has(port)) {
-			await streamMetadataService.releaseKinesisLock(port, instanceId)
-			kinesisLockHeldForPorts.delete(port)
-		}
+			preStartBufferByPort.delete(port)
 
-		if (kinesisIngestionPipeline) {
-			await kinesisIngestionPipeline.stop(port)
-		}
-	},
-})
+			if (kinesisLockHeldForPorts.has(port)) {
+				await streamMetadataService.releaseKinesisLock(port, instanceId)
+				kinesisLockHeldForPorts.delete(port)
+			}
+
+			if (kinesisIngestionPipeline) {
+				await kinesisIngestionPipeline.stop(port)
+			}
+		},
+	}
+}
 
 const isSrtpPort = (port: number): boolean =>
 	srtpEnabled &&
