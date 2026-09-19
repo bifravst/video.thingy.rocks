@@ -225,36 +225,58 @@ void describe('KinesisIngestionPipeline', () => {
 		})
 	})
 
-	void describe('seedSrtpRoc / getSrtpRoc', () => {
+	void describe('seedSrtpRoc / getSrtpRoc / getSrtpRocState', () => {
 		const makePipeline = (): KinesisIngestionPipeline =>
 			new KinesisIngestionPipeline({
 				region: 'eu-central-1',
 				portRange: { start: 5000, end: 5009 },
 			})
 
-		void it('defaults to 0 for a port never observed or seeded', () => {
+		void it('defaults to {roc: 0, highestSeq: 0} for a port never observed or seeded', () => {
 			const pipeline = makePipeline()
 			assert.strictEqual(pipeline.getSrtpRoc(6000), 0)
+			assert.deepStrictEqual(pipeline.getSrtpRocState(6000), {
+				roc: 0,
+				highestSeq: 0,
+			})
 		})
 
-		void it('seeds an initial value', () => {
+		void it('seeds an initial state', () => {
 			const pipeline = makePipeline()
-			pipeline.seedSrtpRoc(6000, 5)
+			pipeline.seedSrtpRoc(6000, { roc: 5, highestSeq: 40000 })
+			assert.strictEqual(pipeline.getSrtpRoc(6000), 5)
+			assert.deepStrictEqual(pipeline.getSrtpRocState(6000), {
+				roc: 5,
+				highestSeq: 40000,
+			})
+		})
+
+		void it('never regresses a higher tracked extended index to a lower seeded one', () => {
+			const pipeline = makePipeline()
+			pipeline.seedSrtpRoc(6000, { roc: 5, highestSeq: 100 })
+			pipeline.seedSrtpRoc(6000, { roc: 3, highestSeq: 100 })
 			assert.strictEqual(pipeline.getSrtpRoc(6000), 5)
 		})
 
-		void it('never regresses a higher tracked value to a lower seeded one', () => {
+		void it('raises the tracked state when the seed has a higher extended index', () => {
 			const pipeline = makePipeline()
-			pipeline.seedSrtpRoc(6000, 5)
-			pipeline.seedSrtpRoc(6000, 3)
-			assert.strictEqual(pipeline.getSrtpRoc(6000), 5)
-		})
-
-		void it('raises the tracked value when the seed is higher', () => {
-			const pipeline = makePipeline()
-			pipeline.seedSrtpRoc(6000, 5)
-			pipeline.seedSrtpRoc(6000, 10)
+			pipeline.seedSrtpRoc(6000, { roc: 5, highestSeq: 100 })
+			pipeline.seedSrtpRoc(6000, { roc: 10, highestSeq: 100 })
 			assert.strictEqual(pipeline.getSrtpRoc(6000), 10)
+		})
+
+		void it('restores the full extended index, not just the ROC, so a live seq far above 0 is classified correctly', () => {
+			// Regression test: seeding ROC 5 while inventing highestSeq: 0 would make the next
+			// packet's candidate-ROC search compare against extended index 5*65536+0, so a
+			// packet with a high sequence number (e.g. 40000, which the sender was actually at
+			// when this ROC was persisted) looks closer to ROC 4 than ROC 5 and gets
+			// misclassified/ignored - seeding the real highestSeq avoids that.
+			const pipeline = makePipeline()
+			pipeline.seedSrtpRoc(6000, { roc: 5, highestSeq: 40000 })
+			// Advancing with a nearby, still-forward sequence number must not roll ROC back.
+			const state = pipeline.getSrtpRocState(6000)
+			assert.strictEqual(state.roc, 5)
+			assert.strictEqual(state.highestSeq, 40000)
 		})
 	})
 })

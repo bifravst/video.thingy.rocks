@@ -141,15 +141,22 @@ started" (not "Kinesis ingestion started") in application logs.
 
 - **Decryption/auth failures only after a restart, on an otherwise-healthy
   long-running stream** - likely an SRTP rollover counter (ROC) mismatch. The
-  backend tracks and persists the ROC per stream slot (in DynamoDB, `srtpRoc`)
-  by observing the plaintext RTP sequence number of every SRTP datagram, and
-  seeds a fresh GStreamer pipeline with it (see
-  `KinesisIngestionPipeline.trackSrtpRoc`/`seedSrtpRoc`/`getSrtpRoc`) - without
+  backend tracks and persists the ROC _and_ the highest RTP sequence number seen
+  under it per stream slot (in DynamoDB, `srtpRoc`/`srtpHighestSeq`) by
+  observing the plaintext RTP sequence number of every SRTP datagram - not just
+  while a pipeline is actively running, but for the whole lock-held window
+  (including while GStreamer has crashed and is waiting to restart) - and seeds
+  a fresh GStreamer pipeline with the full state (see
+  `KinesisIngestionPipeline.trackSrtpRoc`/`seedSrtpRoc`/`getSrtpRocState`). Both
+  fields are persisted together because restoring only the ROC (and inventing a
+  highest-sequence of 0) misclassifies the next real packet whenever the
+  sender's actual sequence number at restart time isn't near 0. Without any of
   this, a fresh `srtpdec` instance always starts at ROC 0, which breaks
   decryption for any restart (GStreamer crash, redeploy, EC2 reboot) after the
   sender's 16-bit sequence number has ever wrapped. This is a best-effort
-  estimate, not a guarantee - if it's ever visibly wrong, check the `srtpRoc`
-  value in the `StreamMetadata` DynamoDB item for the affected slot.
+  estimate, not a guarantee - if it's ever visibly wrong, check the
+  `srtpRoc`/`srtpHighestSeq` values in the `StreamMetadata` DynamoDB item for
+  the affected slot.
 
 - **Two producers competing for the same stream** - a device must use only one
   of the unencrypted or SRTP transports per assigned stream slot (see

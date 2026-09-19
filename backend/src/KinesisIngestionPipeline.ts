@@ -319,24 +319,44 @@ export class KinesisIngestionPipeline extends EventEmitter {
 
 	/** Current best-known SRTP ROC for a port (0 if never observed/seeded). */
 	getSrtpRoc(port: number): number {
-		return this.srtpRocByPort.get(port)?.roc ?? 0
+		return this.getSrtpRocState(port).roc
 	}
 
 	/**
-	 * Seeds this port's ROC from persisted state (see index.ts, which loads it from
-	 * DynamoDB before starting an SRTP port's pipeline, after checking the persisted value
-	 * still belongs to the currently-configured SSRC). Only raises the tracked value - never
-	 * regresses a live, more-current in-process estimate to an older persisted one (e.g. on
-	 * a same-process GStreamer-only restart, where we already have better information than
-	 * whatever was last flushed to DynamoDB).
+	 * Current best-known full SRTP rollover-tracking state for a port ({highestSeq: 0, roc: 0}
+	 * if never observed/seeded) - unlike getSrtpRoc, this includes highestSeq, which is
+	 * required to persist/restore tracking correctly (see seedSrtpRoc: restoring only the ROC
+	 * and inventing highestSeq: 0 misclassifies the next real packet whenever the sender's
+	 * current sequence number isn't actually near 0).
 	 */
-	seedSrtpRoc(port: number, roc: number): void {
+	getSrtpRocState(port: number): SrtpRocState {
+		return this.srtpRocByPort.get(port) ?? { highestSeq: 0, roc: 0 }
+	}
+
+	/**
+	 * Seeds this port's ROC-tracking state from persisted state (see index.ts, which loads it
+	 * from DynamoDB before starting an SRTP port's pipeline, after checking the persisted
+	 * value still belongs to the currently-configured SSRC). Takes the full extended-index
+	 * state (roc AND highestSeq), not just the ROC - seeding with an invented highestSeq: 0
+	 * would make advanceSrtpRoc misjudge the next real packet's candidate ROC whenever the
+	 * sender's actual sequence number at restart time isn't near 0 (e.g. restoring ROC 5 while
+	 * the sender is currently above 32768 would classify those packets as belonging to ROC 4
+	 * and ignore them, then misdetect the next real wrap as ROC 5 instead of 6). Only raises
+	 * the tracked extended index - never regresses a live, more-current in-process estimate to
+	 * an older persisted one (e.g. on a same-process GStreamer-only restart, where we already
+	 * have better information than whatever was last flushed to DynamoDB).
+	 */
+	seedSrtpRoc(port: number, seeded: SrtpRocState): void {
 		const state = this.srtpRocByPort.get(port)
 		if (!state) {
-			this.srtpRocByPort.set(port, { highestSeq: 0, roc })
+			this.srtpRocByPort.set(port, seeded)
 			return
 		}
-		if (roc > state.roc) state.roc = roc
+		const seededExtended = seeded.roc * 0x10000 + seeded.highestSeq
+		const currentExtended = state.roc * 0x10000 + state.highestSeq
+		if (seededExtended > currentExtended) {
+			this.srtpRocByPort.set(port, seeded)
+		}
 	}
 
 	/**
@@ -1087,11 +1107,20 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	 * reorder or coalesce these datagrams itself.
 	 */
 	writePacket(port: number, data: Buffer): void {
+		// Track ROC unconditionally for SRTP ports, even if no pipeline is currently
+		// registered (e.g. the lock-held window between an unexpected GStreamer exit and its
+		// throttled restart in index.ts - see the 'pipelineExited' handler there). Without
+		// this, sequence numbers observed only during that window are invisible to ROC
+		// tracking, so a rollover happening while the pipeline is down is missed entirely and
+		// the eventual restart is seeded with a stale ROC.
+		if (this.isSrtpPort(port)) {
+			this.trackSrtpRoc(port, data)
+		}
+
 		const pipeline = this.activePipelines.get(port)
 		if (!pipeline) return
 
 		if (pipeline.transport === 'srtp-relay') {
-			this.trackSrtpRoc(port, data)
 			if (!pipeline.ready) {
 				// Startup replay is still in flight - queue rather than send now, so this
 				// datagram can't overtake the older, still-buffered ones (see `ready` above).

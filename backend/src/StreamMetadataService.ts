@@ -27,10 +27,17 @@ export type StreamMetadata = {
 	 * KinesisIngestionPipeline.getSrtpRoc/seedSrtpRoc. Only meaningful when the device uses
 	 * the SRTP transport; absent/0 otherwise. */
 	srtpRoc?: number
-	/** The SSRC srtpRoc was recorded under. A key/device change gives the port a new SSRC,
-	 * at which point a persisted ROC from the *previous* session is meaningless (that
-	 * session's sequence numbers have nothing to do with a fresh one starting near 0) and
-	 * must not be used to seed it - see getSrtpRoc, which checks this before trusting srtpRoc. */
+	/** The highest RTP sequence number observed under srtpRoc (see
+	 * KinesisIngestionPipeline.SrtpRocState) - persisted alongside srtpRoc because restoring
+	 * only the ROC and inventing a highestSeq of 0 misclassifies the next real packet
+	 * whenever the sender's actual sequence number at restart time isn't near 0 (see
+	 * getSrtpRocState). */
+	srtpHighestSeq?: number
+	/** The SSRC srtpRoc/srtpHighestSeq were recorded under. A key/device change gives the
+	 * port a new SSRC, at which point persisted state from the *previous* session is
+	 * meaningless (that session's sequence numbers have nothing to do with a fresh one
+	 * starting near 0) and must not be used to seed it - see getSrtpRocState, which checks
+	 * this before trusting srtpRoc/srtpHighestSeq. */
 	srtpRocSsrc?: number
 	createdAt: string
 	updatedAt: string
@@ -249,17 +256,22 @@ export class StreamMetadataService {
 	}
 
 	/**
-	 * Reads the persisted SRTP rollover counter for a stream slot (0 if never persisted, or
-	 * if it was persisted under a different SSRC - see srtpRocSsrc on StreamMetadata; a
-	 * stale ROC from a previous session/device must never seed a fresh one). Called once
-	 * before starting an SRTP port's pipeline, to seed srtpdec correctly across process
-	 * restarts (see KinesisIngestionPipeline.seedSrtpRoc) - a fresh GStreamer instance always
-	 * starts at ROC 0 otherwise, which breaks decryption after any sequence number rollover
-	 * in the sender's session. Uses a strongly consistent read: this runs right before
-	 * seeding a fresh pipeline after a lock handoff, so an eventually-consistent read could
-	 * still return the *previous* owner's now-stale value even after it persisted a newer one.
+	 * Reads the persisted SRTP rollover-tracking state for a stream slot ({roc: 0, highestSeq:
+	 * 0} if never persisted, or if it was persisted under a different SSRC - see srtpRocSsrc
+	 * on StreamMetadata; stale state from a previous session/device must never seed a fresh
+	 * one). Called once before starting an SRTP port's pipeline, to seed srtpdec correctly
+	 * across process restarts (see KinesisIngestionPipeline.seedSrtpRoc) - a fresh GStreamer
+	 * instance always starts at ROC 0 otherwise, which breaks decryption after any sequence
+	 * number rollover in the sender's session. Restoring only the ROC (inventing highestSeq:
+	 * 0) is itself unsafe - see seedSrtpRoc - so both fields are persisted and restored
+	 * together. Uses a strongly consistent read: this runs right before seeding a fresh
+	 * pipeline after a lock handoff, so an eventually-consistent read could still return the
+	 * *previous* owner's now-stale value even after it persisted a newer one.
 	 */
-	async getSrtpRoc(port: number, expectedSsrc: number): Promise<number> {
+	async getSrtpRocState(
+		port: number,
+		expectedSsrc: number,
+	): Promise<{ roc: number; highestSeq: number }> {
 		try {
 			const result = await this.docClient.send(
 				new GetCommand({
@@ -269,34 +281,42 @@ export class StreamMetadataService {
 				}),
 			)
 			const roc: unknown = result.Item?.srtpRoc
+			const highestSeq: unknown = result.Item?.srtpHighestSeq
 			const storedSsrc: unknown = result.Item?.srtpRocSsrc
-			if (typeof roc !== 'number' || storedSsrc !== expectedSsrc) return 0
-			return roc
+			if (
+				typeof roc !== 'number' ||
+				typeof highestSeq !== 'number' ||
+				storedSsrc !== expectedSsrc
+			) {
+				return { roc: 0, highestSeq: 0 }
+			}
+			return { roc, highestSeq }
 		} catch (error) {
 			console.error(
-				`[StreamMetadataService] Error reading SRTP ROC for port ${port}:`,
+				`[StreamMetadataService] Error reading SRTP ROC state for port ${port}:`,
 				error,
 			)
-			return 0
+			return { roc: 0, highestSeq: 0 }
 		}
 	}
 
 	/**
-	 * Persists the current SRTP ROC (tagged with the SSRC it was observed under - see
-	 * srtpRocSsrc) for a stream slot, throttled to once per srtpRocUpdateThrottleMs unless
-	 * `force` is set (e.g. on stream stop, to capture the latest value before the slot
-	 * potentially gets reassigned). Only succeeds if `instanceId` currently holds the
-	 * Kinesis lock for this slot - without that check, a process whose heartbeat condition
-	 * already failed (or that already released the slot) could overwrite the current
-	 * owner's ROC with stale data and break a later restart. Returns false (without
-	 * throwing) if the caller no longer owns the slot, or if the write otherwise fails -
-	 * callers must treat that as having lost the lock and stop writing/relinquish their
-	 * local pipeline, not just log and continue.
+	 * Persists the current SRTP rollover-tracking state (roc and highestSeq, tagged with the
+	 * SSRC they were observed under - see srtpRocSsrc) for a stream slot, throttled to once
+	 * per srtpRocUpdateThrottleMs unless `force` is set (e.g. on stream stop, to capture the
+	 * latest value before the slot potentially gets reassigned). Only succeeds if
+	 * `instanceId` currently holds the Kinesis lock for this slot - without that check, a
+	 * process whose heartbeat condition already failed (or that already released the slot)
+	 * could overwrite the current owner's state with stale data and break a later restart.
+	 * Returns false (without throwing) if the caller no longer owns the slot, or if the write
+	 * otherwise fails - callers must treat that as having lost the lock and stop
+	 * writing/relinquish their local pipeline, not just log and continue.
 	 */
 	async updateSrtpRoc(
 		port: number,
 		instanceId: string,
 		roc: number,
+		highestSeq: number,
 		ssrc: number,
 		force = false,
 	): Promise<boolean> {
@@ -311,9 +331,10 @@ export class StreamMetadataService {
 					TableName: this.tableName,
 					Key: { port },
 					UpdateExpression:
-						'SET srtpRoc = :roc, srtpRocSsrc = :ssrc, updatedAt = :updatedAt',
+						'SET srtpRoc = :roc, srtpHighestSeq = :highestSeq, srtpRocSsrc = :ssrc, updatedAt = :updatedAt',
 					ExpressionAttributeValues: {
 						':roc': roc,
+						':highestSeq': highestSeq,
 						':ssrc': ssrc,
 						':updatedAt': new Date().toISOString(),
 						':instanceId': instanceId,

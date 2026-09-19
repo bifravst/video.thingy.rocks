@@ -141,6 +141,33 @@ const withSlotLock = async <T>(
 }
 
 /**
+ * Per-port ownership epoch, bumped every time this instance stops being the local owner of a
+ * port (see clearLockHeld) or becomes one (see setLockHeld). startPipelineOrReleaseLock
+ * captures the current value synchronously on entry and rechecks it after every await -
+ * without this, a still-running (but now-stale) invocation that started before ownership
+ * changed hands (lost via relinquishPort/onStreamStop, or re-acquired later as a new
+ * ownership session) could resume after its await and register a pipeline or touch
+ * lock/backoff state that no longer belongs to it.
+ */
+const portGeneration = new Map<number, number>()
+
+const bumpPortGeneration = (port: number): void => {
+	portGeneration.set(port, (portGeneration.get(port) ?? 0) + 1)
+}
+
+/** Marks this instance as the local owner of a port's lock and starts a new ownership epoch. */
+const setLockHeld = (port: number): void => {
+	kinesisLockHeldForPorts.add(port)
+	bumpPortGeneration(port)
+}
+
+/** Clears local ownership of a port's lock and ends its ownership epoch. */
+const clearLockHeld = (port: number): void => {
+	kinesisLockHeldForPorts.delete(port)
+	bumpPortGeneration(port)
+}
+
+/**
  * Stops the local pipeline and clears our in-process lock bookkeeping for a port, without
  * touching DynamoDB - used when a conditional write (updateSrtpRoc) reports we're no longer
  * the slot's owner there, so there is nothing left for us to release; continuing to run
@@ -151,7 +178,7 @@ const relinquishPort = async (port: number): Promise<void> => {
 	console.warn(
 		`[Main] Lost Kinesis lock for port ${port}; stopping local pipeline`,
 	)
-	kinesisLockHeldForPorts.delete(port)
+	clearLockHeld(port)
 	if (kinesisIngestionPipeline) {
 		await kinesisIngestionPipeline.stop(port)
 	}
@@ -203,17 +230,24 @@ const startPipelineOrReleaseLock = async (
 	if (!kinesisIngestionPipeline) return
 	const slot = kinesisIngestionPipeline.streamSlotForPort(port)
 
+	// Captured synchronously (before any await below) - see portGeneration's doc comment.
+	const generation = portGeneration.get(port) ?? 0
+	const isStale = (): boolean =>
+		(portGeneration.get(port) ?? 0) !== generation ||
+		!kinesisLockHeldForPorts.has(port)
+
 	if (kinesisIngestionPipeline.isSrtpPort(port)) {
 		// Seed from persisted state before spawning - a fresh srtpdec instance always starts
 		// at ROC 0 otherwise, which breaks decryption after any sequence-number rollover in
-		// the sender's session (see KinesisIngestionPipeline.seedSrtpRoc/getSrtpRoc).
-		// getSrtpRoc never throws (returns 0 on error), so no try/catch needed here. Only
-		// trusts a persisted ROC recorded under the currently-configured SSRC - a stale
+		// the sender's session (see KinesisIngestionPipeline.seedSrtpRoc/getSrtpRocState).
+		// getSrtpRocState never throws (returns zeros on error), so no try/catch needed here.
+		// Only trusts persisted state recorded under the currently-configured SSRC - a stale
 		// value from a previous key/device would misseed a genuinely fresh session.
 		const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
 		if (ssrc !== undefined) {
-			const persistedRoc = await streamMetadataService.getSrtpRoc(slot, ssrc)
-			kinesisIngestionPipeline.seedSrtpRoc(port, persistedRoc)
+			const persisted = await streamMetadataService.getSrtpRocState(slot, ssrc)
+			if (isStale()) return // ownership changed while awaiting DynamoDB; abandon
+			kinesisIngestionPipeline.seedSrtpRoc(port, persisted)
 		}
 	}
 
@@ -228,6 +262,19 @@ const startPipelineOrReleaseLock = async (
 		)
 		failed = true
 	}
+
+	if (isStale()) {
+		// Ownership was lost (or re-acquired as a new epoch) while start() was in flight -
+		// this invocation no longer speaks for the port. Stop whatever it may have just
+		// registered rather than leaving an unowned producer running, but don't touch
+		// lock/backoff/buffer state below - that belongs to whichever invocation now owns
+		// (or cleanly released) this port's epoch.
+		if (kinesisIngestionPipeline.isActive(port)) {
+			await kinesisIngestionPipeline.stop(port)
+		}
+		return
+	}
+
 	if (!failed) {
 		nextStartAttemptAllowedAtByPort.delete(port)
 		return
@@ -236,7 +283,7 @@ const startPipelineOrReleaseLock = async (
 	console.error(
 		`[Main] Kinesis ingestion pipeline failed to start for port ${port}; releasing lock`,
 	)
-	kinesisLockHeldForPorts.delete(port)
+	clearLockHeld(port)
 	try {
 		await streamMetadataService.releaseKinesisLock(slot, instanceId)
 	} catch (err) {
@@ -263,9 +310,15 @@ const startPipelineOrReleaseLock = async (
 	preStartBufferByPort.set(port, { chunks, totalBytes })
 }
 
+/** A PacketHandler plus a hook shutdown() uses to drain this handler's per-port queues before
+ * stopping pipelines/releasing locks (see waitForAllQueuesIdle). */
+type PacketHandlerWithQueueDrain = PacketHandler & {
+	waitForAllQueuesIdle: () => Promise<void>
+}
+
 const createPacketHandler = (
 	rangeConfig: PacketHandlerRangeConfig,
-): PacketHandler => {
+): PacketHandlerWithQueueDrain => {
 	const processPacket = async (
 		port: number,
 		data: Buffer,
@@ -317,9 +370,16 @@ const createPacketHandler = (
 				buf.totalBytes >= rangeConfig.minBytesBeforeStart &&
 				Date.now() >= backoffUntil
 			) {
-				preStartBufferByPort.delete(port)
+				// Captured for startup, but the buffer itself is NOT cleared yet - only once
+				// acquisition has actually succeeded, below. Deleting it unconditionally here
+				// (as before) meant that if the paired-port recheck or tryAcquireKinesisLock
+				// returned false/threw, nothing re-armed it (startPipelineOrReleaseLock only
+				// re-arms on its own failure path, which never runs in these cases) - this
+				// instance could then never retry, since the stream is already 'active' and
+				// none of isFirstPacket/isResume/preStartBufferByPort.has(port) would trigger
+				// buffering again on a later packet.
 				const initialData: Buffer | Buffer[] = rangeConfig.isSrtp
-					? buf.chunks
+					? [...buf.chunks]
 					: Buffer.concat(buf.chunks)
 				packetAlreadyInInitialData = true
 				const slot = kinesisIngestionPipeline.streamSlotForPort(port)
@@ -337,16 +397,16 @@ const createPacketHandler = (
 							pairedPortNow !== undefined &&
 							kinesisLockHeldForPorts.has(pairedPortNow)
 						) {
-							return
+							return // buffer stays armed; a later packet will retry
 						}
 						const acquired = await streamMetadataService.tryAcquireKinesisLock(
 							slot,
 							instanceId,
 						)
-						if (acquired) {
-							kinesisLockHeldForPorts.add(port)
-							await startPipelineOrReleaseLock(port, initialData)
-						}
+						if (!acquired) return // buffer stays armed; a later packet will retry
+						preStartBufferByPort.delete(port)
+						setLockHeld(port)
+						await startPipelineOrReleaseLock(port, initialData)
 					})
 				} catch (err) {
 					console.error(
@@ -356,8 +416,6 @@ const createPacketHandler = (
 				}
 			}
 		}
-
-		streamStateManager.onPacketReceived(port, timestamp)
 
 		// Only update DynamoDB lastPacketTime if we hold the lock
 		if (kinesisIngestionPipeline && kinesisLockHeldForPorts.has(port)) {
@@ -372,17 +430,19 @@ const createPacketHandler = (
 				console.error(`[Main] Error updating DynamoDB for port ${port}:`, err)
 			}
 
-			// Persist the best-known SRTP ROC alongside the heartbeat (throttled internally,
-			// safe to call every packet) - see KinesisIngestionPipeline.getSrtpRoc. If this
-			// reports we're no longer the slot's owner (a condition-checked write), stop
-			// writing to Kinesis for a stream we've lost the lock for instead of continuing
-			// as a competing producer.
+			// Persist the best-known SRTP rollover-tracking state alongside the heartbeat
+			// (throttled internally, safe to call every packet) - see
+			// KinesisIngestionPipeline.getSrtpRocState. If this reports we're no longer the
+			// slot's owner (a condition-checked write), stop writing to Kinesis for a stream
+			// we've lost the lock for instead of continuing as a competing producer.
 			const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
 			if (ssrc !== undefined) {
+				const rocState = kinesisIngestionPipeline.getSrtpRocState(port)
 				const stillOwner = await streamMetadataService.updateSrtpRoc(
 					slot,
 					instanceId,
-					kinesisIngestionPipeline.getSrtpRoc(port),
+					rocState.roc,
+					rocState.highestSeq,
 					ssrc,
 				)
 				if (!stillOwner) {
@@ -425,7 +485,41 @@ const createPacketHandler = (
 	>()
 	const maxQueuedBytes = rangeConfig.minBytesBeforeStart * 2
 
+	/**
+	 * Resolves once this port's queue has fully drained (no items queued, nothing currently
+	 * processing) - used to serialize onStreamStop/shutdown against packets that were already
+	 * queued before the stop/shutdown was requested (see enqueuePacket/onStreamStop). Bounded
+	 * by the same network-call timeouts processPacket's awaited work already has.
+	 */
+	const waitForPortQueueIdle = async (port: number): Promise<void> => {
+		for (;;) {
+			const state = queueStateByPort.get(port)
+			if (!state || (!state.draining && state.queue.length === 0)) return
+			await new Promise((resolve) => setTimeout(resolve, 20))
+		}
+	}
+
+	/** Same as waitForPortQueueIdle, but across every port this handler has ever queued -
+	 * used by shutdown(), which must drain both the unencrypted and SRTP handlers' queues. */
+	const waitForAllQueuesIdle = async (): Promise<void> => {
+		for (;;) {
+			const anyBusy = Array.from(queueStateByPort.values()).some(
+				(state) => state.draining || state.queue.length > 0,
+			)
+			if (!anyBusy) return
+			await new Promise((resolve) => setTimeout(resolve, 20))
+		}
+	}
+
 	const enqueuePacket = (port: number, data: Buffer, timestamp: Date): void => {
+		// Record receipt immediately, not after this packet works its way through the queue -
+		// streamStateManager's inactivity timer/active-state must reflect true receipt time.
+		// Deferring this into processPacket (as before) meant a backed-up queue (slow
+		// DynamoDB, credential retries, the paced SRTP startup replay) could delay it long
+		// enough for the inactivity timeout to fire a spurious onStreamStop while packets were
+		// still arriving, just not yet processed.
+		streamStateManager.onPacketReceived(port, timestamp)
+
 		let state = queueStateByPort.get(port)
 		if (!state) {
 			state = { queue: [], totalBytes: 0, draining: false }
@@ -464,6 +558,8 @@ const createPacketHandler = (
 			enqueuePacket(port, data, timestamp)
 		},
 
+		waitForAllQueuesIdle,
+
 		onStreamStart: async (port) => {
 			console.log(`[Main] Stream started on port ${port}`)
 
@@ -483,6 +579,13 @@ const createPacketHandler = (
 				`[Main] Stream stopped on port ${port} after ${inactivityDuration}ms`,
 			)
 
+			// Wait for any packets already queued (enqueued before this stop event fired) to
+			// finish processing before doing anything else. onPacket only enqueues (see
+			// enqueuePacket) - without this, work still sitting in the queue could keep
+			// running writePacket()/lock-acquire logic *after* we stop the pipeline and
+			// release the lock below, racing the handoff this ordering is meant to guarantee.
+			await waitForPortQueueIdle(port)
+
 			preStartBufferByPort.delete(port)
 
 			// Stop the producer *before* releasing the lock (and before persisting final
@@ -497,21 +600,23 @@ const createPacketHandler = (
 			if (kinesisIngestionPipeline && kinesisLockHeldForPorts.has(port)) {
 				const slot = kinesisIngestionPipeline.streamSlotForPort(port)
 
-				// Force (bypass the throttle) so the freshest ROC is captured before this
+				// Force (bypass the throttle) so the freshest state is captured before this
 				// slot potentially gets reassigned to a different port/instance.
 				const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
 				if (kinesisIngestionPipeline.isSrtpPort(port) && ssrc !== undefined) {
+					const rocState = kinesisIngestionPipeline.getSrtpRocState(port)
 					await streamMetadataService.updateSrtpRoc(
 						slot,
 						instanceId,
-						kinesisIngestionPipeline.getSrtpRoc(port),
+						rocState.roc,
+						rocState.highestSeq,
 						ssrc,
 						true,
 					)
 				}
 
 				await streamMetadataService.releaseKinesisLock(slot, instanceId)
-				kinesisLockHeldForPorts.delete(port)
+				clearLockHeld(port)
 			}
 		},
 	}
@@ -634,6 +739,15 @@ const shutdown = async (): Promise<void> => {
 	await udpListener.stop()
 	await srtpUdpListener?.stop()
 	streamStateManager.stop()
+
+	// Sockets are stopped above, so no new packets can be enqueued from here on - wait for
+	// anything already queued (enqueued before shutdown began) to finish processing before
+	// stopping pipelines/releasing locks below, for the same reason onStreamStop does: queued
+	// work left running afterward could still call writePacket()/re-acquire a lock this
+	// shutdown is about to release.
+	await mainPacketHandler.waitForAllQueuesIdle()
+	await srtpPacketHandler?.waitForAllQueuesIdle()
+
 	preStartBufferByPort.clear()
 
 	// Stop every producer *before* releasing any locks - see the same ordering rationale in
@@ -649,10 +763,12 @@ const shutdown = async (): Promise<void> => {
 			kinesisIngestionPipeline?.isSrtpPort(port) === true &&
 			ssrc !== undefined
 		) {
+			const rocState = kinesisIngestionPipeline.getSrtpRocState(port)
 			await streamMetadataService.updateSrtpRoc(
 				slot,
 				instanceId,
-				kinesisIngestionPipeline.getSrtpRoc(port),
+				rocState.roc,
+				rocState.highestSeq,
 				ssrc,
 				true,
 			)
