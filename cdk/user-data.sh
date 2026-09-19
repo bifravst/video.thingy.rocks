@@ -80,6 +80,10 @@ Environment="TABLE_NAME=__TABLE_NAME__"
 Environment="OUTPUT_DIR=/var/video-streams"
 Environment="TRANSCODING_OUTPUT_DIR=/tmp/video-streams/transcoding"
 Environment="KINESIS_STREAM_PREFIX=__KINESIS_STREAM_PREFIX__"
+Environment="SRTP_STREAM_PREFIX=__SRTP_STREAM_PREFIX__"
+Environment="SRTP_KEY_PARAMETER_PREFIX=__SRTP_KEY_PARAMETER_PREFIX__"
+Environment="SRTP_PORT_RANGE_START=__SRTP_PORT_RANGE_START__"
+Environment="SRTP_PORT_RANGE_END=__SRTP_PORT_RANGE_END__"
 Environment="GST_PLUGIN_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build"
 Environment="LD_LIBRARY_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build"
 ExecStart=/usr/bin/node --max-old-space-size=16384 --experimental-transform-types --no-warnings src/index.ts
@@ -126,6 +130,16 @@ if ! (
 ); then
   echo "WARNING: kvssink build failed or skipped; Kinesis ingestion will not work until the plugin is available. Check $KINESIS_BUILD_LOG and /var/log/cloud-init-output.log."
 fi
+
+# Verify the GStreamer elements the SRTP ingestion path needs are present. These ship in the
+# gstreamer1-plugins-base/good/bad-free packages already installed above; this check is
+# non-fatal (SRTP ingestion just won't work until they're available) so it never blocks the
+# unencrypted MPEG-TS path from starting.
+for element in udpsrc srtpdec rtpjitterbuffer rtph264depay; do
+  if ! gst-inspect-1.0 "$element" > /dev/null 2>&1; then
+    echo "WARNING: GStreamer element '$element' not found; SRTP ingestion will not work until it is available."
+  fi
+done
 
 # Configure CloudWatch Logs agent
 cat > /opt/aws/amazon-cloudwatch-agent/etc/cloudwatch-config.json << 'EOF'

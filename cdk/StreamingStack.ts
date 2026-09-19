@@ -37,6 +37,7 @@ export class StreamingStack extends Stack {
 	public readonly autoScalingGroup: autoscaling.AutoScalingGroup
 	public readonly codeBucket: s3.Bucket
 	public readonly kinesisVideoStreams: kinesisvideo.CfnStream[] = []
+	public readonly kinesisVideoStreamsSrtp: kinesisvideo.CfnStream[] = []
 	public readonly networkLoadBalancer: elbv2.NetworkLoadBalancer
 
 	constructor(
@@ -111,6 +112,25 @@ export class StreamingStack extends Stack {
 			this.kinesisVideoStreams.push(stream)
 		}
 
+		// SRTP Kinesis Video Streams: one per SRTP UDP port (6000-6009). Kept in a separate
+		// set of streams (distinct name prefix) so the encrypted and unencrypted ingestion
+		// paths' lifecycles/alarms never conflate.
+		const srtpStreamPortStart = 6000
+		const srtpStreamPortEnd = 6009
+		const srtpStreamPrefix = `${this.stackName}-video-srtp`
+		for (let port = srtpStreamPortStart; port <= srtpStreamPortEnd; port++) {
+			const stream = new kinesisvideo.CfnStream(
+				this,
+				`KinesisVideoStreamSrtp${port}`,
+				{
+					name: `${srtpStreamPrefix}-${port}`,
+					dataRetentionInHours: Duration.days(30).toHours(),
+					mediaType: 'video/h264',
+				},
+			)
+			this.kinesisVideoStreamsSrtp.push(stream)
+		}
+
 		this.udpSecurityGroup = new ec2.SecurityGroup(this, 'UDPSecurityGroup', {
 			vpc: this.vpc,
 			description: 'Security group for UDP video ingestion',
@@ -128,6 +148,17 @@ export class StreamingStack extends Stack {
 			ec2.Peer.anyIpv6(),
 			ec2.Port.udpRange(5000, 5009),
 			'Allow UDP video ingestion on ports 5000-5009 (IPv6)',
+		)
+		// Allow UDP ingress on ports 6000-6009 (SRTP-encrypted RTP/H.264)
+		this.udpSecurityGroup.addIngressRule(
+			ec2.Peer.anyIpv4(),
+			ec2.Port.udpRange(6000, 6009),
+			'Allow SRTP video ingestion on ports 6000-6009',
+		)
+		this.udpSecurityGroup.addIngressRule(
+			ec2.Peer.anyIpv6(),
+			ec2.Port.udpRange(6000, 6009),
+			'Allow SRTP video ingestion on ports 6000-6009 (IPv6)',
 		)
 		// Allow TCP health checks from NLB (originates within VPC)
 		this.udpSecurityGroup.addIngressRule(
@@ -177,6 +208,18 @@ export class StreamingStack extends Stack {
 					'kinesisvideo:PutMedia',
 				],
 				resources: ['*'],
+			}),
+		)
+
+		// Grant read access to SRTP static pre-shared keys (SecureString parameters,
+		// provisioned out-of-band via scripts/provision-srtp-key.sh, never by CDK)
+		this.ec2Role.addToPolicy(
+			new iam.PolicyStatement({
+				effect: iam.Effect.ALLOW,
+				actions: ['ssm:GetParameter', 'ssm:GetParameters'],
+				resources: [
+					`arn:aws:ssm:${this.region}:${this.account}:parameter/${this.stackName}/srtp/*`,
+				],
 			}),
 		)
 
@@ -242,6 +285,10 @@ export class StreamingStack extends Stack {
 			.replace(/__TABLE_NAME__/g, this.streamTable.tableName)
 			.replace(/__KINESIS_STREAM_PREFIX__/g, kinesisStreamPrefix)
 			.replace(/__CODE_BUCKET__/g, this.codeBucket.bucketName)
+			.replace(/__SRTP_STREAM_PREFIX__/g, srtpStreamPrefix)
+			.replace(/__SRTP_KEY_PARAMETER_PREFIX__/g, `/${this.stackName}/srtp/port`)
+			.replace(/__SRTP_PORT_RANGE_START__/g, String(srtpStreamPortStart))
+			.replace(/__SRTP_PORT_RANGE_END__/g, String(srtpStreamPortEnd))
 
 		const userData = ec2.UserData.custom(userDataScript)
 
@@ -379,9 +426,54 @@ export class StreamingStack extends Stack {
 			})
 		}
 
+		// Create target groups + UDP listeners for SRTP ports 6000-6009 (same fleet, same
+		// stickiness/health-check pattern as the unencrypted 5000-5009 target groups above)
+		const srtpTargetGroups: elbv2.NetworkTargetGroup[] = []
+		for (let port = 6000; port <= 6009; port++) {
+			const targetGroup = new elbv2.NetworkTargetGroup(
+				this,
+				`SrtpTargetGroup${port}`,
+				{
+					vpc: this.vpc,
+					port,
+					protocol: elbv2.Protocol.UDP,
+					targetType: elbv2.TargetType.INSTANCE,
+					ipAddressType: elbv2.TargetGroupIpAddressType.IPV6,
+					healthCheck: {
+						protocol: elbv2.Protocol.TCP,
+						port: '9999',
+						healthyThresholdCount: 2,
+						unhealthyThresholdCount: 2,
+						interval: Duration.seconds(10),
+						timeout: Duration.seconds(10),
+					},
+					deregistrationDelay: Duration.seconds(30),
+					preserveClientIp: true,
+				},
+			)
+
+			targetGroup.setAttribute('stickiness.enabled', 'true')
+			targetGroup.setAttribute('stickiness.type', 'source_ip')
+
+			srtpTargetGroups.push(targetGroup)
+		}
+
+		for (let i = 0; i < srtpTargetGroups.length; i++) {
+			const port = 6000 + i
+			const targetGroup = srtpTargetGroups[i]
+			if (!targetGroup) {
+				throw new Error(`SRTP target group for port ${port} is undefined`)
+			}
+			this.networkLoadBalancer.addListener(`SrtpUDPListener${port}`, {
+				port,
+				protocol: elbv2.Protocol.UDP,
+				defaultAction: elbv2.NetworkListenerAction.forward([targetGroup]),
+			})
+		}
+
 		// Attach all target groups to the Auto Scaling Group
 		// This enables automatic registration/deregistration of instances
-		for (const targetGroup of targetGroups) {
+		for (const targetGroup of [...targetGroups, ...srtpTargetGroups]) {
 			this.autoScalingGroup.attachToNetworkTargetGroup(targetGroup)
 		}
 
@@ -595,6 +687,63 @@ export class StreamingStack extends Stack {
 			new cloudwatch_actions.SnsAction(restartIngestionTopic),
 		)
 
+		// Same composite alarm as above, for the SRTP stream set. Kept separate (rather than
+		// merged into the alarm above) so SRTP's traffic during initial rollout doesn't get
+		// conflated with the unencrypted path's alarm history/thresholds.
+		const kvsIncomingMetricsSrtp: Record<string, cloudwatch.IMetric> = {}
+		this.kinesisVideoStreamsSrtp.forEach((_, i) => {
+			const port = srtpStreamPortStart + i
+			const streamName = `${srtpStreamPrefix}-${port}`
+			kvsIncomingMetricsSrtp[`s${i}`] = new cloudwatch.Metric({
+				namespace: 'AWS/KinesisVideo',
+				metricName: 'PutMedia.IncomingBytes',
+				dimensionsMap: { StreamName: streamName },
+				statistic: 'Sum',
+				period: Duration.minutes(1),
+			})
+		})
+		const kvsIncomingSumSrtp = new cloudwatch.MathExpression({
+			expression: this.kinesisVideoStreamsSrtp.map((_, i) => `s${i}`).join('+'),
+			usingMetrics: kvsIncomingMetricsSrtp,
+			period: Duration.minutes(1),
+			label: 'PutMedia Incoming Bytes (all SRTP streams)',
+		})
+		const kvsNoIngestionAlarmSrtp = new cloudwatch.Alarm(
+			this,
+			'SrtpKVSNoPutMediaIngestionAlarm',
+			{
+				alarmName: `${Stack.of(this).stackName}-SRTP-KVS-PutMedia-Incoming-Zero`,
+				alarmDescription:
+					'Sum of PutMedia.IncomingBytes across all SRTP Kinesis Video Streams is 0',
+				metric: kvsIncomingSumSrtp,
+				threshold: 0,
+				evaluationPeriods: 5,
+				comparisonOperator:
+					cloudwatch.ComparisonOperator.LESS_THAN_OR_EQUAL_TO_THRESHOLD,
+				treatMissingData: cloudwatch.TreatMissingData.BREACHING,
+			},
+		)
+
+		const srtpTrafficNoIngestionAlarm = new cloudwatch.CompositeAlarm(
+			this,
+			'SrtpTrafficNoKinesisIngestionAlarm',
+			{
+				alarmRule: cloudwatch.AlarmRule.allOf(
+					cloudwatch.AlarmRule.not(nlbUdpBytesAlarm),
+					kvsNoIngestionAlarmSrtp,
+				),
+				alarmDescription:
+					'NLB UDP processed bytes > 1 MB/s but PutMedia incoming data across all SRTP Kinesis Video Streams is 0',
+				compositeAlarmName: `${Stack.of(this).stackName}-SRTP-Traffic-No-KVS-Ingestion`,
+			},
+		)
+		srtpTrafficNoIngestionAlarm.addAlarmAction(
+			new cloudwatch_actions.SnsAction(alarmTopic),
+		)
+		srtpTrafficNoIngestionAlarm.addAlarmAction(
+			new cloudwatch_actions.SnsAction(restartIngestionTopic),
+		)
+
 		// CDK Outputs
 		new CfnOutput(this, 'StreamMetadataTableName', {
 			value: this.streamTable.tableName,
@@ -626,7 +775,7 @@ export class StreamingStack extends Stack {
 		// NLB Outputs
 		new CfnOutput(this, 'NLBDnsName', {
 			value: this.networkLoadBalancer.loadBalancerDnsName,
-			description: `Network Load Balancer DNS name for UDP video streaming (ports 5000-5009). Dual-stack: resolves to both A (IPv4) and AAAA (IPv6) records.`,
+			description: `Network Load Balancer DNS name for UDP video streaming (unencrypted MPEG-TS/H.264 on ports 5000-5009, SRTP-encrypted RTP/H.264 on ports 6000-6009). Dual-stack: resolves to both A (IPv4) and AAAA (IPv6) records.`,
 		})
 
 		new CfnOutput(this, 'NLBIPv4Address', {

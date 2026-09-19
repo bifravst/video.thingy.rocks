@@ -2,6 +2,7 @@ import { fromNodeProviderChain } from '@aws-sdk/credential-providers'
 import { HealthServer } from './HealthServer.ts'
 import { resolveInstanceId } from './InstanceId.ts'
 import { KinesisIngestionPipeline } from './KinesisIngestionPipeline.ts'
+import { SrtpKeyStore } from './SrtpKeyStore.ts'
 import { StreamMetadataService } from './StreamMetadataService.ts'
 import { StreamStateManager } from './StreamStateManager.ts'
 import { UDPListener, type PacketHandler } from './UDPListener.ts'
@@ -33,10 +34,11 @@ const ensureAwsCredentials = async (): Promise<void> => {
  * Main entry point for the UDP video ingestion service.
  *
  * This service:
- * - Listens for UDP packets on ports 5000-5009
+ * - Listens for UDP packets on ports 5000-5009 (unencrypted MPEG-TS/H.264), and optionally
+ *   6000-6009 (SRTP-encrypted RTP/H.264, static pre-shared key)
  * - Tracks stream state (active/inactive)
  * - Updates DynamoDB with stream metadata
- * - Optionally sends UDP/MPEG-TS to Kinesis Video Streams (GStreamer (TS -> H.264) -> kvssink -> Kinesis Video)
+ * - Optionally sends both to Kinesis Video Streams via kvssink (GStreamer)
  */
 
 const KINESIS_MIN_BYTES_BEFORE_START =
@@ -60,6 +62,13 @@ const config = {
 		process.env.KINESIS_INGESTION_LOG_GSTREAMER === 'true' ||
 		process.env.KINESIS_INGESTION_LOG_GSTREAMER === '1',
 	kinesisMinBytesBeforeStart: KINESIS_MIN_BYTES_BEFORE_START,
+	srtpPortRange: {
+		start: Number(process.env.SRTP_PORT_RANGE_START ?? 6000),
+		end: Number(process.env.SRTP_PORT_RANGE_END ?? 6009),
+	},
+	srtpStreamPrefix: process.env.SRTP_STREAM_PREFIX ?? '',
+	srtpKeyParameterPrefix: process.env.SRTP_KEY_PARAMETER_PREFIX ?? '',
+	srtpIngestionEnabled: Boolean(process.env.SRTP_STREAM_PREFIX),
 }
 
 const streamStateManager = new StreamStateManager({
@@ -71,12 +80,30 @@ const streamMetadataService = new StreamMetadataService({
 	region: config.awsRegion,
 })
 
+const srtpEnabled =
+	config.kinesisIngestionEnabled && config.srtpIngestionEnabled
+
+const srtpKeyStore = srtpEnabled
+	? new SrtpKeyStore({
+			region: config.awsRegion,
+			parameterPrefix: config.srtpKeyParameterPrefix,
+		})
+	: null
+
 const kinesisIngestionPipeline = config.kinesisIngestionEnabled
 	? new KinesisIngestionPipeline({
 			streamNamePrefix: config.kinesisStreamPrefix,
 			region: config.awsRegion,
 			portRange: config.portRange,
 			logGstreamerOutput: config.kinesisLogGstreamerOutput,
+			srtp:
+				srtpEnabled && srtpKeyStore
+					? {
+							portRange: config.srtpPortRange,
+							streamNamePrefix: config.srtpStreamPrefix,
+							keyStore: srtpKeyStore,
+						}
+					: undefined,
 		})
 	: null
 
@@ -95,7 +122,19 @@ const preStartBufferByPort = new Map<
 /** Resolved at startup; used by packet handler for lock acquisition and DynamoDB updates. */
 let instanceId = 'local'
 
-const createPacketHandler = (): PacketHandler => ({
+type PacketHandlerRangeConfig = {
+	minBytesBeforeStart: number
+	/**
+	 * SRTP decryption/depayloading is inherently per-datagram (sequence numbers, rollover
+	 * counters, auth tags) - the pre-start buffer must be replayed as individual datagrams,
+	 * never Buffer.concat'd into one blob (that would destroy the framing SRTP needs).
+	 */
+	isSrtp: boolean
+}
+
+const createPacketHandler = (
+	rangeConfig: PacketHandlerRangeConfig,
+): PacketHandler => ({
 	onPacket: async (port, data, timestamp) => {
 		const streamState = streamStateManager.getStreamState(port)
 		const isFirstPacket = streamState === undefined
@@ -120,9 +159,11 @@ const createPacketHandler = (): PacketHandler => ({
 			buf.chunks.push(data)
 			buf.totalBytes += data.length
 
-			if (buf.totalBytes >= config.kinesisMinBytesBeforeStart) {
+			if (buf.totalBytes >= rangeConfig.minBytesBeforeStart) {
 				preStartBufferByPort.delete(port)
-				const initialData = Buffer.concat(buf.chunks)
+				const initialData: Buffer | Buffer[] = rangeConfig.isSrtp
+					? buf.chunks
+					: Buffer.concat(buf.chunks)
 				packetAlreadyInInitialData = true
 				try {
 					const acquired = await streamMetadataService.tryAcquireKinesisLock(
@@ -199,21 +240,45 @@ const createPacketHandler = (): PacketHandler => ({
 	},
 })
 
-const packetHandler = createPacketHandler()
+const isSrtpPort = (port: number): boolean =>
+	srtpEnabled &&
+	port >= config.srtpPortRange.start &&
+	port <= config.srtpPortRange.end
+
+const mainPacketHandler = createPacketHandler({
+	minBytesBeforeStart: config.kinesisMinBytesBeforeStart,
+	isSrtp: false,
+})
+const srtpPacketHandler = srtpEnabled
+	? createPacketHandler({
+			minBytesBeforeStart: config.kinesisMinBytesBeforeStart,
+			isSrtp: true,
+		})
+	: null
+
+const handlerForPort = (port: number): PacketHandler =>
+	isSrtpPort(port) && srtpPacketHandler ? srtpPacketHandler : mainPacketHandler
 
 // Set up stream state event handlers
 streamStateManager.on('streamStart', (port: number) => {
-	void packetHandler.onStreamStart(port).catch((err) => {
-		console.error(`[Main] Error handling stream start for port ${port}:`, err)
-	})
+	void handlerForPort(port)
+		.onStreamStart(port)
+		.catch((err) => {
+			console.error(`[Main] Error handling stream start for port ${port}:`, err)
+		})
 })
 
 streamStateManager.on(
 	'streamStop',
 	(port: number, inactivityDuration: number) => {
-		void packetHandler.onStreamStop(port, inactivityDuration).catch((err) => {
-			console.error(`[Main] Error handling stream stop for port ${port}:`, err)
-		})
+		void handlerForPort(port)
+			.onStreamStop(port, inactivityDuration)
+			.catch((err) => {
+				console.error(
+					`[Main] Error handling stream stop for port ${port}:`,
+					err,
+				)
+			})
 	},
 )
 
@@ -258,7 +323,7 @@ if (kinesisIngestionPipeline) {
 	)
 }
 
-// Initialize UDP listener
+// Initialize UDP listener (unencrypted MPEG-TS/H.264, ports 5000-5009)
 const udpListener = new UDPListener({
 	portRange: config.portRange,
 	bufferSize: config.bufferSize,
@@ -266,7 +331,21 @@ const udpListener = new UDPListener({
 	outputDirectory: config.outputDirectory,
 })
 
-udpListener.setPacketHandler(packetHandler)
+udpListener.setPacketHandler(mainPacketHandler)
+
+// Second UDP listener for SRTP-encrypted RTP/H.264 (ports 6000-6009), when configured
+const srtpUdpListener = srtpEnabled
+	? new UDPListener({
+			portRange: config.srtpPortRange,
+			bufferSize: config.bufferSize,
+			flushInterval: config.flushInterval,
+			outputDirectory: config.outputDirectory,
+		})
+	: null
+
+if (srtpUdpListener && srtpPacketHandler) {
+	srtpUdpListener.setPacketHandler(srtpPacketHandler)
+}
 
 const healthServer = new HealthServer()
 
@@ -276,6 +355,7 @@ const shutdown = async (): Promise<void> => {
 
 	await healthServer.stop()
 	await udpListener.stop()
+	await srtpUdpListener?.stop()
 	streamStateManager.stop()
 	preStartBufferByPort.clear()
 	for (const port of kinesisLockHeldForPorts) {
@@ -326,11 +406,32 @@ const start = async (): Promise<void> => {
 			'[Main] Kinesis ingestion disabled (KINESIS_STREAM_PREFIX not set)',
 		)
 	}
+	if (srtpEnabled) {
+		console.log(
+			`[Main] SRTP ingestion enabled (stream prefix: ${config.srtpStreamPrefix}, ports ${config.srtpPortRange.start}-${config.srtpPortRange.end})`,
+		)
+	} else {
+		console.log(
+			'[Main] SRTP ingestion disabled (SRTP_STREAM_PREFIX not set, or Kinesis ingestion disabled)',
+		)
+	}
 
 	try {
 		await ensureAwsCredentials()
+		if (srtpEnabled && srtpKeyStore) {
+			const ports: number[] = []
+			for (
+				let port = config.srtpPortRange.start;
+				port <= config.srtpPortRange.end;
+				port++
+			) {
+				ports.push(port)
+			}
+			await srtpKeyStore.loadPorts(ports)
+		}
 		await healthServer.start()
 		await udpListener.start()
+		await srtpUdpListener?.start()
 		console.log('[Main] Service started successfully')
 	} catch (error) {
 		console.error('[Main] Failed to start service:', error)
