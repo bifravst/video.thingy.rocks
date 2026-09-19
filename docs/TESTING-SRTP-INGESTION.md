@@ -118,9 +118,10 @@ started" (not "Kinesis ingestion started") in application logs.
   start.
 
 - **"No SRTP key configured for port; refusing to start ingestion"** - the SSM
-  parameter `/{stackName}/srtp/port/{port}/key` is missing, malformed JSON, or
-  the key isn't 60 hex characters. Re-run `scripts/provision-srtp-key.sh` and
-  restart the instance(s).
+  parameter `/{stackName}/srtp/port/{port}/key` is missing, malformed JSON, the
+  key isn't 60 hex characters, or it was provisioned without
+  `--type SecureString` (plain `String` parameters are rejected on load). Re-run
+  `scripts/provision-srtp-key.sh` and restart the instance(s).
 
 - **`srtpdec` authentication/auth-tag failures (no fragments in Kinesis,
   GStreamer stderr shows auth failures)** - almost always a key,
@@ -162,13 +163,15 @@ started" (not "Kinesis ingestion started") in application logs.
   key rotated in SSM without changing the SSRC would otherwise seed a fresh
   session with a previous key's stale state. If DynamoDB itself can't be read at
   startup, the backend treats that as "state unavailable" (not a fresh ROC of 0)
-  and releases the lock/backs off rather than guessing. GStreamer's own rollover
-  estimate for the _first_ packet a fresh `srtpdec` instance sees also only has
-  the seeded ROC to go on (its own tracked sequence number starts at 0), so
-  seeding the raw persisted ROC is itself not quite enough when the sender's
-  real sequence number is currently in the upper half of the 16-bit range - see
-  `srtpdecSeedRoc`'s doc comment for the (very fiddly) arithmetic reason and the
-  `roc + 1` compensation it applies.
+  and releases the lock/backs off rather than guessing. The ROC handed to
+  `srtpdec` via its caps is the raw persisted/tracked ROC (see
+  `srtpdecSeedRoc`): libsrtp
+
+  > = 2.3 (any version with `srtp_set_stream_roc`, which the caps `roc` field
+  > requires) applies it directly to the first packet's extended index -
+  > `(seededRoc << 16) | seq` - and pins its rollover state from that estimate,
+  > so no extra compensation is needed or correct, regardless of which half of
+  > the 16-bit sequence space the sender is currently in.
 
 - **Two producers competing for the same stream** - a device must use only one
   of the unencrypted or SRTP transports per assigned stream slot (see

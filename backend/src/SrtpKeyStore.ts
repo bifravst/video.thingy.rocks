@@ -133,9 +133,27 @@ export class SrtpKeyStore {
 			})
 		}
 
-		const paramsByName = new Map(
-			(response.Parameters ?? []).map((p) => [p.Name, p.Value] as const),
-		)
+		const paramsByName = new Map<string, string>()
+		for (const parameter of response.Parameters ?? []) {
+			if (parameter.Name === undefined || parameter.Value === undefined)
+				continue
+			// GetParameters returns plain String parameters too - WithDecryption only means
+			// "decrypt if applicable", not "only return SecureStrings" - so an SRTP key that
+			// was accidentally provisioned without encryption at rest must be rejected here,
+			// not silently accepted and logged as loaded.
+			if (parameter.Type !== 'SecureString') {
+				this.logger.error(
+					'SRTP key parameter is not a SecureString; refusing to use it (re-provision with scripts/provision-srtp-key.sh, which always uses --type SecureString)',
+					new Error('SRTP key parameter is not a SecureString'),
+					{
+						parameterName: parameter.Name,
+						actualType: parameter.Type ?? 'unknown',
+					},
+				)
+				continue
+			}
+			paramsByName.set(parameter.Name, parameter.Value)
+		}
 
 		for (const port of ports) {
 			const name = this.parameterNameForPort(port)

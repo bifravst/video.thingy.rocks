@@ -172,26 +172,30 @@ export const advanceSrtpRoc = (
 
 /**
  * Computes the "roc" value to seed a fresh srtpdec instance with, given our best current
- * tracking state, so that libsrtp's own internal rollover estimate for the *next* packet it
- * actually receives resolves to the correct ROC.
+ * tracking state: the raw tracked ROC, unmodified, regardless of which half of the 16-bit
+ * sequence space the sender's current sequence number is in.
  *
- * GStreamer's srtpdec only exposes a caps "roc" field (srtp_set_stream_roc), which sets the
- * ROC half of its internal 48-bit tracked index but leaves the low 16 bits (the "highest
- * sequence number seen") at 0 - there is no caps field for that. So if we seed roc=5 while
- * the sender's actual current sequence number is, say, 40000, libsrtp's own RFC3711-style
- * guess for the first real packet compares candidate extended indices (4,5,6)*65536+40000
- * against its baseline of 5*65536+0, and 4*65536+40000 is the closest - i.e. it silently
- * decides to use ROC 4, not the 5 we asked for, and decryption/auth fails.
+ * libsrtp's srtp_set_stream_roc - which GStreamer's srtpdec calls with the caps "roc" field -
+ * does NOT pin the decoder's internal index to roc*65536+0 and then re-guess. In every
+ * libsrtp version that has the API (>= 2.3.0, which any srtpdec with caps "roc" support
+ * requires), it sets stream->pending_roc, and the first packet's extended index is computed
+ * DIRECTLY as (seededRoc << 16) | seq - using the packet's real sequence number - after
+ * which srtp_rdbx_set_roc_seq pins both the ROC and the sequence halves from that estimate
+ * (see srtp.c's srtp_estimate_index/srtp_get_est_pkt_index and the srtp_unprotect caller).
+ * So the correct seed is simply the ROC the sender is currently in, in both halves of the
+ * range; no compensation is needed or correct.
  *
- * Working through that same fixed arithmetic (candidate distance vs a baseline pinned at
- * seededRoc*65536+0) shows the guess resolves to our seeded value exactly when the real
- * sequence number is below 32768, and to `seededRoc - 1` when it's 32768 or above. We exploit
- * that in reverse: when our own tracked highestSeq (the best available proxy for whatever
- * sequence number is about to arrive next) is in the upper half, seed `roc + 1` instead of
- * `roc` - libsrtp's own guess then resolves that back down to the correct roc.
+ * (An earlier version of this seeded `roc + 1` when the tracked highestSeq was >= 0x8000,
+ * based on a model of libsrtp that re-guesses the first packet's ROC against a
+ * seededRoc*65536+0 baseline - verified wrong both against the libsrtp source and
+ * empirically, GStreamer 1.28 + libsrtp, sender pinned to ROC 0 with sequence numbers
+ * starting at 40000: seeding the raw roc=0 decrypts 151/151 packets, seeding roc=1 decrypts
+ * 0/151. Seeding one ROC too high makes the first packet fail authentication AND pins the
+ * replay/rollover state one ROC forward, dropping every packet until the sender genuinely
+ * wraps - up to ~32768 sequence numbers (~18 minutes at 30 fps) of lost video, on roughly
+ * half of all restarts.) Exported for unit testing.
  */
-export const srtpdecSeedRoc = (state: SrtpRocState): number =>
-	state.highestSeq >= 0x8000 ? state.roc + 1 : state.roc
+export const srtpdecSeedRoc = (state: SrtpRocState): number => state.roc
 
 /** Per-port throttle for GStreamer stderr warning categories. */
 type GstStderrThrottle = { lastLog: Record<string, number> }
@@ -274,9 +278,40 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	 * trackSrtpRoc/seedSrtpRoc/getSrtpRoc.
 	 */
 	private readonly srtpRocByPort: Map<number, SrtpRocState> = new Map()
+	/**
+	 * Every GStreamer child this instance has spawned that hasn't exited yet. shutdown()
+	 * sweeps this set so no child - including one registered by a start() that was still in
+	 * flight when shutdown began, after stopAll() had already snapshotted the active
+	 * pipelines - can outlive the process as an orphan: process.exit() does not signal
+	 * children, and an orphaned kvssink producer would keep writing to Kinesis with no
+	 * owner.
+	 */
+	private readonly spawnedGst: Set<ReturnType<typeof spawn>> = new Set()
+	/** True once shutdown() has run; further starts are refused (see shutdown()). */
+	private closed = false
 
 	constructor(config: KinesisIngestionPipelineConfig) {
 		super()
+		// Fail fast on a config that would silently map ports to nonexistent Kinesis
+		// VideoStreams: streamSlotForPort derives the slot from the port's offset within its
+		// own range, so an SRTP range covering more ports than the main range yields slots
+		// beyond the streams the CDK stack creates (and fewer ports would strand SRTP ports
+		// at the end of the range with no slot at all).
+		if (config.portRange.start > config.portRange.end) {
+			throw new Error(
+				`Invalid config: portRange must be non-empty (${config.portRange.start} > ${config.portRange.end})`,
+			)
+		}
+		if (config.srtp !== undefined) {
+			const mainPorts = config.portRange.end - config.portRange.start + 1
+			const srtpPorts =
+				config.srtp.portRange.end - config.srtp.portRange.start + 1
+			if (srtpPorts !== mainPorts) {
+				throw new Error(
+					`Invalid config: srtp.portRange (${config.srtp.portRange.start}-${config.srtp.portRange.end}, ${srtpPorts} ports) must cover exactly as many ports as portRange (${config.portRange.start}-${config.portRange.end}, ${mainPorts} ports): unencrypted port start+N and SRTP port start+N must stay paired (see streamSlotForPort/streamNameForPort)`,
+				)
+			}
+		}
 		this.config = config
 		this.logger = new Logger('KinesisIngestionPipeline')
 	}
@@ -581,6 +616,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	 * decryption depends on); each is relayed to GStreamer as its own UDP datagram.
 	 */
 	async start(port: number, initialData?: Buffer | Buffer[]): Promise<void> {
+		if (this.closed) return
 		if (!this.isPortInRange(port)) return
 		if (this.activePipelines.has(port)) return
 
@@ -696,10 +732,20 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			pipelineStr,
 			shellCmd,
 		})
+		// Checked in the same synchronous block as the spawn below, so a concurrent
+		// shutdown() can never interleave between the check and the child appearing.
+		if (this.closed) {
+			this.logger.warn(
+				'Refusing to spawn GStreamer: pipeline manager is shut down',
+				{ port, streamName },
+			)
+			return
+		}
 		const gst = spawn('sh', ['-c', shellCmd], {
 			stdio: ['ignore', 'pipe', 'pipe'],
 			env,
 		})
+		this.spawnedGst.add(gst)
 
 		// Open FIFO for writing (blocks until GStreamer filesrc opens for read); then write
 		// initial data so pipeline has data when it starts. Raced against the child exiting
@@ -775,6 +821,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 				err instanceof Error ? err : new Error(String(err)),
 				{ port, streamName, fifoPath },
 			)
+			this.spawnedGst.delete(gst)
 			gst.kill('SIGTERM')
 			try {
 				fs.unlinkSync(fifoPath)
@@ -807,6 +854,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		})
 		gst.on('error', (err) => {
 			this.logger.error('GStreamer error', err, { port, streamName })
+			this.spawnedGst.delete(gst)
 			// Only mutate/notify if the map still points to *this* pipeline instance - see
 			// the identical check (and rationale) on the SRTP path's handlers.
 			if (this.activePipelines.get(port) !== pipeline) return
@@ -814,6 +862,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			this.emit('pipelineExited', { port, code: null, signal: null })
 		})
 		gst.on('exit', (code, signal) => {
+			this.spawnedGst.delete(gst)
 			const wasUnexpected = this.activePipelines.get(port) === pipeline
 			this.logger.info('GStreamer exited', {
 				port,
@@ -880,8 +929,9 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		// the actual installed GStreamer version via `gst-inspect-1.0 srtpdec` - see docs/TESTING-SRTP-INGESTION.md.
 		// "roc" seeds srtpdec's rollover counter (see trackSrtpRoc/getSrtpRoc) so a restart
 		// after the sender's sequence number has wrapped doesn't start back at ROC 0. Callers
-		// must pass it through srtpdecSeedRoc, not a raw tracked/persisted roc value - see
-		// that function's doc comment for why the raw value alone can seed the wrong ROC.
+		// must pass it through srtpdecSeedRoc, which returns the raw tracked/persisted ROC -
+		// see that function's doc comment for why no compensation is applied (and why the
+		// roc+1 compensation that used to live there was wrong).
 		const caps = [
 			'application/x-srtp',
 			'media=(string)video',
@@ -945,13 +995,18 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	 * a spawned gst-launch-1.0 process - but it's a meaningful improvement, and
 	 * SRTP_STARTUP_GRACE_MS still bounds the wait as a fallback in case the message never
 	 * appears (e.g. output format differs across GStreamer versions, or gets swallowed by
-	 * stdout buffering).
+	 * stdout buffering). Matches against accumulated stdout rather than each 'data' chunk
+	 * individually, since a pipe-buffered child can split the line across two chunks.
 	 */
 	private async waitForSrtpPipelineReady(
 		gst: ReturnType<typeof spawn>,
 	): Promise<void> {
 		return new Promise((resolve) => {
 			let settled = false
+			// Bounded rolling tail of everything seen so far - only needs to be long enough
+			// to hold one "Setting pipeline to PLAYING ..." line (~29 chars) plus a
+			// chunk-sized margin, in case a chunk boundary falls inside it.
+			let text = ''
 			const finish = (): void => {
 				if (settled) return
 				settled = true
@@ -960,7 +1015,8 @@ export class KinesisIngestionPipeline extends EventEmitter {
 				resolve()
 			}
 			const onStdout = (data: Buffer): void => {
-				if (/Setting pipeline to PLAYING/i.test(data.toString())) finish()
+				text = (text + data.toString()).slice(-1024)
+				if (/Setting pipeline to PLAYING/i.test(text)) finish()
 			}
 			gst.stdout?.on('data', onStdout)
 			const timer = setTimeout(finish, SRTP_STARTUP_GRACE_MS)
@@ -1033,10 +1089,21 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			argv: this.redactSrtpArgv(argv),
 		})
 
+		// Checked in the same synchronous block as the spawn below, so a concurrent
+		// shutdown() can never interleave between the check and the child appearing.
+		if (this.closed) {
+			this.logger.warn(
+				'Refusing to spawn GStreamer: pipeline manager is shut down',
+				{ port, streamName, relayPort },
+			)
+			return
+		}
+
 		const gst = spawn('gst-launch-1.0', argv, {
 			stdio: ['ignore', 'pipe', 'pipe'],
 			env,
 		})
+		this.spawnedGst.add(gst)
 
 		// Best-effort readiness signal instead of a blind fixed sleep: start listening now
 		// (before any awaits) so an early message isn't missed. See waitForSrtpPipelineReady.
@@ -1079,6 +1146,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		})
 		gst.on('error', (err) => {
 			this.logger.error('GStreamer error', err, { port, streamName })
+			this.spawnedGst.delete(gst)
 			// Only mutate/notify if the map still points to *this* pipeline instance - a
 			// stale event from an already-replaced (newer) pipeline for the same port must
 			// not delete that replacement's entry or trigger a spurious restart for it.
@@ -1094,6 +1162,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			this.emit('pipelineExited', { port, code: null, signal: null })
 		})
 		gst.on('exit', (code, signal) => {
+			this.spawnedGst.delete(gst)
 			// Same identity check as 'error' above: only the pipeline currently registered
 			// for this port may treat its own exit as unexpected. An intentional stop()
 			// deletes the map entry before killing the process, so its own exit correctly
@@ -1386,5 +1455,23 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	async stopAll(): Promise<void> {
 		const ports = Array.from(this.activePipelines.keys())
 		await Promise.all(ports.map(async (port) => this.stop(port)))
+	}
+
+	/**
+	 * Permanently stops this pipeline manager and refuses further starts. index.ts stops
+	 * initiating restarts/resumes first (see its `shuttingDown` guards) and drains its
+	 * packet queues before calling this, so by the time it runs only starts that were
+	 * already in flight can still be pending: those refuse to spawn (see the closed checks
+	 * in runStartForFifoPort/runStartForSrtpPort), and any child that slipped past the
+	 * checks before `closed` was set - and would otherwise outlive the process, since
+	 * process.exit() does not signal children - is swept from spawnedGst so no orphaned
+	 * kvssink producer keeps writing to Kinesis with no owner.
+	 */
+	async shutdown(): Promise<void> {
+		this.closed = true
+		await this.stopAll()
+		for (const gst of this.spawnedGst) {
+			gst.kill('SIGTERM')
+		}
 	}
 }

@@ -228,6 +228,14 @@ const nextStartAttemptAllowedAtByPort = new Map<number, number>()
 /** Resolved at startup; used by packet handler for lock acquisition and DynamoDB updates. */
 let instanceId = 'local'
 
+/**
+ * True once shutdown() has begun - no new pipeline start/restart may be initiated after
+ * this point, so a pending 'pipelineExited' restart timer or a fire-and-forget streamStart
+ * resume can't spawn a GStreamer producer that teardown (or process.exit(), which does not
+ * signal children - see KinesisIngestionPipeline.shutdown()'s orphan sweep) never stops.
+ */
+let shuttingDown = false
+
 type PacketHandlerRangeConfig = {
 	minBytesBeforeStart: number
 	/**
@@ -290,6 +298,7 @@ const startPipelineOrReleaseLock = async (
 	port: number,
 	initialData?: Buffer | Buffer[],
 ): Promise<void> => {
+	if (shuttingDown) return
 	if (!kinesisIngestionPipeline) return
 	const slot = kinesisIngestionPipeline.streamSlotForPort(port)
 
@@ -728,6 +737,9 @@ const createPacketHandler = (
 		onStreamStart: async (port) => {
 			console.log(`[Main] Stream started on port ${port}`)
 
+			// Never (re)start a producer once shutdown has begun - see shuttingDown.
+			if (shuttingDown) return
+
 			// Resume Kinesis pipeline only if we hold the lock (e.g. stream resume after brief inactivity)
 			if (kinesisIngestionPipeline && kinesisLockHeldForPorts.has(port)) {
 				void startPipelineOrReleaseLock(port).catch((err) => {
@@ -894,6 +906,9 @@ if (kinesisIngestionPipeline) {
 				`[Main] GStreamer exited unexpectedly for port ${port} (code=${code}, signal=${signal}). Restarting in ${delay}ms...`,
 			)
 			setTimeout(() => {
+				// The delay above can straddle a shutdown that started after this timer was
+				// scheduled - re-check so a restart can't spawn a producer teardown never stops.
+				if (shuttingDown) return
 				lastPipelineRestartByPort.set(port, Date.now())
 				void startPipelineOrReleaseLock(port).catch((err) => {
 					console.error(
@@ -934,6 +949,10 @@ const healthServer = new HealthServer()
 
 // Graceful shutdown handler
 const shutdown = async (): Promise<void> => {
+	// First thing, before any of the awaits below: from here on, no new pipeline
+	// start/restart may be initiated (see shuttingDown) while teardown drains queues and
+	// stops producers.
+	shuttingDown = true
 	console.log('[Main] Shutting down...')
 
 	await healthServer.stop()
@@ -952,9 +971,11 @@ const shutdown = async (): Promise<void> => {
 	preStartBufferByPort.clear()
 
 	// Stop every producer *before* releasing any locks - see the same ordering rationale in
-	// onStreamStop above.
+	// onStreamStop above. shutdown() (not stopAll()) also refuses any further start() and
+	// sweeps children still alive afterwards, so a start that was in flight while the queues
+	// above were draining cannot leave an orphaned producer behind at process.exit().
 	if (kinesisIngestionPipeline) {
-		await kinesisIngestionPipeline.stopAll()
+		await kinesisIngestionPipeline.shutdown()
 	}
 
 	for (const port of kinesisLockHeldForPorts) {

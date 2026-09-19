@@ -148,17 +148,23 @@ void describe('KinesisIngestionPipeline', () => {
 			assert.strictEqual(srtpdecSeedRoc({ roc: 5, highestSeq: 0x7fff }), 5)
 		})
 
-		void it('seeds roc+1 when the tracked sequence is in the upper half', () => {
-			// Regression case from the review finding: seeding roc=5 alone while the real
-			// sequence number is far above 0 makes libsrtp's own internal rollover guess
-			// (which starts its baseline at roc*65536+0) land on roc-1 instead - seeding
-			// roc+1 here compensates so libsrtp's guess resolves back down to the real roc.
-			assert.strictEqual(srtpdecSeedRoc({ roc: 5, highestSeq: 0x8000 }), 6)
-			assert.strictEqual(srtpdecSeedRoc({ roc: 5, highestSeq: 40000 }), 6)
-			assert.strictEqual(srtpdecSeedRoc({ roc: 5, highestSeq: 0xffff }), 6)
+		void it('seeds the raw roc when the tracked sequence is in the upper half', () => {
+			// libsrtp >= 2.3 (any version with srtp_set_stream_roc, which srtpdec's caps
+			// "roc" field requires) does NOT re-guess the first packet's ROC against a
+			// roc*65536+0 baseline: srtp_set_stream_roc sets stream->pending_roc, the first
+			// packet's extended index is computed directly as (seededRoc << 16) | seq, and
+			// both halves of the rollover state are then pinned from that estimate. Verified
+			// against the libsrtp source and empirically (GStreamer 1.28 + libsrtp): a sender
+			// pinned to ROC 0 with sequence numbers starting at 40000 decrypts 151/151
+			// packets when seeded with the raw roc=0, and 0/151 when seeded roc=1. The
+			// "seed roc+1 in the upper half" compensation this test used to assert breaks
+			// decryption for up to ~32768 sequence numbers instead of fixing it.
+			assert.strictEqual(srtpdecSeedRoc({ roc: 5, highestSeq: 0x8000 }), 5)
+			assert.strictEqual(srtpdecSeedRoc({ roc: 5, highestSeq: 40000 }), 5)
+			assert.strictEqual(srtpdecSeedRoc({ roc: 5, highestSeq: 0xffff }), 5)
 		})
 
-		void it('seeds 0 for a never-observed stream regardless of the half-space rule', () => {
+		void it('seeds 0 for a never-observed stream', () => {
 			assert.strictEqual(srtpdecSeedRoc({ roc: 0, highestSeq: 0 }), 0)
 		})
 	})
@@ -207,6 +213,60 @@ void describe('KinesisIngestionPipeline', () => {
 				portRange: { start: 5000, end: 5009 },
 			})
 			assert.strictEqual(pipeline.pairedPortFor(5003), undefined)
+		})
+	})
+
+	void describe('constructor port-range validation', () => {
+		const keyStore = {} as SrtpKeyStore
+
+		void it('accepts matching-length port ranges', () => {
+			new KinesisIngestionPipeline({
+				region: 'eu-central-1',
+				portRange: { start: 5000, end: 5009 },
+				srtp: { portRange: { start: 6000, end: 6009 }, keyStore },
+			})
+			new KinesisIngestionPipeline({
+				region: 'eu-central-1',
+				portRange: { start: 5000, end: 5009 },
+			})
+		})
+
+		void it('throws when the SRTP range covers more ports than the main range', () => {
+			// streamSlotForPort derives the slot from the port's offset within its own
+			// range, so extra SRTP ports would map to slots beyond the Kinesis streams the
+			// CDK stack creates - fail fast at construction instead.
+			assert.throws(
+				() =>
+					new KinesisIngestionPipeline({
+						region: 'eu-central-1',
+						portRange: { start: 5000, end: 5009 },
+						srtp: { portRange: { start: 6000, end: 6019 }, keyStore },
+					}),
+				/must cover exactly as many ports/,
+			)
+		})
+
+		void it('throws when the SRTP range covers fewer ports than the main range', () => {
+			assert.throws(
+				() =>
+					new KinesisIngestionPipeline({
+						region: 'eu-central-1',
+						portRange: { start: 5000, end: 5009 },
+						srtp: { portRange: { start: 6000, end: 6005 }, keyStore },
+					}),
+				/must cover exactly as many ports/,
+			)
+		})
+
+		void it('throws for an inverted main port range', () => {
+			assert.throws(
+				() =>
+					new KinesisIngestionPipeline({
+						region: 'eu-central-1',
+						portRange: { start: 5009, end: 5000 },
+					}),
+				/portRange must be non-empty/,
+			)
 		})
 	})
 
