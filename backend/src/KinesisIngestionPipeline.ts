@@ -50,6 +50,10 @@ const DEFAULT_SRTP_JITTER_BUFFER_LATENCY_MS = 200
  * lost here self-heal at the next H.264 keyframe, the same tolerance the system already has
  * for ordinary network loss. */
 const SRTP_STARTUP_GRACE_MS = 300
+/** Pace the pre-start buffer replay: await this many sends, then pause, instead of firing
+ * the whole (potentially thousands-of-datagrams) buffer at once with no backpressure. */
+const SRTP_REPLAY_BATCH_SIZE = 50
+const SRTP_REPLAY_BATCH_PAUSE_MS = 10
 
 type ReorderState = {
 	nextSeq: number
@@ -710,17 +714,29 @@ export class KinesisIngestionPipeline extends EventEmitter {
 
 		if (initialDatagrams.length > 0) {
 			await new Promise((resolve) => setTimeout(resolve, SRTP_STARTUP_GRACE_MS))
-			for (const datagram of initialDatagrams) {
-				this.sendSrtpDatagram(port, pipeline, datagram, 'initial')
+			// Await each send and pause briefly every batch - the pre-start buffer can hold
+			// thousands of packets (10MB / ~1300 bytes each), and firing them all at once
+			// with no pacing can overrun the local UDP socket/receiving udpsrc, silently
+			// dropping datagrams (including the first keyframe/SPS/PPS) before GStreamer can
+			// consume them.
+			for (const [index, datagram] of initialDatagrams.entries()) {
+				await this.sendSrtpDatagram(port, pipeline, datagram, 'initial')
+				if ((index + 1) % SRTP_REPLAY_BATCH_SIZE === 0) {
+					await new Promise((resolve) =>
+						setTimeout(resolve, SRTP_REPLAY_BATCH_PAUSE_MS),
+					)
+				}
 			}
 			// Flush whatever writePacket() queued while replay was in flight, in the order it
 			// arrived, before accepting further direct sends - this is what stops live packets
 			// from overtaking (and causing anti-replay/jitter-buffer discard of) the replay.
+			// This queue is bounded by the startup grace period's real-time packet arrival
+			// rate (not the 10MB buffer), so it doesn't need the same batching/pacing.
 			pipeline.ready = true
 			const queued = pipeline.pendingQueue
 			pipeline.pendingQueue = []
 			for (const datagram of queued) {
-				this.sendSrtpDatagram(port, pipeline, datagram, 'queued')
+				void this.sendSrtpDatagram(port, pipeline, datagram, 'queued')
 			}
 		}
 
@@ -731,27 +747,37 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		})
 	}
 
-	/** Sends one datagram to the SRTP relay port, logging (not throwing) on failure. */
-	private sendSrtpDatagram(
+	/**
+	 * Sends one datagram to the SRTP relay port, logging (not throwing) on failure. Resolves
+	 * once the send completes (success or failure) - callers that fire many of these in a
+	 * row (the startup replay) must await each one rather than firing them all at once, or
+	 * nothing paces the burst against what the receiving udpsrc/srtpdec can actually consume.
+	 * Live per-packet sends (already paced by real network arrival) may call this without
+	 * awaiting it.
+	 */
+	private async sendSrtpDatagram(
 		port: number,
 		pipeline: SrtpRelayPortPipeline,
 		datagram: Buffer,
 		kind: 'initial' | 'queued' | 'live',
-	): void {
-		pipeline.relaySocket.send(
-			datagram,
-			pipeline.relayPort,
-			'127.0.0.1',
-			(err) => {
-				if (err) {
-					this.logger.warn('Failed to relay SRTP datagram', {
-						port,
-						kind,
-						message: err.message,
-					})
-				}
-			},
-		)
+	): Promise<void> {
+		await new Promise<void>((resolve) => {
+			pipeline.relaySocket.send(
+				datagram,
+				pipeline.relayPort,
+				'127.0.0.1',
+				(err) => {
+					if (err) {
+						this.logger.warn('Failed to relay SRTP datagram', {
+							port,
+							kind,
+							message: err.message,
+						})
+					}
+					resolve()
+				},
+			)
+		})
 	}
 
 	private drainFifo(port: number, stdin: Writable): void {
@@ -799,7 +825,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 				pipeline.pendingQueue.push(data)
 				return
 			}
-			this.sendSrtpDatagram(port, pipeline, data, 'live')
+			void this.sendSrtpDatagram(port, pipeline, data, 'live')
 			return
 		}
 

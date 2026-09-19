@@ -449,7 +449,19 @@ const start = async (): Promise<void> => {
 			) {
 				ports.push(port)
 			}
-			await srtpKeyStore.loadPorts(ports)
+			// Isolated from the outer try/catch: an SSM outage/throttling/permissions error
+			// here must not abort startup of the unencrypted MPEG-TS path (5000-5009), which
+			// does not depend on SRTP keys at all. SRTP ports will simply have no key loaded
+			// (KinesisIngestionPipeline already logs and refuses ingestion per-port when that
+			// happens) until this is retried on the next restart.
+			try {
+				await srtpKeyStore.loadPorts(ports)
+			} catch (err) {
+				console.error(
+					'[Main] Failed to load SRTP keys from SSM; SRTP ingestion will be unavailable until this is resolved. The unencrypted MPEG-TS path is unaffected. Error:',
+					err,
+				)
+			}
 		}
 		await healthServer.start()
 		await udpListener.start()
