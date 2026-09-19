@@ -11,10 +11,13 @@ unencrypted UDP/MPEG-TS pipeline documented in
 - EC2 instances have `SRTP_STREAM_PREFIX` set (the CDK stack always sets this;
   it's `{stackName}-video-srtp`), and a matching SRTP key provisioned for the
   port you're testing (see below).
-- Local GStreamer with `gst-plugins-bad` installed (for `srtpenc`, used by the
-  test sender script). Confirm with:
+- Local GStreamer with `gst-plugins-bad` (for `srtpenc`) **and**
+  `gst-plugins-ugly` (for `x264enc`) installed - both are used by the test
+  sender script, and `x264enc` is a separate package from `srtpenc`'s. Confirm
+  with:
   ```bash
   gst-inspect-1.0 srtpenc
+  gst-inspect-1.0 x264enc
   ```
 
 ## Pipeline overview

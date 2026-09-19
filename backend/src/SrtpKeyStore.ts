@@ -28,16 +28,40 @@ type StoredSrtpKey = {
 	auth?: string
 }
 
-const DEFAULT_CIPHER = 'aes-128-icm'
-const DEFAULT_AUTH = 'hmac-sha1-80'
+/**
+ * The only cipher/auth suite validated end-to-end (matches the 60-hex-char/30-byte key
+ * format enforced by isValidSrtpKeyHex below - a different suite, e.g. aes-256-icm, needs a
+ * different key length, so accepting an arbitrary cipher/auth string here would let a
+ * mismatched key/cipher pair through and fail later inside GStreamer instead of at load time).
+ */
+const SUPPORTED_SRTP_CIPHER = 'aes-128-icm'
+const SUPPORTED_SRTP_AUTH = 'hmac-sha1-80'
+
+/** RTP SSRC is a 32-bit unsigned integer. */
+const MAX_UINT32 = 0xffffffff
 
 /** AWS SSM GetParameters accepts at most 10 names per request. */
 const SSM_GET_PARAMETERS_MAX_NAMES = 10
 
-const isStoredSrtpKey = (value: unknown): value is StoredSrtpKey => {
+export const isStoredSrtpKey = (value: unknown): value is StoredSrtpKey => {
 	if (typeof value !== 'object' || value === null) return false
 	const v = value as Record<string, unknown>
-	return typeof v.key === 'string' && typeof v.ssrc === 'number'
+
+	if (typeof v.key !== 'string') return false
+
+	if (
+		typeof v.ssrc !== 'number' ||
+		!Number.isInteger(v.ssrc) ||
+		v.ssrc < 0 ||
+		v.ssrc > MAX_UINT32
+	) {
+		return false
+	}
+
+	if (v.cipher !== undefined && v.cipher !== SUPPORTED_SRTP_CIPHER) return false
+	if (v.auth !== undefined && v.auth !== SUPPORTED_SRTP_AUTH) return false
+
+	return true
 }
 
 /**
@@ -115,7 +139,7 @@ export class SrtpKeyStore {
 
 			if (!isStoredSrtpKey(parsed)) {
 				this.logger.error(
-					'SRTP key parameter missing required fields (key, ssrc)',
+					`SRTP key parameter is invalid: needs a string "key", a uint32 "ssrc", and, if present, "cipher"/"auth" must be exactly "${SUPPORTED_SRTP_CIPHER}"/"${SUPPORTED_SRTP_AUTH}" (the only suite supported end-to-end)`,
 					new Error('Invalid SRTP key parameter shape'),
 					{ port, parameterName: name },
 				)
@@ -134,8 +158,8 @@ export class SrtpKeyStore {
 			this.keysByPort.set(port, {
 				keyHex: parsed.key,
 				ssrc: parsed.ssrc,
-				cipher: parsed.cipher ?? DEFAULT_CIPHER,
-				auth: parsed.auth ?? DEFAULT_AUTH,
+				cipher: parsed.cipher ?? SUPPORTED_SRTP_CIPHER,
+				auth: parsed.auth ?? SUPPORTED_SRTP_AUTH,
 			})
 			this.logger.info('Loaded SRTP key', { port })
 		}

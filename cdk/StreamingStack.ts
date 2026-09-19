@@ -687,62 +687,15 @@ export class StreamingStack extends Stack {
 			new cloudwatch_actions.SnsAction(restartIngestionTopic),
 		)
 
-		// Same composite alarm as above, for the SRTP stream set. Kept separate (rather than
-		// merged into the alarm above) so SRTP's traffic during initial rollout doesn't get
-		// conflated with the unencrypted path's alarm history/thresholds.
-		const kvsIncomingMetricsSrtp: Record<string, cloudwatch.IMetric> = {}
-		this.kinesisVideoStreamsSrtp.forEach((_, i) => {
-			const port = srtpStreamPortStart + i
-			const streamName = `${srtpStreamPrefix}-${port}`
-			kvsIncomingMetricsSrtp[`s${i}`] = new cloudwatch.Metric({
-				namespace: 'AWS/KinesisVideo',
-				metricName: 'PutMedia.IncomingBytes',
-				dimensionsMap: { StreamName: streamName },
-				statistic: 'Sum',
-				period: Duration.minutes(1),
-			})
-		})
-		const kvsIncomingSumSrtp = new cloudwatch.MathExpression({
-			expression: this.kinesisVideoStreamsSrtp.map((_, i) => `s${i}`).join('+'),
-			usingMetrics: kvsIncomingMetricsSrtp,
-			period: Duration.minutes(1),
-			label: 'PutMedia Incoming Bytes (all SRTP streams)',
-		})
-		const kvsNoIngestionAlarmSrtp = new cloudwatch.Alarm(
-			this,
-			'SrtpKVSNoPutMediaIngestionAlarm',
-			{
-				alarmName: `${Stack.of(this).stackName}-SRTP-KVS-PutMedia-Incoming-Zero`,
-				alarmDescription:
-					'Sum of PutMedia.IncomingBytes across all SRTP Kinesis Video Streams is 0',
-				metric: kvsIncomingSumSrtp,
-				threshold: 0,
-				evaluationPeriods: 5,
-				comparisonOperator:
-					cloudwatch.ComparisonOperator.LESS_THAN_OR_EQUAL_TO_THRESHOLD,
-				treatMissingData: cloudwatch.TreatMissingData.BREACHING,
-			},
-		)
-
-		const srtpTrafficNoIngestionAlarm = new cloudwatch.CompositeAlarm(
-			this,
-			'SrtpTrafficNoKinesisIngestionAlarm',
-			{
-				alarmRule: cloudwatch.AlarmRule.allOf(
-					cloudwatch.AlarmRule.not(nlbUdpBytesAlarm),
-					kvsNoIngestionAlarmSrtp,
-				),
-				alarmDescription:
-					'NLB UDP processed bytes > 1 MB/s but PutMedia incoming data across all SRTP Kinesis Video Streams is 0',
-				compositeAlarmName: `${Stack.of(this).stackName}-SRTP-Traffic-No-KVS-Ingestion`,
-			},
-		)
-		srtpTrafficNoIngestionAlarm.addAlarmAction(
-			new cloudwatch_actions.SnsAction(alarmTopic),
-		)
-		srtpTrafficNoIngestionAlarm.addAlarmAction(
-			new cloudwatch_actions.SnsAction(restartIngestionTopic),
-		)
+		// Deliberately no SRTP equivalent of the composite alarm above: `nlbUdpBytesAlarm` is
+		// AWS/NetworkELB ProcessedBytes_UDP for the whole load balancer (all listeners, both
+		// the unencrypted 5000-5009 and SRTP 6000-6009 ports combined) - it cannot tell
+		// whether traffic on it is SRTP traffic, so a composite built from it would alarm (or
+		// stay quiet) based on unrelated traffic on the other port range, not SRTP ingestion
+		// health. Add a genuinely SRTP-specific traffic signal (e.g. a custom CloudWatch
+		// metric the backend publishes when it relays an SRTP datagram) before reinstating
+		// this; until then, use the per-stream `PutMedia.IncomingBytes` metric in the KVS
+		// console to check SRTP ingestion.
 
 		// CDK Outputs
 		new CfnOutput(this, 'StreamMetadataTableName', {

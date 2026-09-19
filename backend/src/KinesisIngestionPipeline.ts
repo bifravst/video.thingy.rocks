@@ -81,8 +81,24 @@ type SrtpRelayPortPipeline = {
 	/** Node-side socket used to relay each UDP datagram, unmodified, to GStreamer's udpsrc. */
 	relaySocket: dgram.Socket
 	relayPort: number
+	/**
+	 * Closes relaySocket exactly once. Closing an already-closed dgram socket throws
+	 * ERR_SOCKET_DGRAM_NOT_RUNNING, and this can be reached from three independent places
+	 * (the gst 'error' handler, the gst 'exit' handler, and stop()) - always go through this
+	 * instead of calling relaySocket.close() directly.
+	 */
+	closeRelaySocket: () => void
 	gstStderrThrottle: GstStderrThrottle
 	gstStdoutThrottle: GstStdoutThrottle
+	/**
+	 * True once startup replay (if any) has finished. While false, writePacket() queues live
+	 * datagrams in pendingQueue instead of sending them immediately, so they can't overtake
+	 * the still-in-flight replay of pre-buffered datagrams (which would let SRTP's
+	 * anti-replay/jitter-buffer handling discard the older, buffered packets - including the
+	 * initial keyframe - as apparent duplicates/out-of-order).
+	 */
+	ready: boolean
+	pendingQueue: Buffer[]
 }
 
 type PortPipeline = FifoPortPipeline | SrtpRelayPortPipeline
@@ -631,6 +647,21 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			})
 		})
 
+		let relaySocketClosed = false
+		const closeRelaySocket = (): void => {
+			if (relaySocketClosed) return
+			relaySocketClosed = true
+			try {
+				relaySocket.close()
+			} catch (err) {
+				this.logger.warn('Error closing SRTP relay socket', {
+					port,
+					relayPort,
+					message: err instanceof Error ? err.message : String(err),
+				})
+			}
+		}
+
 		const gstStderrThrottle: GstStderrThrottle = { lastLog: {} }
 		const gstStdoutThrottle: GstStdoutThrottle = { lastLog: {} }
 		gst.stdout?.on('data', (data: Buffer) => {
@@ -645,7 +676,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		gst.on('error', (err) => {
 			this.logger.error('GStreamer error', err, { port, streamName })
 			this.activePipelines.delete(port)
-			relaySocket.close()
+			closeRelaySocket()
 		})
 		gst.on('exit', (code, signal) => {
 			const wasUnexpected = this.activePipelines.has(port)
@@ -657,33 +688,39 @@ export class KinesisIngestionPipeline extends EventEmitter {
 				unexpected: wasUnexpected,
 			})
 			this.activePipelines.delete(port)
-			relaySocket.close()
+			closeRelaySocket()
 			if (wasUnexpected) {
 				this.emit('pipelineExited', { port, code, signal })
 			}
 		})
 
-		this.activePipelines.set(port, {
+		const pipeline: SrtpRelayPortPipeline = {
 			transport: 'srtp-relay',
 			gst,
 			relaySocket,
 			relayPort,
+			closeRelaySocket,
 			gstStderrThrottle,
 			gstStdoutThrottle,
-		})
+			// No replay needed => nothing can overtake it => ready immediately.
+			ready: initialDatagrams.length === 0,
+			pendingQueue: [],
+		}
+		this.activePipelines.set(port, pipeline)
 
 		if (initialDatagrams.length > 0) {
 			await new Promise((resolve) => setTimeout(resolve, SRTP_STARTUP_GRACE_MS))
 			for (const datagram of initialDatagrams) {
-				relaySocket.send(datagram, relayPort, '127.0.0.1', (err) => {
-					if (err) {
-						this.logger.warn('Failed to relay initial SRTP datagram', {
-							port,
-							relayPort,
-							message: err.message,
-						})
-					}
-				})
+				this.sendSrtpDatagram(port, pipeline, datagram, 'initial')
+			}
+			// Flush whatever writePacket() queued while replay was in flight, in the order it
+			// arrived, before accepting further direct sends - this is what stops live packets
+			// from overtaking (and causing anti-replay/jitter-buffer discard of) the replay.
+			pipeline.ready = true
+			const queued = pipeline.pendingQueue
+			pipeline.pendingQueue = []
+			for (const datagram of queued) {
+				this.sendSrtpDatagram(port, pipeline, datagram, 'queued')
 			}
 		}
 
@@ -692,6 +729,29 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			streamName,
 			relayPort,
 		})
+	}
+
+	/** Sends one datagram to the SRTP relay port, logging (not throwing) on failure. */
+	private sendSrtpDatagram(
+		port: number,
+		pipeline: SrtpRelayPortPipeline,
+		datagram: Buffer,
+		kind: 'initial' | 'queued' | 'live',
+	): void {
+		pipeline.relaySocket.send(
+			datagram,
+			pipeline.relayPort,
+			'127.0.0.1',
+			(err) => {
+				if (err) {
+					this.logger.warn('Failed to relay SRTP datagram', {
+						port,
+						kind,
+						message: err.message,
+					})
+				}
+			},
+		)
 	}
 
 	private drainFifo(port: number, stdin: Writable): void {
@@ -733,19 +793,13 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		if (!pipeline) return
 
 		if (pipeline.transport === 'srtp-relay') {
-			pipeline.relaySocket.send(
-				data,
-				pipeline.relayPort,
-				'127.0.0.1',
-				(err) => {
-					if (err) {
-						this.logger.warn('Failed to relay SRTP datagram', {
-							port,
-							message: err.message,
-						})
-					}
-				},
-			)
+			if (!pipeline.ready) {
+				// Startup replay is still in flight - queue rather than send now, so this
+				// datagram can't overtake the older, still-buffered ones (see `ready` above).
+				pipeline.pendingQueue.push(data)
+				return
+			}
+			this.sendSrtpDatagram(port, pipeline, data, 'live')
 			return
 		}
 
@@ -797,7 +851,13 @@ export class KinesisIngestionPipeline extends EventEmitter {
 				})
 			}
 		} else {
-			pipeline.relaySocket.close()
+			// Unlike the FIFO path (where ending the input stream gives filesrc a natural EOS
+			// that makes GStreamer exit on its own), closing our relay socket has no effect on
+			// GStreamer's own, independently bound udpsrc socket - nothing will make this
+			// process exit by itself. Signal it immediately rather than idling through the
+			// exit-wait below for the full 15 seconds for nothing.
+			pipeline.closeRelaySocket()
+			gst.kill('SIGTERM')
 		}
 
 		try {
