@@ -90,20 +90,32 @@ export class StreamingStack extends Stack {
 			removalPolicy: RemovalPolicy.DESTROY,
 		})
 
-		// Kinesis Video Streams: one per UDP port (5000-5009)
-		const kinesisStreamPortStart = 5000
-		const kinesisStreamPortEnd = 5009
-		const kinesisStreamPrefix = `${this.stackName}-video`
-		for (
-			let port = kinesisStreamPortStart;
-			port <= kinesisStreamPortEnd;
-			port++
-		) {
+		// Kinesis Video Streams: one per device, numbered 1-10, shared by both ingestion
+		// methods. Port 5000+n (unencrypted MPEG-TS) and port 6000+n (SRTP) both target the
+		// same stream (n+1) - a device is assigned one port range or the other, never both,
+		// so nothing needs to arbitrate between them beyond the existing per-port Kinesis
+		// lock (see StreamMetadataService). Stream name prefix must match
+		// backend/src/KinesisIngestionPipeline.ts's KINESIS_STREAM_NAME_PREFIX (duplicated,
+		// not shared, since backend/ and cdk/ are deployed separately).
+		//
+		// IMPORTANT: Kinesis Video Stream names cannot be changed in place (no rename API), so
+		// changing this prefix (or the stream count) is a genuinely destructive migration for
+		// any already-deployed stack: deploying such a change replaces every existing stream
+		// (old logical IDs/names deleted, new ones created), discarding up to 30 days of
+		// retained media in the old streams and breaking anything that referenced the old
+		// names. There is no way to preserve history across a rename - export anything that
+		// matters before deploying one.
+		const KINESIS_STREAM_NAME_PREFIX = 'video-streaming-2026-09-video'
+		const STREAM_COUNT = 10
+		const srtpPortRangeStart = 6000
+		const srtpPortRangeEnd = srtpPortRangeStart + STREAM_COUNT - 1
+		for (let i = 0; i < STREAM_COUNT; i++) {
+			const streamName = `${KINESIS_STREAM_NAME_PREFIX}-${i + 1}`
 			const stream = new kinesisvideo.CfnStream(
 				this,
-				`KinesisVideoStream${port}`,
+				`KinesisVideoStream${i + 1}`,
 				{
-					name: `${kinesisStreamPrefix}-${port}`,
+					name: streamName,
 					dataRetentionInHours: Duration.days(30).toHours(),
 					mediaType: 'video/h264',
 				},
@@ -128,6 +140,17 @@ export class StreamingStack extends Stack {
 			ec2.Peer.anyIpv6(),
 			ec2.Port.udpRange(5000, 5009),
 			'Allow UDP video ingestion on ports 5000-5009 (IPv6)',
+		)
+		// Allow UDP ingress on ports 6000-6009 (SRTP-encrypted RTP/H.264)
+		this.udpSecurityGroup.addIngressRule(
+			ec2.Peer.anyIpv4(),
+			ec2.Port.udpRange(6000, 6009),
+			'Allow SRTP video ingestion on ports 6000-6009',
+		)
+		this.udpSecurityGroup.addIngressRule(
+			ec2.Peer.anyIpv6(),
+			ec2.Port.udpRange(6000, 6009),
+			'Allow SRTP video ingestion on ports 6000-6009 (IPv6)',
 		)
 		// Allow TCP health checks from NLB (originates within VPC)
 		this.udpSecurityGroup.addIngressRule(
@@ -177,6 +200,18 @@ export class StreamingStack extends Stack {
 					'kinesisvideo:PutMedia',
 				],
 				resources: ['*'],
+			}),
+		)
+
+		// Grant read access to SRTP static pre-shared keys (SecureString parameters,
+		// provisioned out-of-band via scripts/provision-srtp-key.sh, never by CDK)
+		this.ec2Role.addToPolicy(
+			new iam.PolicyStatement({
+				effect: iam.Effect.ALLOW,
+				actions: ['ssm:GetParameter', 'ssm:GetParameters'],
+				resources: [
+					`arn:aws:ssm:${this.region}:${this.account}:parameter/${this.stackName}/srtp/*`,
+				],
 			}),
 		)
 
@@ -240,8 +275,10 @@ export class StreamingStack extends Stack {
 		userDataScript = userDataScript
 			.replace(/__AWS_REGION__/g, this.region)
 			.replace(/__TABLE_NAME__/g, this.streamTable.tableName)
-			.replace(/__KINESIS_STREAM_PREFIX__/g, kinesisStreamPrefix)
 			.replace(/__CODE_BUCKET__/g, this.codeBucket.bucketName)
+			.replace(/__SRTP_KEY_PARAMETER_PREFIX__/g, `/${this.stackName}/srtp/port`)
+			.replace(/__SRTP_PORT_RANGE_START__/g, String(srtpPortRangeStart))
+			.replace(/__SRTP_PORT_RANGE_END__/g, String(srtpPortRangeEnd))
 
 		const userData = ec2.UserData.custom(userDataScript)
 
@@ -379,9 +416,54 @@ export class StreamingStack extends Stack {
 			})
 		}
 
+		// Create target groups + UDP listeners for SRTP ports 6000-6009 (same fleet, same
+		// stickiness/health-check pattern as the unencrypted 5000-5009 target groups above)
+		const srtpTargetGroups: elbv2.NetworkTargetGroup[] = []
+		for (let port = 6000; port <= 6009; port++) {
+			const targetGroup = new elbv2.NetworkTargetGroup(
+				this,
+				`SrtpTargetGroup${port}`,
+				{
+					vpc: this.vpc,
+					port,
+					protocol: elbv2.Protocol.UDP,
+					targetType: elbv2.TargetType.INSTANCE,
+					ipAddressType: elbv2.TargetGroupIpAddressType.IPV6,
+					healthCheck: {
+						protocol: elbv2.Protocol.TCP,
+						port: '9999',
+						healthyThresholdCount: 2,
+						unhealthyThresholdCount: 2,
+						interval: Duration.seconds(10),
+						timeout: Duration.seconds(10),
+					},
+					deregistrationDelay: Duration.seconds(30),
+					preserveClientIp: true,
+				},
+			)
+
+			targetGroup.setAttribute('stickiness.enabled', 'true')
+			targetGroup.setAttribute('stickiness.type', 'source_ip')
+
+			srtpTargetGroups.push(targetGroup)
+		}
+
+		for (let i = 0; i < srtpTargetGroups.length; i++) {
+			const port = 6000 + i
+			const targetGroup = srtpTargetGroups[i]
+			if (!targetGroup) {
+				throw new Error(`SRTP target group for port ${port} is undefined`)
+			}
+			this.networkLoadBalancer.addListener(`SrtpUDPListener${port}`, {
+				port,
+				protocol: elbv2.Protocol.UDP,
+				defaultAction: elbv2.NetworkListenerAction.forward([targetGroup]),
+			})
+		}
+
 		// Attach all target groups to the Auto Scaling Group
 		// This enables automatic registration/deregistration of instances
-		for (const targetGroup of targetGroups) {
+		for (const targetGroup of [...targetGroups, ...srtpTargetGroups]) {
 			this.autoScalingGroup.attachToNetworkTargetGroup(targetGroup)
 		}
 
@@ -543,8 +625,7 @@ export class StreamingStack extends Stack {
 
 		const kvsIncomingMetrics: Record<string, cloudwatch.IMetric> = {}
 		this.kinesisVideoStreams.forEach((_, i) => {
-			const port = kinesisStreamPortStart + i
-			const streamName = `${kinesisStreamPrefix}-${port}`
+			const streamName = `${KINESIS_STREAM_NAME_PREFIX}-${i + 1}`
 			kvsIncomingMetrics[`s${i}`] = new cloudwatch.Metric({
 				namespace: 'AWS/KinesisVideo',
 				metricName: 'PutMedia.IncomingBytes',
@@ -595,6 +676,13 @@ export class StreamingStack extends Stack {
 			new cloudwatch_actions.SnsAction(restartIngestionTopic),
 		)
 
+		// No separate SRTP alarm needed: SRTP and unencrypted ingestion now write into the
+		// same 10 Kinesis Video Streams (see the stream-creation loop above), so
+		// `kvsNoIngestionAlarm` already reflects ingestion health for whichever transport a
+		// given device actually uses, and `nlbUdpBytesAlarm` already covers traffic on both
+		// port ranges (it's load-balancer-wide). The composite above needs no SRTP-specific
+		// equivalent.
+
 		// CDK Outputs
 		new CfnOutput(this, 'StreamMetadataTableName', {
 			value: this.streamTable.tableName,
@@ -626,7 +714,7 @@ export class StreamingStack extends Stack {
 		// NLB Outputs
 		new CfnOutput(this, 'NLBDnsName', {
 			value: this.networkLoadBalancer.loadBalancerDnsName,
-			description: `Network Load Balancer DNS name for UDP video streaming (ports 5000-5009). Dual-stack: resolves to both A (IPv4) and AAAA (IPv6) records.`,
+			description: `Network Load Balancer DNS name for UDP video streaming (unencrypted MPEG-TS/H.264 on ports 5000-5009, SRTP-encrypted RTP/H.264 on ports 6000-6009). Dual-stack: resolves to both A (IPv4) and AAAA (IPv6) records.`,
 		})
 
 		new CfnOutput(this, 'NLBIPv4Address', {

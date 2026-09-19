@@ -5,8 +5,8 @@ How to test the UDP → GStreamer (kvssink) → Kinesis Video Streams pipeline.
 ## Prerequisites
 
 - Stack deployed (`npm run cdk:prod:deploy`).
-- EC2 instances have `KINESIS_STREAM_PREFIX` set (e.g. `{stackName}-video`) so
-  ingestion is enabled.
+- EC2 instances have `KINESIS_INGESTION_ENABLED=true` set (the CDK stack always
+  sets this) so ingestion is enabled.
 - FFmpeg installed on your machine for sending UDP (used by the test scripts).
   The server uses GStreamer and the AWS kvssink plugin (built from the Kinesis
   Video C++ Producer SDK in user-data).
@@ -72,15 +72,20 @@ Or stream from a webcam:
 ```
 
 The backend receives UDP on that port, starts the GStreamer pipeline for that
-port, and kvssink sends H.264 to the Kinesis stream named
-`{KINESIS_STREAM_PREFIX}-{port}` (e.g. `video-streaming-video-5000`).
+port, and kvssink sends H.264 to the numbered Kinesis Video Stream for that
+port: port 5000 → stream `video-streaming-2026-09-video-1`, port 5001 →
+`video-streaming-2026-09-video-2`, ..., port 5009 →
+`video-streaming-2026-09-video-10` (`port - 5000 + 1`). SRTP port 6000+N targets
+the same stream as unencrypted port 5000+N - see
+[TESTING-SRTP-INGESTION.md](./TESTING-SRTP-INGESTION.md) - so don't send both to
+the same numbered port at once.
 
 ## 3. Verify in AWS
 
 1. **Kinesis Video Streams console**  
-   Open the stream for the port you used (e.g. `{stackName}-video-5000`).
-   Confirm fragments are ingesting (e.g. “Fragment count” or “Ingestion”
-   metrics).
+   Open the stream for the port you used (e.g. port 5000 →
+   `video-streaming-2026-09-video-1`). Confirm fragments are ingesting (e.g.
+   “Fragment count” or “Ingestion” metrics).
 
 2. **Playback (optional)**  
    Use “Playback” or “Get HLS streaming session URL” in the console to play the
@@ -126,13 +131,12 @@ escaping the bang (e.g. in bash: `gst-launch-1.0 -e fdsrc fd=0 \! fakesink`).
 ## Troubleshooting
 
 - **Only “Updated last packet time” in logs, no Kinesis upload**  
-  Check startup logs for **“Kinesis ingestion disabled (KINESIS_STREAM_PREFIX
-  not set)”**. If you see that, the backend is not sending to Kinesis because
-  the env var is missing. On the server, confirm the systemd service has it:  
+  Check startup logs for **“Kinesis ingestion disabled
+  (KINESIS_INGESTION_ENABLED not set)”**. If you see that, the backend is not
+  sending to Kinesis because the env var is missing. On the server, confirm the
+  systemd service has it:  
   `systemctl show video-streaming.service --property=Environment`  
-  or inspect `/etc/systemd/system/video-streaming.service`. The CDK replaces
-  `__KINESIS_STREAM_PREFIX__` in user-data when the stack is deployed; replace
-  instances (or redeploy) if the service was created before that was added.
+  or inspect `/etc/systemd/system/video-streaming.service`.
 
 - **"erroneous pipeline: syntax error" when testing GStreamer**  
   See **Verify GStreamer (minimal pipeline)** above. Use
@@ -171,11 +175,11 @@ escaping the bang (e.g. in bash: `gst-launch-1.0 -e fdsrc fd=0 \! fakesink`).
   the build manually with `make -j1`.
 
 - **No fragments in Kinesis (plugin loads)**  
-  Ensure `KINESIS_STREAM_PREFIX` is set and the stack has Kinesis streams and
-  IAM for the EC2 role (GetDataEndpoint, PutMedia). In application logs, look
-  for “Kinesis ingestion started” and any “GStreamer stderr” or “GStreamer
-  error” messages. Source must be valid MPEG-TS with H.264; the test scripts
-  produce compatible streams.
+  Ensure `KINESIS_INGESTION_ENABLED=true` is set and the stack has Kinesis
+  streams and IAM for the EC2 role (GetDataEndpoint, PutMedia). In application
+  logs, look for “Kinesis ingestion started” and any “GStreamer stderr” or
+  “GStreamer error” messages. Source must be valid MPEG-TS with H.264; the test
+  scripts produce compatible streams.
 
 - **Stream not starting**  
   Send UDP for at least a few seconds so the inactivity timer sees activity and
@@ -253,5 +257,5 @@ escaping the bang (e.g. in bash: `gst-launch-1.0 -e fdsrc fd=0 \! fakesink`).
 # In an interactive shell, escape ! or run from a script to avoid history expansion.
 GST_PLUGIN_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build \
 LD_LIBRARY_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build \
-gst-launch-1.0 fdsrc fd=0 ! tsparse set-timestamps=true ! tsdemux name=d d. ! queue ! h264parse ! capsfilter caps="video/x-h264,stream-format=avc,alignment=au" ! kvssink stream-name="video-streaming-video-5000" aws-region="eu-central-1" storage-size=128 log-config="/opt/video-streaming/kvs_log_configuration"
+gst-launch-1.0 fdsrc fd=0 ! tsparse set-timestamps=true ! tsdemux name=d d. ! queue ! h264parse ! capsfilter caps="video/x-h264,stream-format=avc,alignment=au" ! kvssink stream-name="video-streaming-2026-09-video-1" aws-region="eu-central-1" storage-size=128 log-config="/opt/video-streaming/kvs_log_configuration"
 ```
