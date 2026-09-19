@@ -31,6 +31,9 @@ type StoredSrtpKey = {
 const DEFAULT_CIPHER = 'aes-128-icm'
 const DEFAULT_AUTH = 'hmac-sha1-80'
 
+/** AWS SSM GetParameters accepts at most 10 names per request. */
+const SSM_GET_PARAMETERS_MAX_NAMES = 10
+
 const isStoredSrtpKey = (value: unknown): value is StoredSrtpKey => {
 	if (typeof value !== 'object' || value === null) return false
 	const v = value as Record<string, unknown>
@@ -64,6 +67,15 @@ export class SrtpKeyStore {
 	 * for the rest; callers should treat a port with no entry in keysByPort as unconfigured.
 	 */
 	async loadPorts(ports: number[]): Promise<void> {
+		for (let i = 0; i < ports.length; i += SSM_GET_PARAMETERS_MAX_NAMES) {
+			await this.loadPortsChunk(
+				ports.slice(i, i + SSM_GET_PARAMETERS_MAX_NAMES),
+			)
+		}
+	}
+
+	/** Loads at most SSM_GET_PARAMETERS_MAX_NAMES ports in a single GetParameters call. */
+	private async loadPortsChunk(ports: number[]): Promise<void> {
 		if (ports.length === 0) return
 
 		const names = ports.map((port) => this.parameterNameForPort(port))

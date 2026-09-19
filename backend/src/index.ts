@@ -132,6 +132,28 @@ type PacketHandlerRangeConfig = {
 	isSrtp: boolean
 }
 
+/**
+ * Starts (or restarts) the Kinesis ingestion pipeline for a port, and releases the lock if
+ * the pipeline did not actually become active (e.g. missing SRTP key, credential resolution
+ * failure - start() can return without throwing in these cases). Without this, the lock
+ * would stay held while no pipeline is registered, and writePacket would silently drop all
+ * traffic for the port instead of letting another attempt/instance pick it up.
+ */
+const startPipelineOrReleaseLock = async (
+	port: number,
+	initialData?: Buffer | Buffer[],
+): Promise<void> => {
+	if (!kinesisIngestionPipeline) return
+	await kinesisIngestionPipeline.start(port, initialData)
+	if (!kinesisIngestionPipeline.isActive(port)) {
+		console.error(
+			`[Main] Kinesis ingestion pipeline failed to start for port ${port}; releasing lock`,
+		)
+		kinesisLockHeldForPorts.delete(port)
+		await streamMetadataService.releaseKinesisLock(port, instanceId)
+	}
+}
+
 const createPacketHandler = (
 	rangeConfig: PacketHandlerRangeConfig,
 ): PacketHandler => ({
@@ -172,7 +194,7 @@ const createPacketHandler = (
 					)
 					if (acquired) {
 						kinesisLockHeldForPorts.add(port)
-						await kinesisIngestionPipeline.start(port, initialData)
+						await startPipelineOrReleaseLock(port, initialData)
 					}
 				} catch (err) {
 					console.error(
@@ -213,7 +235,7 @@ const createPacketHandler = (
 
 		// Resume Kinesis pipeline only if we hold the lock (e.g. stream resume after brief inactivity)
 		if (kinesisIngestionPipeline && kinesisLockHeldForPorts.has(port)) {
-			void kinesisIngestionPipeline.start(port).catch((err) => {
+			void startPipelineOrReleaseLock(port).catch((err) => {
 				console.error(
 					`[Main] Error starting Kinesis ingestion for port ${port}:`,
 					err,
@@ -312,7 +334,7 @@ if (kinesisIngestionPipeline) {
 			)
 			setTimeout(() => {
 				lastPipelineRestartByPort.set(port, Date.now())
-				void kinesisIngestionPipeline?.start(port).catch((err) => {
+				void startPipelineOrReleaseLock(port).catch((err) => {
 					console.error(
 						`[Main] Error restarting Kinesis ingestion for port ${port}:`,
 						err,

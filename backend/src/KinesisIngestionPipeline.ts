@@ -136,6 +136,16 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	}
 
 	/**
+	 * Whether a pipeline is actually running for this port. start() can return without
+	 * throwing but without registering a pipeline either (e.g. missing SRTP key, credential
+	 * resolution failure) - callers must check this before treating start() as having
+	 * succeeded, so they don't hold a Kinesis lock for a port nothing is ingesting.
+	 */
+	isActive(port: number): boolean {
+		return this.activePipelines.has(port)
+	}
+
+	/**
 	 * Logs GStreamer stderr; throttles repeated warnings per category.
 	 */
 	private logGstStderr(
