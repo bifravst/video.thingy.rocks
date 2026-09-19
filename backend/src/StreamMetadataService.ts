@@ -39,6 +39,12 @@ export type StreamMetadata = {
 	 * starting near 0) and must not be used to seed it - see getSrtpRocState, which checks
 	 * this before trusting srtpRoc/srtpHighestSeq. */
 	srtpRocSsrc?: number
+	/** Non-secret fingerprint of the SRTP key srtpRoc/srtpHighestSeq were recorded under (see
+	 * KinesisIngestionPipeline.getConfiguredSrtpKeyFingerprint) - a second identity check
+	 * alongside srtpRocSsrc, since a key can be rotated in SSM while the device keeps the
+	 * same SSRC (the provisioning script permits this), which srtpRocSsrc alone would not
+	 * catch, letting stale state from the retired key seed a session using the new one. */
+	srtpRocKeyFingerprint?: string | null
 	createdAt: string
 	updatedAt: string
 }
@@ -256,22 +262,31 @@ export class StreamMetadataService {
 	}
 
 	/**
-	 * Reads the persisted SRTP rollover-tracking state for a stream slot ({roc: 0, highestSeq:
-	 * 0} if never persisted, or if it was persisted under a different SSRC - see srtpRocSsrc
-	 * on StreamMetadata; stale state from a previous session/device must never seed a fresh
-	 * one). Called once before starting an SRTP port's pipeline, to seed srtpdec correctly
-	 * across process restarts (see KinesisIngestionPipeline.seedSrtpRoc) - a fresh GStreamer
-	 * instance always starts at ROC 0 otherwise, which breaks decryption after any sequence
-	 * number rollover in the sender's session. Restoring only the ROC (inventing highestSeq:
-	 * 0) is itself unsafe - see seedSrtpRoc - so both fields are persisted and restored
-	 * together. Uses a strongly consistent read: this runs right before seeding a fresh
-	 * pipeline after a lock handoff, so an eventually-consistent read could still return the
-	 * *previous* owner's now-stale value even after it persisted a newer one.
+	 * Reads the persisted SRTP rollover-tracking state for a stream slot: `{roc: 0,
+	 * highestSeq: 0}` if never persisted, or if it was persisted under a different SSRC or
+	 * key fingerprint (see srtpRocSsrc/srtpRocKeyFingerprint on StreamMetadata - either
+	 * changing means state from a *previous* session/key must never seed a fresh one), or
+	 * `undefined` if the read itself failed. That `undefined` case is NOT the same as a
+	 * genuinely fresh session and must not be treated as one - a DynamoDB outage happening to
+	 * land right as a sender has wrapped would otherwise seed a fresh srtpdec with a
+	 * fabricated zero and silently break decryption; callers must treat `undefined` as
+	 * "state unavailable" (see index.ts's startPipelineOrReleaseLock, which releases the lock
+	 * and backs off rather than starting with a guessed value).
+	 *
+	 * Called once before starting an SRTP port's pipeline, to seed srtpdec correctly across
+	 * process restarts (see KinesisIngestionPipeline.seedSrtpRoc) - a fresh GStreamer instance
+	 * always starts at ROC 0 otherwise, which breaks decryption after any sequence number
+	 * rollover in the sender's session. Restoring only the ROC (inventing highestSeq: 0) is
+	 * itself unsafe - see seedSrtpRoc - so both fields are persisted and restored together.
+	 * Uses a strongly consistent read: this runs right before seeding a fresh pipeline after a
+	 * lock handoff, so an eventually-consistent read could still return the *previous*
+	 * owner's now-stale value even after it persisted a newer one.
 	 */
 	async getSrtpRocState(
 		port: number,
 		expectedSsrc: number,
-	): Promise<{ roc: number; highestSeq: number }> {
+		expectedKeyFingerprint: string | undefined,
+	): Promise<{ roc: number; highestSeq: number } | undefined> {
 		try {
 			const result = await this.docClient.send(
 				new GetCommand({
@@ -283,10 +298,16 @@ export class StreamMetadataService {
 			const roc: unknown = result.Item?.srtpRoc
 			const highestSeq: unknown = result.Item?.srtpHighestSeq
 			const storedSsrc: unknown = result.Item?.srtpRocSsrc
+			const storedKeyFingerprint: unknown = result.Item?.srtpRocKeyFingerprint
 			if (
 				typeof roc !== 'number' ||
 				typeof highestSeq !== 'number' ||
-				storedSsrc !== expectedSsrc
+				storedSsrc !== expectedSsrc ||
+				// Normalize both sides the same way updateSrtpRoc stores an absent
+				// fingerprint (as null, since DynamoDB has no "undefined") - comparing the
+				// raw values would treat null (stored) vs undefined (expected) as a mismatch
+				// even when neither side ever had a fingerprint to begin with.
+				storedKeyFingerprint !== (expectedKeyFingerprint ?? null)
 			) {
 				return { roc: 0, highestSeq: 0 }
 			}
@@ -296,21 +317,22 @@ export class StreamMetadataService {
 				`[StreamMetadataService] Error reading SRTP ROC state for port ${port}:`,
 				error,
 			)
-			return { roc: 0, highestSeq: 0 }
+			return undefined
 		}
 	}
 
 	/**
 	 * Persists the current SRTP rollover-tracking state (roc and highestSeq, tagged with the
-	 * SSRC they were observed under - see srtpRocSsrc) for a stream slot, throttled to once
-	 * per srtpRocUpdateThrottleMs unless `force` is set (e.g. on stream stop, to capture the
-	 * latest value before the slot potentially gets reassigned). Only succeeds if
-	 * `instanceId` currently holds the Kinesis lock for this slot - without that check, a
-	 * process whose heartbeat condition already failed (or that already released the slot)
-	 * could overwrite the current owner's state with stale data and break a later restart.
-	 * Returns false (without throwing) if the caller no longer owns the slot, or if the write
-	 * otherwise fails - callers must treat that as having lost the lock and stop
-	 * writing/relinquish their local pipeline, not just log and continue.
+	 * SSRC and key fingerprint they were observed under - see srtpRocSsrc/
+	 * srtpRocKeyFingerprint) for a stream slot, throttled to once per srtpRocUpdateThrottleMs
+	 * unless `force` is set (e.g. on stream stop, to capture the latest value before the slot
+	 * potentially gets reassigned). Only succeeds if `instanceId` currently holds the Kinesis
+	 * lock for this slot - without that check, a process whose heartbeat condition already
+	 * failed (or that already released the slot) could overwrite the current owner's state
+	 * with stale data and break a later restart. Returns false (without throwing) if the
+	 * caller no longer owns the slot, or if the write otherwise fails - callers must treat
+	 * that as having lost the lock and stop writing/relinquish their local pipeline, not just
+	 * log and continue.
 	 */
 	async updateSrtpRoc(
 		port: number,
@@ -318,6 +340,7 @@ export class StreamMetadataService {
 		roc: number,
 		highestSeq: number,
 		ssrc: number,
+		keyFingerprint: string | undefined,
 		force = false,
 	): Promise<boolean> {
 		const now = Date.now()
@@ -331,11 +354,12 @@ export class StreamMetadataService {
 					TableName: this.tableName,
 					Key: { port },
 					UpdateExpression:
-						'SET srtpRoc = :roc, srtpHighestSeq = :highestSeq, srtpRocSsrc = :ssrc, updatedAt = :updatedAt',
+						'SET srtpRoc = :roc, srtpHighestSeq = :highestSeq, srtpRocSsrc = :ssrc, srtpRocKeyFingerprint = :keyFingerprint, updatedAt = :updatedAt',
 					ExpressionAttributeValues: {
 						':roc': roc,
 						':highestSeq': highestSeq,
 						':ssrc': ssrc,
+						':keyFingerprint': keyFingerprint ?? null,
 						':updatedAt': new Date().toISOString(),
 						':instanceId': instanceId,
 					},

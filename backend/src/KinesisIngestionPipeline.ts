@@ -142,6 +142,29 @@ export const advanceSrtpRoc = (
 	return { highestSeq: seq, roc: bestRoc }
 }
 
+/**
+ * Computes the "roc" value to seed a fresh srtpdec instance with, given our best current
+ * tracking state, so that libsrtp's own internal rollover estimate for the *next* packet it
+ * actually receives resolves to the correct ROC.
+ *
+ * GStreamer's srtpdec only exposes a caps "roc" field (srtp_set_stream_roc), which sets the
+ * ROC half of its internal 48-bit tracked index but leaves the low 16 bits (the "highest
+ * sequence number seen") at 0 - there is no caps field for that. So if we seed roc=5 while
+ * the sender's actual current sequence number is, say, 40000, libsrtp's own RFC3711-style
+ * guess for the first real packet compares candidate extended indices (4,5,6)*65536+40000
+ * against its baseline of 5*65536+0, and 4*65536+40000 is the closest - i.e. it silently
+ * decides to use ROC 4, not the 5 we asked for, and decryption/auth fails.
+ *
+ * Working through that same fixed arithmetic (candidate distance vs a baseline pinned at
+ * seededRoc*65536+0) shows the guess resolves to our seeded value exactly when the real
+ * sequence number is below 32768, and to `seededRoc - 1` when it's 32768 or above. We exploit
+ * that in reverse: when our own tracked highestSeq (the best available proxy for whatever
+ * sequence number is about to arrive next) is in the upper half, seed `roc + 1` instead of
+ * `roc` - libsrtp's own guess then resolves that back down to the correct roc.
+ */
+export const srtpdecSeedRoc = (state: SrtpRocState): number =>
+	state.highestSeq >= 0x8000 ? state.roc + 1 : state.roc
+
 /** Per-port throttle for GStreamer stderr warning categories. */
 type GstStderrThrottle = { lastLog: Record<string, number> }
 
@@ -293,6 +316,14 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	 * a stale ROC from a previous session/device would misseed a genuinely fresh one). */
 	getConfiguredSrtpSsrc(port: number): number | undefined {
 		return this.config.srtp?.keyStore.getKeyForPort(port)?.ssrc
+	}
+
+	/** Non-secret fingerprint of the currently-configured SRTP key for a port (undefined if
+	 * SRTP isn't configured or no key is loaded yet) - see SrtpKeyStore.keyFingerprint. A
+	 * second identity check alongside getConfiguredSrtpSsrc for persisted ROC state, since a
+	 * key can be rotated in SSM while keeping the same SSRC, which SSRC alone wouldn't catch. */
+	getConfiguredSrtpKeyFingerprint(port: number): string | undefined {
+		return this.config.srtp?.keyStore.getKeyForPort(port)?.keyFingerprint
 	}
 
 	/**
@@ -749,7 +780,9 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		// Verify caps field names/values (especially srtp-cipher/srtp-auth enum literals) against
 		// the actual installed GStreamer version via `gst-inspect-1.0 srtpdec` - see docs/TESTING-SRTP-INGESTION.md.
 		// "roc" seeds srtpdec's rollover counter (see trackSrtpRoc/getSrtpRoc) so a restart
-		// after the sender's sequence number has wrapped doesn't start back at ROC 0.
+		// after the sender's sequence number has wrapped doesn't start back at ROC 0. Callers
+		// must pass it through srtpdecSeedRoc, not a raw tracked/persisted roc value - see
+		// that function's doc comment for why the raw value alone can seed the wrong ROC.
 		const caps = [
 			'application/x-srtp',
 			'media=(string)video',
@@ -871,8 +904,15 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		const jitterBufferLatencyMs =
 			srtpConfig.jitterBufferLatencyMs ?? DEFAULT_SRTP_JITTER_BUFFER_LATENCY_MS
 
-		// Account for any rollover within the buffered data itself before seeding this
-		// pipeline instance's ROC (see trackSrtpRoc/getSrtpRoc).
+		// Capture the state applicable to the very first datagram we're about to actually
+		// feed this fresh srtpdec instance - NOT the state after folding in the whole
+		// buffered batch below, which could itself span a rollover and would then misseed
+		// the earliest replayed packets with a ROC that only applies to the latest ones.
+		const rocStateBeforeReplay = this.getSrtpRocState(port)
+
+		// Still track every buffered datagram (including via any rollover within the batch
+		// itself) for our own bookkeeping, independently of what gets seeded above - this is
+		// what the next heartbeat/persist call (see index.ts) reports as current.
 		for (const datagram of initialDatagrams) {
 			this.trackSrtpRoc(port, datagram)
 		}
@@ -884,7 +924,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			logConfigPath: this.logConfigPath(),
 			key,
 			jitterBufferLatencyMs,
-			roc: this.getSrtpRoc(port),
+			roc: srtpdecSeedRoc(rocStateBeforeReplay),
 		})
 
 		this.logger.info('GStreamer command (SRTP)', {

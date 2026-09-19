@@ -4,6 +4,7 @@ import {
 	advanceSrtpRoc,
 	KinesisIngestionPipeline,
 	parseAuthenticRtpSequenceNumber,
+	srtpdecSeedRoc,
 	type SrtpRocState,
 } from './KinesisIngestionPipeline.ts'
 import type { SrtpKeyStore } from './SrtpKeyStore.ts'
@@ -138,6 +139,27 @@ void describe('KinesisIngestionPipeline', () => {
 			const beforeStale = state
 			state = advanceSrtpRoc(state, 150) // stale/reordered, lower than highest seen
 			assert.deepStrictEqual(state, beforeStale)
+		})
+	})
+
+	void describe('srtpdecSeedRoc', () => {
+		void it('seeds the raw roc when the tracked sequence is in the lower half', () => {
+			assert.strictEqual(srtpdecSeedRoc({ roc: 5, highestSeq: 100 }), 5)
+			assert.strictEqual(srtpdecSeedRoc({ roc: 5, highestSeq: 0x7fff }), 5)
+		})
+
+		void it('seeds roc+1 when the tracked sequence is in the upper half', () => {
+			// Regression case from the review finding: seeding roc=5 alone while the real
+			// sequence number is far above 0 makes libsrtp's own internal rollover guess
+			// (which starts its baseline at roc*65536+0) land on roc-1 instead - seeding
+			// roc+1 here compensates so libsrtp's guess resolves back down to the real roc.
+			assert.strictEqual(srtpdecSeedRoc({ roc: 5, highestSeq: 0x8000 }), 6)
+			assert.strictEqual(srtpdecSeedRoc({ roc: 5, highestSeq: 40000 }), 6)
+			assert.strictEqual(srtpdecSeedRoc({ roc: 5, highestSeq: 0xffff }), 6)
+		})
+
+		void it('seeds 0 for a never-observed stream regardless of the half-space rule', () => {
+			assert.strictEqual(srtpdecSeedRoc({ roc: 0, highestSeq: 0 }), 0)
 		})
 	})
 

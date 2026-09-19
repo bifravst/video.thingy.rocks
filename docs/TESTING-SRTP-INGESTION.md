@@ -156,7 +156,19 @@ started" (not "Kinesis ingestion started") in application logs.
   sender's 16-bit sequence number has ever wrapped. This is a best-effort
   estimate, not a guarantee - if it's ever visibly wrong, check the
   `srtpRoc`/`srtpHighestSeq` values in the `StreamMetadata` DynamoDB item for
-  the affected slot.
+  the affected slot. This state is only trusted when both `srtpRocSsrc` and
+  `srtpRocKeyFingerprint` (a non-secret hash of the key, see
+  `SrtpKeyStore.keyFingerprint`) still match the currently-configured key - a
+  key rotated in SSM without changing the SSRC would otherwise seed a fresh
+  session with a previous key's stale state. If DynamoDB itself can't be read at
+  startup, the backend treats that as "state unavailable" (not a fresh ROC of 0)
+  and releases the lock/backs off rather than guessing. GStreamer's own rollover
+  estimate for the _first_ packet a fresh `srtpdec` instance sees also only has
+  the seeded ROC to go on (its own tracked sequence number starts at 0), so
+  seeding the raw persisted ROC is itself not quite enough when the sender's
+  real sequence number is currently in the upper half of the 16-bit range - see
+  `srtpdecSeedRoc`'s doc comment for the (very fiddly) arithmetic reason and the
+  `roc + 1` compensation it applies.
 
 - **Two producers competing for the same stream** - a device must use only one
   of the unencrypted or SRTP transports per assigned stream slot (see

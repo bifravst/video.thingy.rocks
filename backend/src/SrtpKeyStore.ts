@@ -1,4 +1,5 @@
 import { GetParametersCommand, SSMClient } from '@aws-sdk/client-ssm'
+import { createHash } from 'node:crypto'
 import { Logger } from './Logger.ts'
 
 /** 16-byte AES key + 14-byte salt (SRTP master key+salt), hex-encoded = 60 hex chars. */
@@ -13,7 +14,20 @@ export type SrtpPortKey = {
 	ssrc: number
 	cipher: string
 	auth: string
+	/** Non-secret fingerprint of keyHex (see keyFingerprint) - safe to persist/log, unlike
+	 * keyHex itself. */
+	keyFingerprint: string
 }
+
+/**
+ * A non-secret, deterministic fingerprint of an SRTP key, used to detect a key rotation that
+ * keeps the same SSRC (the provisioning script permits this) - see StreamMetadata's
+ * srtpRocKeyFingerprint doc comment for why SSRC alone can't catch that case. SHA-256 is a
+ * one-way function, so this reveals nothing about keyHex; truncated since it only needs to
+ * distinguish keys from each other, not resist adversarial collision search.
+ */
+export const keyFingerprint = (keyHex: string): string =>
+	createHash('sha256').update(keyHex).digest('hex').slice(0, 16)
 
 export type SrtpKeyStoreConfig = {
 	region?: string
@@ -160,6 +174,7 @@ export class SrtpKeyStore {
 				ssrc: parsed.ssrc,
 				cipher: parsed.cipher ?? SUPPORTED_SRTP_CIPHER,
 				auth: parsed.auth ?? SUPPORTED_SRTP_AUTH,
+				keyFingerprint: keyFingerprint(parsed.key),
 			})
 			this.logger.info('Loaded SRTP key', { port })
 		}

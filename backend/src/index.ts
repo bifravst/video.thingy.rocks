@@ -223,6 +223,38 @@ type PacketHandlerRangeConfig = {
  * and writePacket would silently drop all traffic for the port instead of letting another
  * attempt/instance pick it up.
  */
+/**
+ * Shared tail for startPipelineOrReleaseLock's failure paths (a failed start, or a failed
+ * read of persisted SRTP ROC state): releases the lock, backs off before the next attempt,
+ * and re-arms the pre-start buffer so a later packet can retry. Without the re-arm, a
+ * failure here would strand the port until a full inactivity/resume cycle happens on its
+ * own, since none of isFirstPacket/isResume/preStartBufferByPort.has(port) would hold once
+ * the stream is already 'active' with no buffer entry.
+ */
+const releaseLockBackoffAndRearm = async (
+	port: number,
+	slot: number,
+	initialData: Buffer | Buffer[] | undefined,
+): Promise<void> => {
+	clearLockHeld(port)
+	try {
+		await streamMetadataService.releaseKinesisLock(slot, instanceId)
+	} catch (err) {
+		console.error(`[Main] Error releasing Kinesis lock for port ${port}:`, err)
+	}
+
+	nextStartAttemptAllowedAtByPort.set(port, Date.now() + START_RETRY_BACKOFF_MS)
+
+	const chunks =
+		initialData === undefined
+			? []
+			: Array.isArray(initialData)
+				? initialData
+				: [initialData]
+	const totalBytes = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
+	preStartBufferByPort.set(port, { chunks, totalBytes })
+}
+
 const startPipelineOrReleaseLock = async (
 	port: number,
 	initialData?: Buffer | Buffer[],
@@ -240,13 +272,30 @@ const startPipelineOrReleaseLock = async (
 		// Seed from persisted state before spawning - a fresh srtpdec instance always starts
 		// at ROC 0 otherwise, which breaks decryption after any sequence-number rollover in
 		// the sender's session (see KinesisIngestionPipeline.seedSrtpRoc/getSrtpRocState).
-		// getSrtpRocState never throws (returns zeros on error), so no try/catch needed here.
-		// Only trusts persisted state recorded under the currently-configured SSRC - a stale
-		// value from a previous key/device would misseed a genuinely fresh session.
+		// Only trusts persisted state recorded under the currently-configured SSRC *and* key
+		// fingerprint - either changing (a device/key rotation) means state from the
+		// *previous* session is meaningless and must not seed a genuinely fresh one.
 		const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
 		if (ssrc !== undefined) {
-			const persisted = await streamMetadataService.getSrtpRocState(slot, ssrc)
+			const keyFingerprint =
+				kinesisIngestionPipeline.getConfiguredSrtpKeyFingerprint(port)
+			const persisted = await streamMetadataService.getSrtpRocState(
+				slot,
+				ssrc,
+				keyFingerprint,
+			)
 			if (isStale()) return // ownership changed while awaiting DynamoDB; abandon
+			if (persisted === undefined) {
+				// A DynamoDB read failure is not the same as a genuinely fresh/never-persisted
+				// session (see getSrtpRocState) - seeding with a fabricated zero here could
+				// silently break decryption if the sender has already wrapped. Treat this like
+				// a failed start rather than guessing.
+				console.error(
+					`[Main] Failed to read persisted SRTP ROC state for port ${port}; releasing lock`,
+				)
+				await releaseLockBackoffAndRearm(port, slot, initialData)
+				return
+			}
 			kinesisIngestionPipeline.seedSrtpRoc(port, persisted)
 		}
 	}
@@ -283,31 +332,7 @@ const startPipelineOrReleaseLock = async (
 	console.error(
 		`[Main] Kinesis ingestion pipeline failed to start for port ${port}; releasing lock`,
 	)
-	clearLockHeld(port)
-	try {
-		await streamMetadataService.releaseKinesisLock(slot, instanceId)
-	} catch (err) {
-		console.error(`[Main] Error releasing Kinesis lock for port ${port}:`, err)
-	}
-
-	// Back off before the next attempt for this port - without this, re-arming the buffer
-	// below lets a persistent failure (missing key, bad credentials, missing plugin) retry
-	// on literally the next packet, hammering DynamoDB and logs at line rate.
-	nextStartAttemptAllowedAtByPort.set(port, Date.now() + START_RETRY_BACKOFF_MS)
-
-	// Re-arm the pre-start buffer so subsequent packets can trigger another attempt once the
-	// backoff above elapses. onPacket only re-enters the buffering/lock-acquire path while
-	// isFirstPacket/isResume/preStartBufferByPort.has(port) holds - none of which are true
-	// once the stream is already 'active' with no buffer entry, so without this a failed
-	// start here would strand the port until a full inactivity/resume cycle happens on its own.
-	const chunks =
-		initialData === undefined
-			? []
-			: Array.isArray(initialData)
-				? initialData
-				: [initialData]
-	const totalBytes = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
-	preStartBufferByPort.set(port, { chunks, totalBytes })
+	await releaseLockBackoffAndRearm(port, slot, initialData)
 }
 
 /** A PacketHandler plus a hook shutdown() uses to drain this handler's per-port queues before
@@ -323,11 +348,15 @@ const createPacketHandler = (
 		port: number,
 		data: Buffer,
 		timestamp: Date,
+		// Snapshotted by enqueuePacket *before* it calls streamStateManager.onPacketReceived
+		// for this same packet - onPacketReceived immediately flips a missing/inactive
+		// stream to 'active', so deriving these from getStreamState(port) here (after the
+		// queue has already delayed this packet) would always see the post-update state and
+		// never observe a genuine first/resume packet, permanently breaking pre-start
+		// buffering and lock acquisition for new and resumed streams.
+		isFirstPacket: boolean,
+		isResume: boolean,
 	): Promise<void> => {
-		const streamState = streamStateManager.getStreamState(port)
-		const isFirstPacket = streamState === undefined
-		const isResume = streamState?.status === 'inactive'
-
 		let packetAlreadyInInitialData = false
 		// Buffer packets until we have enough data, then acquire Kinesis lock and start GStreamer.
 		// This prevents port scans (small random payloads) from being treated as video streams.
@@ -438,12 +467,15 @@ const createPacketHandler = (
 			const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
 			if (ssrc !== undefined) {
 				const rocState = kinesisIngestionPipeline.getSrtpRocState(port)
+				const keyFingerprint =
+					kinesisIngestionPipeline.getConfiguredSrtpKeyFingerprint(port)
 				const stillOwner = await streamMetadataService.updateSrtpRoc(
 					slot,
 					instanceId,
 					rocState.roc,
 					rocState.highestSeq,
 					ssrc,
+					keyFingerprint,
 				)
 				if (!stillOwner) {
 					await relinquishPort(port)
@@ -478,7 +510,12 @@ const createPacketHandler = (
 	const queueStateByPort = new Map<
 		number,
 		{
-			queue: { data: Buffer; timestamp: Date }[]
+			queue: {
+				data: Buffer
+				timestamp: Date
+				isFirstPacket: boolean
+				isResume: boolean
+			}[]
 			totalBytes: number
 			draining: boolean
 		}
@@ -512,6 +549,15 @@ const createPacketHandler = (
 	}
 
 	const enqueuePacket = (port: number, data: Buffer, timestamp: Date): void => {
+		// Snapshot first/resume status *before* onPacketReceived below flips a missing or
+		// inactive stream to 'active' - once that runs, getStreamState(port) reports 'active'
+		// regardless of what it was a moment ago, so deriving these later (inside
+		// processPacket, once this packet's turn in the queue comes up) would never see a
+		// genuine first/resume transition.
+		const streamState = streamStateManager.getStreamState(port)
+		const isFirstPacket = streamState === undefined
+		const isResume = streamState?.status === 'inactive'
+
 		// Record receipt immediately, not after this packet works its way through the queue -
 		// streamStateManager's inactivity timer/active-state must reflect true receipt time.
 		// Deferring this into processPacket (as before) meant a backed-up queue (slow
@@ -526,7 +572,7 @@ const createPacketHandler = (
 			queueStateByPort.set(port, state)
 		}
 
-		state.queue.push({ data, timestamp })
+		state.queue.push({ data, timestamp, isFirstPacket, isResume })
 		state.totalBytes += data.length
 		while (state.totalBytes > maxQueuedBytes && state.queue.length > 1) {
 			const dropped = state.queue.shift()
@@ -541,7 +587,13 @@ const createPacketHandler = (
 				if (!next) break
 				state.totalBytes -= next.data.length
 				try {
-					await processPacket(port, next.data, next.timestamp)
+					await processPacket(
+						port,
+						next.data,
+						next.timestamp,
+						next.isFirstPacket,
+						next.isResume,
+					)
 				} catch (err) {
 					console.error(
 						`[Main] Unhandled error processing packet for port ${port}:`,
@@ -586,6 +638,19 @@ const createPacketHandler = (
 			// release the lock below, racing the handoff this ordering is meant to guarantee.
 			await waitForPortQueueIdle(port)
 
+			// A resume can race this stop: a new packet may have arrived and been fully
+			// processed - including possibly re-acquiring the lock and starting a fresh
+			// pipeline - while we were waiting above (streamStateManager doesn't emit a
+			// distinct 'streamResume' event this could hook into instead). If the stream is
+			// active again, this stop callback is now stale; tearing down below would undo
+			// that legitimate resume and leave an active stream without ingestion.
+			if (streamStateManager.getStreamState(port)?.status === 'active') {
+				console.log(
+					`[Main] Stream on port ${port} resumed before stop could complete; aborting stale stop`,
+				)
+				return
+			}
+
 			preStartBufferByPort.delete(port)
 
 			// Stop the producer *before* releasing the lock (and before persisting final
@@ -605,12 +670,15 @@ const createPacketHandler = (
 				const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
 				if (kinesisIngestionPipeline.isSrtpPort(port) && ssrc !== undefined) {
 					const rocState = kinesisIngestionPipeline.getSrtpRocState(port)
+					const keyFingerprint =
+						kinesisIngestionPipeline.getConfiguredSrtpKeyFingerprint(port)
 					await streamMetadataService.updateSrtpRoc(
 						slot,
 						instanceId,
 						rocState.roc,
 						rocState.highestSeq,
 						ssrc,
+						keyFingerprint,
 						true,
 					)
 				}
@@ -764,12 +832,15 @@ const shutdown = async (): Promise<void> => {
 			ssrc !== undefined
 		) {
 			const rocState = kinesisIngestionPipeline.getSrtpRocState(port)
+			const keyFingerprint =
+				kinesisIngestionPipeline.getConfiguredSrtpKeyFingerprint(port)
 			await streamMetadataService.updateSrtpRoc(
 				slot,
 				instanceId,
 				rocState.roc,
 				rocState.highestSeq,
 				ssrc,
+				keyFingerprint,
 				true,
 			)
 		}
