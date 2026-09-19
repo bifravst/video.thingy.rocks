@@ -114,6 +114,50 @@ const kinesisIngestionPipeline = config.kinesisIngestionEnabled
 const kinesisLockHeldForPorts = new Set<number>()
 
 /**
+ * Serializes "try to acquire and start ingestion for this stream slot" by slot number, so
+ * the unencrypted and SRTP ports for the same device - handled by two independently
+ * draining per-range packet queues, see createPacketHandler - can never both race into
+ * tryAcquireKinesisLock concurrently. Without this, if both ports crossed their
+ * pre-start-buffer threshold at close enough wall-clock times, both could see no local
+ * holder yet, and DynamoDB's own-instance-id clause would let both acquisitions "succeed"
+ * (it has no way to know two different local callers are asking) - creating two producers
+ * for one Kinesis stream. This is a one-time-per-stream-start operation (not per-packet),
+ * so an unbounded promise-chain mutex is fine here (no risk of the unbounded-queue problem
+ * a per-packet version would have).
+ */
+const slotAcquisitionMutexTail = new Map<number, Promise<unknown>>()
+
+const withSlotLock = async <T>(
+	slot: number,
+	fn: () => Promise<T>,
+): Promise<T> => {
+	const previous = slotAcquisitionMutexTail.get(slot) ?? Promise.resolve()
+	const result = previous.then(fn, fn)
+	slotAcquisitionMutexTail.set(
+		slot,
+		result.catch(() => {}),
+	)
+	return result
+}
+
+/**
+ * Stops the local pipeline and clears our in-process lock bookkeeping for a port, without
+ * touching DynamoDB - used when a conditional write (updateSrtpRoc) reports we're no longer
+ * the slot's owner there, so there is nothing left for us to release; continuing to run
+ * (and write to) a pipeline we've lost the lock for is exactly the competing-producer
+ * problem the lock exists to prevent.
+ */
+const relinquishPort = async (port: number): Promise<void> => {
+	console.warn(
+		`[Main] Lost Kinesis lock for port ${port}; stopping local pipeline`,
+	)
+	kinesisLockHeldForPorts.delete(port)
+	if (kinesisIngestionPipeline) {
+		await kinesisIngestionPipeline.stop(port)
+	}
+}
+
+/**
  * Per-port buffer of packets before we start GStreamer. We wait until at least
  * kinesisMinBytesBeforeStart (10 MB) to avoid treating port scans as video streams.
  */
@@ -163,9 +207,14 @@ const startPipelineOrReleaseLock = async (
 		// Seed from persisted state before spawning - a fresh srtpdec instance always starts
 		// at ROC 0 otherwise, which breaks decryption after any sequence-number rollover in
 		// the sender's session (see KinesisIngestionPipeline.seedSrtpRoc/getSrtpRoc).
-		// getSrtpRoc never throws (returns 0 on error), so no try/catch needed here.
-		const persistedRoc = await streamMetadataService.getSrtpRoc(slot)
-		kinesisIngestionPipeline.seedSrtpRoc(port, persistedRoc)
+		// getSrtpRoc never throws (returns 0 on error), so no try/catch needed here. Only
+		// trusts a persisted ROC recorded under the currently-configured SSRC - a stale
+		// value from a previous key/device would misseed a genuinely fresh session.
+		const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
+		if (ssrc !== undefined) {
+			const persistedRoc = await streamMetadataService.getSrtpRoc(slot, ssrc)
+			kinesisIngestionPipeline.seedSrtpRoc(port, persistedRoc)
+		}
 	}
 
 	let failed: boolean
@@ -254,11 +303,10 @@ const createPacketHandler = (
 				if (dropped !== undefined) buf.totalBytes -= dropped.length
 			}
 
-			// A stream slot is shared between the unencrypted and SRTP transports (see
-			// KinesisIngestionPipeline.streamSlotForPort) - if the *other* port for this slot
-			// already holds the lock (in this process), don't even attempt to acquire it here.
-			// This is the same-instance backstop; tryAcquireKinesisLock's slot-keyed
-			// conditional write below is what protects against the cross-instance case.
+			// Cheap, best-effort early-exit check (see the authoritative re-check inside
+			// withSlotLock below for why this alone isn't enough): if the *other* port for
+			// this stream slot already holds the lock in this process, skip the mutex
+			// entirely rather than queuing up behind it for nothing.
 			const pairedPort = kinesisIngestionPipeline.pairedPortFor(port)
 			const pairedPortHoldsLock =
 				pairedPort !== undefined && kinesisLockHeldForPorts.has(pairedPort)
@@ -274,16 +322,32 @@ const createPacketHandler = (
 					? buf.chunks
 					: Buffer.concat(buf.chunks)
 				packetAlreadyInInitialData = true
+				const slot = kinesisIngestionPipeline.streamSlotForPort(port)
 				try {
-					const slot = kinesisIngestionPipeline.streamSlotForPort(port)
-					const acquired = await streamMetadataService.tryAcquireKinesisLock(
-						slot,
-						instanceId,
-					)
-					if (acquired) {
-						kinesisLockHeldForPorts.add(port)
-						await startPipelineOrReleaseLock(port, initialData)
-					}
+					// The unencrypted and SRTP ports for this slot are drained by two
+					// independent per-range queues (see createPacketHandler), so without this
+					// mutex, both could cross their threshold at close enough wall-clock times
+					// to both see no local holder and both "succeed" at tryAcquireKinesisLock
+					// (DynamoDB's own-instance-id clause can't distinguish two local callers).
+					// Re-check paired-port ownership *inside* the lock - the snapshot above,
+					// taken before queuing for the mutex, can be stale by the time we get it.
+					await withSlotLock(slot, async () => {
+						const pairedPortNow = kinesisIngestionPipeline.pairedPortFor(port)
+						if (
+							pairedPortNow !== undefined &&
+							kinesisLockHeldForPorts.has(pairedPortNow)
+						) {
+							return
+						}
+						const acquired = await streamMetadataService.tryAcquireKinesisLock(
+							slot,
+							instanceId,
+						)
+						if (acquired) {
+							kinesisLockHeldForPorts.add(port)
+							await startPipelineOrReleaseLock(port, initialData)
+						}
+					})
 				} catch (err) {
 					console.error(
 						`[Main] Error acquiring Kinesis lock / starting ingestion for port ${port}:`,
@@ -309,12 +373,21 @@ const createPacketHandler = (
 			}
 
 			// Persist the best-known SRTP ROC alongside the heartbeat (throttled internally,
-			// safe to call every packet) - see KinesisIngestionPipeline.getSrtpRoc.
-			if (kinesisIngestionPipeline.isSrtpPort(port)) {
-				await streamMetadataService.updateSrtpRoc(
+			// safe to call every packet) - see KinesisIngestionPipeline.getSrtpRoc. If this
+			// reports we're no longer the slot's owner (a condition-checked write), stop
+			// writing to Kinesis for a stream we've lost the lock for instead of continuing
+			// as a competing producer.
+			const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
+			if (ssrc !== undefined) {
+				const stillOwner = await streamMetadataService.updateSrtpRoc(
 					slot,
+					instanceId,
 					kinesisIngestionPipeline.getSrtpRoc(port),
+					ssrc,
 				)
+				if (!stillOwner) {
+					await relinquishPort(port)
+				}
 			}
 		}
 
@@ -412,24 +485,33 @@ const createPacketHandler = (
 
 			preStartBufferByPort.delete(port)
 
+			// Stop the producer *before* releasing the lock (and before persisting final
+			// state) - releasing first would let another instance acquire the slot and start
+			// writing while this producer is still shutting down (up to its stop timeout),
+			// creating two producers for the same Kinesis stream. Release is the final step
+			// of the handoff, not an early one.
+			if (kinesisIngestionPipeline) {
+				await kinesisIngestionPipeline.stop(port)
+			}
+
 			if (kinesisIngestionPipeline && kinesisLockHeldForPorts.has(port)) {
 				const slot = kinesisIngestionPipeline.streamSlotForPort(port)
-				await streamMetadataService.releaseKinesisLock(slot, instanceId)
-				kinesisLockHeldForPorts.delete(port)
 
 				// Force (bypass the throttle) so the freshest ROC is captured before this
 				// slot potentially gets reassigned to a different port/instance.
-				if (kinesisIngestionPipeline.isSrtpPort(port)) {
+				const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
+				if (kinesisIngestionPipeline.isSrtpPort(port) && ssrc !== undefined) {
 					await streamMetadataService.updateSrtpRoc(
 						slot,
+						instanceId,
 						kinesisIngestionPipeline.getSrtpRoc(port),
+						ssrc,
 						true,
 					)
 				}
-			}
 
-			if (kinesisIngestionPipeline) {
-				await kinesisIngestionPipeline.stop(port)
+				await streamMetadataService.releaseKinesisLock(slot, instanceId)
+				kinesisLockHeldForPorts.delete(port)
 			}
 		},
 	}
@@ -553,21 +635,31 @@ const shutdown = async (): Promise<void> => {
 	await srtpUdpListener?.stop()
 	streamStateManager.stop()
 	preStartBufferByPort.clear()
-	for (const port of kinesisLockHeldForPorts) {
-		const slot = kinesisIngestionPipeline?.streamSlotForPort(port) ?? port
-		await streamMetadataService.releaseKinesisLock(slot, instanceId)
-		if (kinesisIngestionPipeline?.isSrtpPort(port) === true) {
-			await streamMetadataService.updateSrtpRoc(
-				slot,
-				kinesisIngestionPipeline.getSrtpRoc(port),
-				true,
-			)
-		}
-	}
-	kinesisLockHeldForPorts.clear()
+
+	// Stop every producer *before* releasing any locks - see the same ordering rationale in
+	// onStreamStop above.
 	if (kinesisIngestionPipeline) {
 		await kinesisIngestionPipeline.stopAll()
 	}
+
+	for (const port of kinesisLockHeldForPorts) {
+		const slot = kinesisIngestionPipeline?.streamSlotForPort(port) ?? port
+		const ssrc = kinesisIngestionPipeline?.getConfiguredSrtpSsrc(port)
+		if (
+			kinesisIngestionPipeline?.isSrtpPort(port) === true &&
+			ssrc !== undefined
+		) {
+			await streamMetadataService.updateSrtpRoc(
+				slot,
+				instanceId,
+				kinesisIngestionPipeline.getSrtpRoc(port),
+				ssrc,
+				true,
+			)
+		}
+		await streamMetadataService.releaseKinesisLock(slot, instanceId)
+	}
+	kinesisLockHeldForPorts.clear()
 
 	console.log('[Main] Shutdown complete')
 	process.exit(0)

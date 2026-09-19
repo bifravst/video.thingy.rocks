@@ -27,6 +27,11 @@ export type StreamMetadata = {
 	 * KinesisIngestionPipeline.getSrtpRoc/seedSrtpRoc. Only meaningful when the device uses
 	 * the SRTP transport; absent/0 otherwise. */
 	srtpRoc?: number
+	/** The SSRC srtpRoc was recorded under. A key/device change gives the port a new SSRC,
+	 * at which point a persisted ROC from the *previous* session is meaningless (that
+	 * session's sequence numbers have nothing to do with a fresh one starting near 0) and
+	 * must not be used to seed it - see getSrtpRoc, which checks this before trusting srtpRoc. */
+	srtpRocSsrc?: number
 	createdAt: string
 	updatedAt: string
 }
@@ -244,19 +249,29 @@ export class StreamMetadataService {
 	}
 
 	/**
-	 * Reads the persisted SRTP rollover counter for a stream slot (0 if never persisted).
-	 * Called once before starting an SRTP port's pipeline, to seed srtpdec correctly across
-	 * process restarts (see KinesisIngestionPipeline.seedSrtpRoc) - a fresh GStreamer
-	 * instance always starts at ROC 0 otherwise, which breaks decryption after any sequence
-	 * number rollover in the sender's session.
+	 * Reads the persisted SRTP rollover counter for a stream slot (0 if never persisted, or
+	 * if it was persisted under a different SSRC - see srtpRocSsrc on StreamMetadata; a
+	 * stale ROC from a previous session/device must never seed a fresh one). Called once
+	 * before starting an SRTP port's pipeline, to seed srtpdec correctly across process
+	 * restarts (see KinesisIngestionPipeline.seedSrtpRoc) - a fresh GStreamer instance always
+	 * starts at ROC 0 otherwise, which breaks decryption after any sequence number rollover
+	 * in the sender's session. Uses a strongly consistent read: this runs right before
+	 * seeding a fresh pipeline after a lock handoff, so an eventually-consistent read could
+	 * still return the *previous* owner's now-stale value even after it persisted a newer one.
 	 */
-	async getSrtpRoc(port: number): Promise<number> {
+	async getSrtpRoc(port: number, expectedSsrc: number): Promise<number> {
 		try {
 			const result = await this.docClient.send(
-				new GetCommand({ TableName: this.tableName, Key: { port } }),
+				new GetCommand({
+					TableName: this.tableName,
+					Key: { port },
+					ConsistentRead: true,
+				}),
 			)
 			const roc: unknown = result.Item?.srtpRoc
-			return typeof roc === 'number' ? roc : 0
+			const storedSsrc: unknown = result.Item?.srtpRocSsrc
+			if (typeof roc !== 'number' || storedSsrc !== expectedSsrc) return 0
+			return roc
 		} catch (error) {
 			console.error(
 				`[StreamMetadataService] Error reading SRTP ROC for port ${port}:`,
@@ -267,16 +282,27 @@ export class StreamMetadataService {
 	}
 
 	/**
-	 * Persists the current SRTP ROC for a stream slot, throttled to once per
-	 * srtpRocUpdateThrottleMs unless `force` is set (e.g. on stream stop, to capture the
-	 * latest value before the slot potentially gets reassigned). Upserts the row (no
-	 * ConditionExpression) since this may run before any lock has ever been acquired for
-	 * this slot.
+	 * Persists the current SRTP ROC (tagged with the SSRC it was observed under - see
+	 * srtpRocSsrc) for a stream slot, throttled to once per srtpRocUpdateThrottleMs unless
+	 * `force` is set (e.g. on stream stop, to capture the latest value before the slot
+	 * potentially gets reassigned). Only succeeds if `instanceId` currently holds the
+	 * Kinesis lock for this slot - without that check, a process whose heartbeat condition
+	 * already failed (or that already released the slot) could overwrite the current
+	 * owner's ROC with stale data and break a later restart. Returns false (without
+	 * throwing) if the caller no longer owns the slot, or if the write otherwise fails -
+	 * callers must treat that as having lost the lock and stop writing/relinquish their
+	 * local pipeline, not just log and continue.
 	 */
-	async updateSrtpRoc(port: number, roc: number, force = false): Promise<void> {
+	async updateSrtpRoc(
+		port: number,
+		instanceId: string,
+		roc: number,
+		ssrc: number,
+		force = false,
+	): Promise<boolean> {
 		const now = Date.now()
 		const lastUpdate = this.lastSrtpRocUpdateTimes.get(port) ?? 0
-		if (!force && now - lastUpdate < this.srtpRocUpdateThrottleMs) return
+		if (!force && now - lastUpdate < this.srtpRocUpdateThrottleMs) return true
 		this.lastSrtpRocUpdateTimes.set(port, now)
 
 		try {
@@ -284,19 +310,31 @@ export class StreamMetadataService {
 				new UpdateCommand({
 					TableName: this.tableName,
 					Key: { port },
-					UpdateExpression: 'SET srtpRoc = :roc, updatedAt = :updatedAt',
+					UpdateExpression:
+						'SET srtpRoc = :roc, srtpRocSsrc = :ssrc, updatedAt = :updatedAt',
 					ExpressionAttributeValues: {
 						':roc': roc,
+						':ssrc': ssrc,
 						':updatedAt': new Date().toISOString(),
+						':instanceId': instanceId,
 					},
+					ConditionExpression: 'kinesisOwnerInstanceId = :instanceId',
 				}),
 			)
-		} catch (error) {
+			return true
+		} catch (error: unknown) {
+			if (
+				error instanceof Error &&
+				error.name === 'ConditionalCheckFailedException'
+			) {
+				return false
+			}
 			console.error(
 				`[StreamMetadataService] Error updating SRTP ROC for port ${port}:`,
 				error,
 			)
 			this.lastSrtpRocUpdateTimes.delete(port)
+			return false
 		}
 	}
 

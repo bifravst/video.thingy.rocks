@@ -70,35 +70,76 @@ type ReorderState = {
 }
 
 /**
- * Parses the RTP sequence number (bytes 2-3 of the fixed 12-byte header) from a plain RTP
- * or SRTP datagram - both share the same header layout, and SRTP (RFC 3711) never encrypts
- * the header, only the payload, so this needs no decryption. Returns undefined if the
- * datagram is too short to contain a valid RTP/SRTP header. Exported for unit testing.
+ * Parses and lightly validates a plain RTP/SRTP header: the RTP version (top 2 bits of byte
+ * 0) must be 2, and the SSRC (bytes 8-11) must match `expectedSsrc`. Returns the sequence
+ * number (bytes 2-3) if so, else undefined. SRTP (RFC 3711) never encrypts the header, only
+ * the payload, so reading these fields needs no decryption - but that's also exactly why
+ * this is NOT a substitute for real SRTP authentication: anyone who can reach the public UDP
+ * port can forge a datagram with the right version/SSRC (neither is secret) and an arbitrary
+ * sequence number, without knowing the key. This filters out obvious noise/unrelated traffic
+ * before it can influence ROC tracking (see advanceSrtpRoc), not a determined spoofer - a
+ * fully watertight fix would need per-packet authentication feedback from srtpdec, which
+ * isn't exposed by this gst-launch-1.0-based architecture. Exported for unit testing.
  */
-export const parseRtpSequenceNumber = (
+export const parseAuthenticRtpSequenceNumber = (
 	datagram: Buffer,
+	expectedSsrc: number,
 ): number | undefined => {
 	if (datagram.length < 12) return undefined
+	const version = datagram[0]! >>> 6
+	if (version !== 2) return undefined
+	if (datagram.readUInt32BE(8) !== expectedSsrc) return undefined
 	return datagram.readUInt16BE(2)
 }
 
-export type SrtpRocState = { lastSeq: number; roc: number }
+export type SrtpRocState = { highestSeq: number; roc: number }
 
 /**
- * Advances an SRTP rollover-counter tracking state by one observed sequence number, using
- * the standard rollover heuristic (RFC 3711 Appendix A): if the sequence number jumps
- * backward by more than half the 16-bit range, the counter must have wrapped forward, so
- * the rollover counter increments. `state` undefined means "first packet ever observed for
- * this port" - starts at ROC 0, matching srtpdec's own default for a truly fresh session.
+ * Advances an SRTP rollover-counter tracking state by one observed sequence number.
+ * `state` undefined means "first packet ever observed for this port" - starts at ROC 0,
+ * matching srtpdec's own default for a truly fresh session.
+ *
+ * Tracks the *highest* extended sequence index seen (roc * 65536 + seq), not just the most
+ * recently arrived one: for each new seq, it guesses which of roc-1/roc/roc+1 puts the
+ * extended index closest to the current highest (the standard RFC 3711 Appendix A
+ * approach), and only advances the tracked state if that guess is actually higher than the
+ * highest seen so far. A naive "compare only to the last-seen seq" version is vulnerable to
+ * a single reordered packet right at a wrap boundary corrupting the estimate: e.g. seq
+ * 65535 -> 0 correctly sets ROC 1, but if a late/reordered duplicate of 65535 then arrives
+ * and is compared only against 0, it looks unwrapped and overwrites the tracked "last seq"
+ * to 65535 again - so the next genuinely-forward packet (seq 1) gets misdetected as a
+ * second wrap. Comparing against the highest-seen extended index instead means a
+ * lower/older packet is simply ignored for tracking purposes (it still gets relayed to
+ * GStreamer as normal - this only affects our own seed-value bookkeeping).
  * Exported for unit testing.
  */
 export const advanceSrtpRoc = (
 	state: SrtpRocState | undefined,
 	seq: number,
 ): SrtpRocState => {
-	if (!state) return { lastSeq: seq, roc: 0 }
-	const wrapped = state.lastSeq > 0xc000 && seq < 0x4000
-	return { lastSeq: seq, roc: wrapped ? state.roc + 1 : state.roc }
+	if (!state) return { highestSeq: seq, roc: 0 }
+
+	const highestExtended = state.roc * 0x10000 + state.highestSeq
+	const candidateRocs =
+		state.roc > 0
+			? [state.roc - 1, state.roc, state.roc + 1]
+			: [state.roc, state.roc + 1]
+
+	let bestRoc = state.roc
+	let bestExtended = state.roc * 0x10000 + seq
+	let bestDistance = Math.abs(bestExtended - highestExtended)
+	for (const candidateRoc of candidateRocs) {
+		const extended = candidateRoc * 0x10000 + seq
+		const distance = Math.abs(extended - highestExtended)
+		if (distance < bestDistance) {
+			bestRoc = candidateRoc
+			bestExtended = extended
+			bestDistance = distance
+		}
+	}
+
+	if (bestExtended <= highestExtended) return state
+	return { highestSeq: seq, roc: bestRoc }
 }
 
 /** Per-port throttle for GStreamer stderr warning categories. */
@@ -178,10 +219,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	 * instance with the wrong ROC and it would never correctly decrypt again. See
 	 * trackSrtpRoc/seedSrtpRoc/getSrtpRoc.
 	 */
-	private readonly srtpRocByPort: Map<
-		number,
-		{ lastSeq: number; roc: number }
-	> = new Map()
+	private readonly srtpRocByPort: Map<number, SrtpRocState> = new Map()
 
 	constructor(config: KinesisIngestionPipelineConfig) {
 		super()
@@ -248,19 +286,30 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		return this.activePipelines.has(port)
 	}
 
+	/** The configured SRTP SSRC for a port (undefined if SRTP isn't configured or no key is
+	 * loaded for this port yet). Used both to validate inbound datagrams before they can
+	 * influence ROC tracking (see trackSrtpRoc) and to tag persisted ROC state with the
+	 * session it belongs to (see index.ts, which must reset the ROC on a key/SSRC change -
+	 * a stale ROC from a previous session/device would misseed a genuinely fresh one). */
+	getConfiguredSrtpSsrc(port: number): number | undefined {
+		return this.config.srtp?.keyStore.getKeyForPort(port)?.ssrc
+	}
+
 	/**
 	 * Updates this port's best-known SRTP ROC by observing one datagram's plaintext RTP
 	 * sequence number (SRTP/RFC 3711 never encrypts the header, only the payload, so this
-	 * needs no decryption). Uses advanceSrtpRoc's rollover heuristic. This is a best-effort
-	 * estimate for seeding a *future* restart, not a replacement for srtpdec/libsrtp's own
-	 * real-time sliding-window tracking during normal operation - an occasional misordered
-	 * packet right at a wrap boundary could misestimate by one, an acceptable residual risk
-	 * given the alternative (always assuming ROC 0) is far worse. Call for every SRTP
-	 * datagram, in arrival order, whether or not it's been sent on yet (including ones still
-	 * sitting in the pre-start buffer).
+	 * needs no decryption) - but only for datagrams that pass parseAuthenticRtpSequenceNumber's
+	 * version/SSRC check, so unrelated noise on the public UDP port can't influence it. Uses
+	 * advanceSrtpRoc's rollover heuristic. This is a best-effort estimate for seeding a
+	 * *future* restart, not a replacement for srtpdec/libsrtp's own real-time sliding-window
+	 * tracking during normal operation. Call for every SRTP datagram, in arrival order,
+	 * whether or not it's been sent on yet (including ones still sitting in the pre-start
+	 * buffer).
 	 */
 	private trackSrtpRoc(port: number, datagram: Buffer): void {
-		const seq = parseRtpSequenceNumber(datagram)
+		const expectedSsrc = this.getConfiguredSrtpSsrc(port)
+		if (expectedSsrc === undefined) return
+		const seq = parseAuthenticRtpSequenceNumber(datagram, expectedSsrc)
 		if (seq === undefined) return
 		this.srtpRocByPort.set(
 			port,
@@ -275,15 +324,16 @@ export class KinesisIngestionPipeline extends EventEmitter {
 
 	/**
 	 * Seeds this port's ROC from persisted state (see index.ts, which loads it from
-	 * DynamoDB before starting an SRTP port's pipeline). Only raises the tracked value -
-	 * never regresses a live, more-current in-process estimate to an older persisted one
-	 * (e.g. on a same-process GStreamer-only restart, where we already have better
-	 * information than whatever was last flushed to DynamoDB).
+	 * DynamoDB before starting an SRTP port's pipeline, after checking the persisted value
+	 * still belongs to the currently-configured SSRC). Only raises the tracked value - never
+	 * regresses a live, more-current in-process estimate to an older persisted one (e.g. on
+	 * a same-process GStreamer-only restart, where we already have better information than
+	 * whatever was last flushed to DynamoDB).
 	 */
 	seedSrtpRoc(port: number, roc: number): void {
 		const state = this.srtpRocByPort.get(port)
 		if (!state) {
-			this.srtpRocByPort.set(port, { lastSeq: 0, roc })
+			this.srtpRocByPort.set(port, { highestSeq: 0, roc })
 			return
 		}
 		if (roc > state.roc) state.roc = roc
