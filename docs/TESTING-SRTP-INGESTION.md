@@ -8,9 +8,9 @@ unencrypted UDP/MPEG-TS pipeline documented in
 ## Prerequisites
 
 - Stack deployed (`npm run cdk:prod:deploy`).
-- EC2 instances have `SRTP_STREAM_PREFIX` set (the CDK stack always sets this;
-  it's `{stackName}-video-srtp`), and a matching SRTP key provisioned for the
-  port you're testing (see below).
+- EC2 instances have `SRTP_INGESTION_ENABLED=true` set (the CDK stack always
+  sets this), and a matching SRTP key provisioned for the port you're testing
+  (see below).
 - Local GStreamer with `gst-plugins-bad` (for `srtpenc`) **and**
   `gst-plugins-ugly` (for `x264enc`) installed - both are used by the test
   sender script, and `x264enc` is a separate package from `srtpenc`'s. Confirm
@@ -33,6 +33,12 @@ GStreamer then does
 kvssink tail as the unencrypted path. Keys are static and pre-shared, loaded
 once at process start from SSM Parameter Store (see
 `backend/src/SrtpKeyStore.ts`).
+
+**SRTP and unencrypted ingestion share the same Kinesis Video Streams**,
+numbered `1`-`10`. SRTP port 6000+N targets the same stream as unencrypted port
+5000+N (e.g. port 6000 and port 5000 both feed stream `1`). A device is assigned
+one port range or the other - never send both transports for the same numbered
+stream at once.
 
 **Key management is per-port**: each SRTP port (6000-6009) has its own key and a
 fixed, provisioned SSRC. The device must use a stable SSRC on a given port -
@@ -88,15 +94,17 @@ key/SSRC in step 2, pass them explicitly:
 ```
 
 The backend receives UDP on that port, relays it to GStreamer's `udpsrc`, and
-kvssink sends decrypted H.264 to the Kinesis stream named
-`{stackName}-video-srtp-{port}` (e.g. `video-streaming-video-srtp-6000`).
+kvssink sends decrypted H.264 to the numbered Kinesis Video Stream for that
+port: port 6000 → stream `1`, port 6001 → stream `2`, ..., port 6009 → stream
+`10` (`port - 6000 + 1`) - the same stream the unencrypted path would use for
+the corresponding 5000+N port.
 
 ## 4. Verify in AWS
 
 Same as the unencrypted path (see
 [TESTING-KINESIS-INGESTION.md](./TESTING-KINESIS-INGESTION.md#3-verify-in-aws)),
-but look for the `-video-srtp-` stream name in the Kinesis Video Streams
-console, and for "SRTP Kinesis ingestion started" (not "Kinesis ingestion
+using the stream number for the port you tested (e.g. port 6000 → stream `1`),
+and looking for "SRTP Kinesis ingestion started" (not "Kinesis ingestion
 started") in application logs.
 
 ## Troubleshooting

@@ -41,6 +41,15 @@ if ! [[ "$HEX_KEY" =~ ^[0-9a-fA-F]{60}$ ]]; then
   exit 1
 fi
 
+# Must be a canonical decimal uint32 (no leading zeros, no sign, no whitespace) - anything
+# else either breaks the JSON below (e.g. "abc", or "0123" which JSON forbids as a leading
+# zero) or gets silently rejected later by backend/src/SrtpKeyStore.ts's own uint32 check.
+# Catch it here so this script doesn't report success for a value that will never work.
+if ! [[ "$SSRC" =~ ^(0|[1-9][0-9]*)$ ]] || [ "$SSRC" -gt 4294967295 ]; then
+  echo "Error: ssrc must be a canonical decimal uint32 (0-4294967295, no leading zeros)"
+  exit 1
+fi
+
 STACK_NAME="${STACK_NAME:-${STACK_PREFIX:-video}-streaming-2026-05}"
 REGION="${AWS_REGION:-eu-central-1}"
 PARAMETER_NAME="/${STACK_NAME}/srtp/port/${PORT}/key"

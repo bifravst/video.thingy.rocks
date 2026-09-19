@@ -11,6 +11,13 @@ services (DynamoDB, S3) for metadata and storage.
 
 ## Sending Video (Client / Device Integration)
 
+Each device is assigned one numbered Kinesis Video Stream (`1`-`10`) and sends
+video using **exactly one** of the two methods below - never both for the same
+device. Unencrypted port 5000+N and SRTP port 6000+N both feed the same stream
+(`N+1`), so a device's stream number determines both which port to use for its
+chosen method and which stream to watch for its video (e.g. a device using SRTP
+on port 6003, or unencrypted UDP on port 5003, both land in stream `4`).
+
 ### SRTP (encrypted, recommended)
 
 Devices can send **SRTP-encrypted RTP/H.264** video to ports **6000-6009** on
@@ -29,8 +36,9 @@ What a client/device needs to send:
 - **Payload**: H.264 video packetized as RTP per
   [RFC 6184](https://www.rfc-editor.org/rfc/rfc6184) (payload type 96, 90000 Hz
   clock rate), SRTP-encrypted on top.
-- **Port**: one fixed port per device/session, in the range 6000-6009. Each port
-  maps 1:1 to its own Kinesis Video Stream and its own SRTP key.
+- **Port**: one fixed port per device/session, in the range 6000-6009. Port
+  6000+N feeds Kinesis Video Stream `N+1` (the same stream unencrypted port
+  5000+N would use) and has its own SRTP key.
 - **SSRC**: a fixed, stable RTP SSRC for the lifetime of that port assignment.
   The backend decrypts using a static SSRC configured per port, so a device that
   picks a new SSRC on every (re)connect will not decrypt correctly - always
@@ -49,8 +57,9 @@ What a client/device needs to send:
 ### Unencrypted (legacy)
 
 Devices can also send plain **MPEG-TS/H.264 over UDP** (no RTP framing, no
-encryption) to ports **5000-5009**. This is the original ingest path and is
-unauthenticated - prefer SRTP above for anything internet-facing. See
+encryption) to ports **5000-5009**; port 5000+N feeds Kinesis Video Stream
+`N+1`. This is the original ingest path and is unauthenticated - prefer SRTP
+above for anything internet-facing. See
 [`../docs/TESTING-KINESIS-INGESTION.md`](../docs/TESTING-KINESIS-INGESTION.md).
 
 ## Components Implemented

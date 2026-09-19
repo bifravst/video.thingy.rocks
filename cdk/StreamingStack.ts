@@ -37,7 +37,6 @@ export class StreamingStack extends Stack {
 	public readonly autoScalingGroup: autoscaling.AutoScalingGroup
 	public readonly codeBucket: s3.Bucket
 	public readonly kinesisVideoStreams: kinesisvideo.CfnStream[] = []
-	public readonly kinesisVideoStreamsSrtp: kinesisvideo.CfnStream[] = []
 	public readonly networkLoadBalancer: elbv2.NetworkLoadBalancer
 
 	constructor(
@@ -91,44 +90,27 @@ export class StreamingStack extends Stack {
 			removalPolicy: RemovalPolicy.DESTROY,
 		})
 
-		// Kinesis Video Streams: one per UDP port (5000-5009)
-		const kinesisStreamPortStart = 5000
-		const kinesisStreamPortEnd = 5009
-		const kinesisStreamPrefix = `${this.stackName}-video`
-		for (
-			let port = kinesisStreamPortStart;
-			port <= kinesisStreamPortEnd;
-			port++
-		) {
+		// Kinesis Video Streams: one per device, numbered 1-10, shared by both ingestion
+		// methods. Port 5000+n (unencrypted MPEG-TS) and port 6000+n (SRTP) both target the
+		// same stream (n+1) - a device is assigned one port range or the other, never both,
+		// so nothing needs to arbitrate between them beyond the existing per-port Kinesis
+		// lock (see StreamMetadataService). Stream names are plain device numbers ("1".."10"),
+		// matching backend/src/KinesisIngestionPipeline.ts's streamNameForPort().
+		const STREAM_COUNT = 10
+		const srtpPortRangeStart = 6000
+		const srtpPortRangeEnd = srtpPortRangeStart + STREAM_COUNT - 1
+		for (let i = 0; i < STREAM_COUNT; i++) {
+			const streamName = `${i + 1}`
 			const stream = new kinesisvideo.CfnStream(
 				this,
-				`KinesisVideoStream${port}`,
+				`KinesisVideoStream${i + 1}`,
 				{
-					name: `${kinesisStreamPrefix}-${port}`,
+					name: streamName,
 					dataRetentionInHours: Duration.days(30).toHours(),
 					mediaType: 'video/h264',
 				},
 			)
 			this.kinesisVideoStreams.push(stream)
-		}
-
-		// SRTP Kinesis Video Streams: one per SRTP UDP port (6000-6009). Kept in a separate
-		// set of streams (distinct name prefix) so the encrypted and unencrypted ingestion
-		// paths' lifecycles/alarms never conflate.
-		const srtpStreamPortStart = 6000
-		const srtpStreamPortEnd = 6009
-		const srtpStreamPrefix = `${this.stackName}-video-srtp`
-		for (let port = srtpStreamPortStart; port <= srtpStreamPortEnd; port++) {
-			const stream = new kinesisvideo.CfnStream(
-				this,
-				`KinesisVideoStreamSrtp${port}`,
-				{
-					name: `${srtpStreamPrefix}-${port}`,
-					dataRetentionInHours: Duration.days(30).toHours(),
-					mediaType: 'video/h264',
-				},
-			)
-			this.kinesisVideoStreamsSrtp.push(stream)
 		}
 
 		this.udpSecurityGroup = new ec2.SecurityGroup(this, 'UDPSecurityGroup', {
@@ -283,12 +265,10 @@ export class StreamingStack extends Stack {
 		userDataScript = userDataScript
 			.replace(/__AWS_REGION__/g, this.region)
 			.replace(/__TABLE_NAME__/g, this.streamTable.tableName)
-			.replace(/__KINESIS_STREAM_PREFIX__/g, kinesisStreamPrefix)
 			.replace(/__CODE_BUCKET__/g, this.codeBucket.bucketName)
-			.replace(/__SRTP_STREAM_PREFIX__/g, srtpStreamPrefix)
 			.replace(/__SRTP_KEY_PARAMETER_PREFIX__/g, `/${this.stackName}/srtp/port`)
-			.replace(/__SRTP_PORT_RANGE_START__/g, String(srtpStreamPortStart))
-			.replace(/__SRTP_PORT_RANGE_END__/g, String(srtpStreamPortEnd))
+			.replace(/__SRTP_PORT_RANGE_START__/g, String(srtpPortRangeStart))
+			.replace(/__SRTP_PORT_RANGE_END__/g, String(srtpPortRangeEnd))
 
 		const userData = ec2.UserData.custom(userDataScript)
 
@@ -635,8 +615,7 @@ export class StreamingStack extends Stack {
 
 		const kvsIncomingMetrics: Record<string, cloudwatch.IMetric> = {}
 		this.kinesisVideoStreams.forEach((_, i) => {
-			const port = kinesisStreamPortStart + i
-			const streamName = `${kinesisStreamPrefix}-${port}`
+			const streamName = `${i + 1}`
 			kvsIncomingMetrics[`s${i}`] = new cloudwatch.Metric({
 				namespace: 'AWS/KinesisVideo',
 				metricName: 'PutMedia.IncomingBytes',
@@ -687,15 +666,12 @@ export class StreamingStack extends Stack {
 			new cloudwatch_actions.SnsAction(restartIngestionTopic),
 		)
 
-		// Deliberately no SRTP equivalent of the composite alarm above: `nlbUdpBytesAlarm` is
-		// AWS/NetworkELB ProcessedBytes_UDP for the whole load balancer (all listeners, both
-		// the unencrypted 5000-5009 and SRTP 6000-6009 ports combined) - it cannot tell
-		// whether traffic on it is SRTP traffic, so a composite built from it would alarm (or
-		// stay quiet) based on unrelated traffic on the other port range, not SRTP ingestion
-		// health. Add a genuinely SRTP-specific traffic signal (e.g. a custom CloudWatch
-		// metric the backend publishes when it relays an SRTP datagram) before reinstating
-		// this; until then, use the per-stream `PutMedia.IncomingBytes` metric in the KVS
-		// console to check SRTP ingestion.
+		// No separate SRTP alarm needed: SRTP and unencrypted ingestion now write into the
+		// same 10 Kinesis Video Streams (see the stream-creation loop above), so
+		// `kvsNoIngestionAlarm` already reflects ingestion health for whichever transport a
+		// given device actually uses, and `nlbUdpBytesAlarm` already covers traffic on both
+		// port ranges (it's load-balancer-wide). The composite above needs no SRTP-specific
+		// equivalent.
 
 		// CDK Outputs
 		new CfnOutput(this, 'StreamMetadataTableName', {

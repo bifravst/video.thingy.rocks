@@ -56,8 +56,7 @@ const config = {
 	dynamoDBTableName: process.env.TABLE_NAME ?? 'StreamMetadata',
 	awsRegion: process.env.AWS_REGION ?? 'eu-central-1',
 	segmentDuration: 6, // 6 seconds for HLS segments
-	kinesisStreamPrefix: process.env.KINESIS_STREAM_PREFIX ?? '',
-	kinesisIngestionEnabled: Boolean(process.env.KINESIS_STREAM_PREFIX),
+	kinesisIngestionEnabled: Boolean(process.env.KINESIS_INGESTION_ENABLED),
 	kinesisLogGstreamerOutput:
 		process.env.KINESIS_INGESTION_LOG_GSTREAMER === 'true' ||
 		process.env.KINESIS_INGESTION_LOG_GSTREAMER === '1',
@@ -66,9 +65,8 @@ const config = {
 		start: Number(process.env.SRTP_PORT_RANGE_START ?? 6000),
 		end: Number(process.env.SRTP_PORT_RANGE_END ?? 6009),
 	},
-	srtpStreamPrefix: process.env.SRTP_STREAM_PREFIX ?? '',
 	srtpKeyParameterPrefix: process.env.SRTP_KEY_PARAMETER_PREFIX ?? '',
-	srtpIngestionEnabled: Boolean(process.env.SRTP_STREAM_PREFIX),
+	srtpIngestionEnabled: Boolean(process.env.SRTP_INGESTION_ENABLED),
 }
 
 const streamStateManager = new StreamStateManager({
@@ -92,7 +90,6 @@ const srtpKeyStore = srtpEnabled
 
 const kinesisIngestionPipeline = config.kinesisIngestionEnabled
 	? new KinesisIngestionPipeline({
-			streamNamePrefix: config.kinesisStreamPrefix,
 			region: config.awsRegion,
 			portRange: config.portRange,
 			logGstreamerOutput: config.kinesisLogGstreamerOutput,
@@ -100,7 +97,6 @@ const kinesisIngestionPipeline = config.kinesisIngestionEnabled
 				srtpEnabled && srtpKeyStore
 					? {
 							portRange: config.srtpPortRange,
-							streamNamePrefix: config.srtpStreamPrefix,
 							keyStore: srtpKeyStore,
 						}
 					: undefined,
@@ -135,23 +131,53 @@ type PacketHandlerRangeConfig = {
 /**
  * Starts (or restarts) the Kinesis ingestion pipeline for a port, and releases the lock if
  * the pipeline did not actually become active (e.g. missing SRTP key, credential resolution
- * failure - start() can return without throwing in these cases). Without this, the lock
- * would stay held while no pipeline is registered, and writePacket would silently drop all
- * traffic for the port instead of letting another attempt/instance pick it up.
+ * failure - start() can return without throwing in these cases, but is also handled here if
+ * it does throw). Without this, the lock would stay held while no pipeline is registered,
+ * and writePacket would silently drop all traffic for the port instead of letting another
+ * attempt/instance pick it up.
  */
 const startPipelineOrReleaseLock = async (
 	port: number,
 	initialData?: Buffer | Buffer[],
 ): Promise<void> => {
 	if (!kinesisIngestionPipeline) return
-	await kinesisIngestionPipeline.start(port, initialData)
-	if (!kinesisIngestionPipeline.isActive(port)) {
+
+	let failed: boolean
+	try {
+		await kinesisIngestionPipeline.start(port, initialData)
+		failed = !kinesisIngestionPipeline.isActive(port)
+	} catch (err) {
 		console.error(
-			`[Main] Kinesis ingestion pipeline failed to start for port ${port}; releasing lock`,
+			`[Main] Error starting Kinesis ingestion pipeline for port ${port}:`,
+			err,
 		)
-		kinesisLockHeldForPorts.delete(port)
-		await streamMetadataService.releaseKinesisLock(port, instanceId)
+		failed = true
 	}
+	if (!failed) return
+
+	console.error(
+		`[Main] Kinesis ingestion pipeline failed to start for port ${port}; releasing lock`,
+	)
+	kinesisLockHeldForPorts.delete(port)
+	try {
+		await streamMetadataService.releaseKinesisLock(port, instanceId)
+	} catch (err) {
+		console.error(`[Main] Error releasing Kinesis lock for port ${port}:`, err)
+	}
+
+	// Re-arm the pre-start buffer so subsequent packets can trigger another attempt.
+	// onPacket only re-enters the buffering/lock-acquire path while isFirstPacket/isResume/
+	// preStartBufferByPort.has(port) holds - none of which are true once the stream is
+	// already 'active' with no buffer entry, so without this a failed start here would
+	// strand the port until a full inactivity/resume cycle happens on its own.
+	const chunks =
+		initialData === undefined
+			? []
+			: Array.isArray(initialData)
+				? initialData
+				: [initialData]
+	const totalBytes = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
+	preStartBufferByPort.set(port, { chunks, totalBytes })
 }
 
 const createPacketHandler = (
@@ -418,23 +444,23 @@ const start = async (): Promise<void> => {
 	console.log(`[Main] AWS region: ${config.awsRegion}`)
 	if (config.kinesisIngestionEnabled) {
 		console.log(
-			`[Main] Kinesis ingestion enabled (stream prefix: ${config.kinesisStreamPrefix})`,
+			`[Main] Kinesis ingestion enabled (ports ${config.portRange.start}-${config.portRange.end} -> streams 1-${config.portRange.end - config.portRange.start + 1})`,
 		)
 		console.log(
 			`[Main] GStreamer starts after ${config.kinesisMinBytesBeforeStart / 1024 / 1024} MB received (KINESIS_MIN_BYTES_BEFORE_START)`,
 		)
 	} else {
 		console.log(
-			'[Main] Kinesis ingestion disabled (KINESIS_STREAM_PREFIX not set)',
+			'[Main] Kinesis ingestion disabled (KINESIS_INGESTION_ENABLED not set)',
 		)
 	}
 	if (srtpEnabled) {
 		console.log(
-			`[Main] SRTP ingestion enabled (stream prefix: ${config.srtpStreamPrefix}, ports ${config.srtpPortRange.start}-${config.srtpPortRange.end})`,
+			`[Main] SRTP ingestion enabled (ports ${config.srtpPortRange.start}-${config.srtpPortRange.end} -> same streams 1-${config.srtpPortRange.end - config.srtpPortRange.start + 1})`,
 		)
 	} else {
 		console.log(
-			'[Main] SRTP ingestion disabled (SRTP_STREAM_PREFIX not set, or Kinesis ingestion disabled)',
+			'[Main] SRTP ingestion disabled (SRTP_INGESTION_ENABLED not set, or Kinesis ingestion disabled)',
 		)
 	}
 

@@ -11,7 +11,6 @@ import { Logger } from './Logger.ts'
 import type { SrtpKeyStore, SrtpPortKey } from './SrtpKeyStore.ts'
 
 export type KinesisIngestionPipelineConfig = {
-	streamNamePrefix: string
 	region: string
 	portRange: { start: number; end: number }
 	/**
@@ -29,10 +28,15 @@ export type KinesisIngestionPipelineConfig = {
 	 * Optional SRTP ingestion: a separate port range whose packets are RTP/H.264 wrapped in
 	 * SRTP (RFC 6184 + static pre-shared key), relayed to a loopback udpsrc, decrypted by
 	 * srtpdec, depayloaded, and sent to Kinesis the same way as the FIFO/MPEG-TS path.
+	 *
+	 * `portRange` must have the same number of ports as the top-level `portRange`: port
+	 * `portRange.start + i` (unencrypted) and `srtp.portRange.start + i` (SRTP) both target
+	 * the same Kinesis Video Stream, numbered `i + 1` (see streamNameForPort). A device is
+	 * assigned one port range or the other, never both, so nothing arbitrates between them
+	 * beyond the existing per-port Kinesis lock (StreamMetadataService).
 	 */
 	srtp?: {
 		portRange: { start: number; end: number }
-		streamNamePrefix: string
 		/** Local relay port = publicPort + relayPortOffset. Default 10000. */
 		relayPortOffset?: number
 		/** rtpjitterbuffer latency in ms. Default 200. */
@@ -142,11 +146,16 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		return port >= srtp.portRange.start && port <= srtp.portRange.end
 	}
 
+	/**
+	 * Kinesis Video Stream name for a port: the port's offset within its own range (0-based),
+	 * plus 1. Ports at the same offset in the unencrypted and SRTP ranges resolve to the same
+	 * stream name, e.g. portRange.start and srtp.portRange.start both map to "1".
+	 */
 	streamNameForPort(port: number): string {
-		if (this.isSrtpPort(port)) {
-			return `${this.config.srtp!.streamNamePrefix}-${port}`
-		}
-		return `${this.config.streamNamePrefix}-${port}`
+		const rangeStart = this.isSrtpPort(port)
+			? this.config.srtp!.portRange.start
+			: this.config.portRange.start
+		return String(port - rangeStart + 1)
 	}
 
 	isPortInRange(port: number): boolean {
@@ -706,38 +715,53 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			closeRelaySocket,
 			gstStderrThrottle,
 			gstStdoutThrottle,
-			// No replay needed => nothing can overtake it => ready immediately.
-			ready: initialDatagrams.length === 0,
+			// Always false until the startup grace period below elapses - even a resume/
+			// restart with no initialDatagrams needs udpsrc to have bound before it's safe to
+			// send, so this can't be short-circuited to true just because there's nothing to
+			// replay (that previously let restart traffic race udpsrc's bind and get dropped).
+			ready: false,
 			pendingQueue: [],
 		}
 		this.activePipelines.set(port, pipeline)
 
-		if (initialDatagrams.length > 0) {
-			await new Promise((resolve) => setTimeout(resolve, SRTP_STARTUP_GRACE_MS))
-			// Await each send and pause briefly every batch - the pre-start buffer can hold
-			// thousands of packets (10MB / ~1300 bytes each), and firing them all at once
-			// with no pacing can overrun the local UDP socket/receiving udpsrc, silently
-			// dropping datagrams (including the first keyframe/SPS/PPS) before GStreamer can
-			// consume them.
-			for (const [index, datagram] of initialDatagrams.entries()) {
-				await this.sendSrtpDatagram(port, pipeline, datagram, 'initial')
-				if ((index + 1) % SRTP_REPLAY_BATCH_SIZE === 0) {
-					await new Promise((resolve) =>
-						setTimeout(resolve, SRTP_REPLAY_BATCH_PAUSE_MS),
-					)
-				}
+		// Unlike the FIFO path (whose fs.open() blocks until filesrc opens for read), there is
+		// no OS-level handshake for udpsrc binding a port, so we always wait a bit before
+		// sending anything - live packets queue in pendingQueue (via writePacket) during this
+		// window instead of racing udpsrc's bind.
+		await new Promise((resolve) => setTimeout(resolve, SRTP_STARTUP_GRACE_MS))
+
+		// A stop()/crash during the wait above deletes or replaces this port's pipeline entry
+		// (see stop() and the gst 'error'/'exit' handlers above) - if that happened, this
+		// (now-stale) pipeline must not replay, flip ready, log "started", or touch the relay
+		// socket again. Compared by reference, not just isActive(port), so a *newer* pipeline
+		// that already took over this port isn't mistaken for this one.
+		if (this.activePipelines.get(port) !== pipeline) return
+
+		// Await each send and pause briefly every batch - the pre-start buffer can hold
+		// thousands of packets (10MB / ~1300 bytes each), and firing them all at once with no
+		// pacing can overrun the local UDP socket/receiving udpsrc, silently dropping
+		// datagrams (including the first keyframe/SPS/PPS) before GStreamer can consume them.
+		for (const [index, datagram] of initialDatagrams.entries()) {
+			await this.sendSrtpDatagram(port, pipeline, datagram, 'initial')
+			if (this.activePipelines.get(port) !== pipeline) return
+			if ((index + 1) % SRTP_REPLAY_BATCH_SIZE === 0) {
+				await new Promise((resolve) =>
+					setTimeout(resolve, SRTP_REPLAY_BATCH_PAUSE_MS),
+				)
+				if (this.activePipelines.get(port) !== pipeline) return
 			}
-			// Flush whatever writePacket() queued while replay was in flight, in the order it
-			// arrived, before accepting further direct sends - this is what stops live packets
-			// from overtaking (and causing anti-replay/jitter-buffer discard of) the replay.
-			// This queue is bounded by the startup grace period's real-time packet arrival
-			// rate (not the 10MB buffer), so it doesn't need the same batching/pacing.
-			pipeline.ready = true
-			const queued = pipeline.pendingQueue
-			pipeline.pendingQueue = []
-			for (const datagram of queued) {
-				void this.sendSrtpDatagram(port, pipeline, datagram, 'queued')
-			}
+		}
+
+		// Flush whatever writePacket() queued while replay was in flight, in the order it
+		// arrived, before accepting further direct sends - this is what stops live packets
+		// from overtaking (and causing anti-replay/jitter-buffer discard of) the replay. This
+		// queue is bounded by the grace period's real-time packet arrival rate (not the 10MB
+		// buffer), so it doesn't need the same batching/pacing.
+		pipeline.ready = true
+		const queued = pipeline.pendingQueue
+		pipeline.pendingQueue = []
+		for (const datagram of queued) {
+			void this.sendSrtpDatagram(port, pipeline, datagram, 'queued')
 		}
 
 		this.logger.info('SRTP Kinesis ingestion started', {
@@ -761,23 +785,39 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		datagram: Buffer,
 		kind: 'initial' | 'queued' | 'live',
 	): Promise<void> {
-		await new Promise<void>((resolve) => {
-			pipeline.relaySocket.send(
-				datagram,
-				pipeline.relayPort,
-				'127.0.0.1',
-				(err) => {
-					if (err) {
-						this.logger.warn('Failed to relay SRTP datagram', {
-							port,
-							kind,
-							message: err.message,
-						})
-					}
-					resolve()
+		// Never throws/rejects, even on a synchronous error (e.g. the relay socket was
+		// already closed by a concurrent stop()/crash) - callers that await a run of these in
+		// a loop (the startup replay) must not have that loop aborted by a single failed send,
+		// or a caller further up (start()) could reject and leave an already-acquired Kinesis
+		// lock unreleased.
+		try {
+			await new Promise<void>((resolve) => {
+				pipeline.relaySocket.send(
+					datagram,
+					pipeline.relayPort,
+					'127.0.0.1',
+					(err) => {
+						if (err) {
+							this.logger.warn('Failed to relay SRTP datagram', {
+								port,
+								kind,
+								message: err.message,
+							})
+						}
+						resolve()
+					},
+				)
+			})
+		} catch (err) {
+			this.logger.warn(
+				'Failed to relay SRTP datagram (synchronous send error)',
+				{
+					port,
+					kind,
+					message: err instanceof Error ? err.message : String(err),
 				},
 			)
-		})
+		}
 	}
 
 	private drainFifo(port: number, stdin: Writable): void {
