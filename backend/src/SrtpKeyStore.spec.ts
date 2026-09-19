@@ -1,8 +1,32 @@
 import assert from 'node:assert'
 import { describe, it } from 'node:test'
-import { isStoredSrtpKey, isValidSrtpKeyHex } from './SrtpKeyStore.ts'
+import {
+	isStoredSrtpKey,
+	isValidSrtpKeyHex,
+	keyFingerprint,
+} from './SrtpKeyStore.ts'
 
 void describe('SrtpKeyStore', () => {
+	void describe('keyFingerprint', () => {
+		void it('is stable for the same key', () => {
+			const hex = 'aB1'.repeat(20)
+			assert.strictEqual(keyFingerprint(hex), keyFingerprint(hex))
+		})
+
+		void it('is the same regardless of hex casing (same key bytes)', () => {
+			const lower = 'ab12cd34'.repeat(7) + 'abcd'
+			const upper = lower.toUpperCase()
+			assert.strictEqual(keyFingerprint(lower), keyFingerprint(upper))
+		})
+
+		void it('differs for different keys', () => {
+			assert.notStrictEqual(
+				keyFingerprint('a'.repeat(60)),
+				keyFingerprint('b'.repeat(60)),
+			)
+		})
+	})
+
 	void describe('isValidSrtpKeyHex', () => {
 		void it('accepts a 60-character hex string (30-byte master key+salt)', () => {
 			assert.strictEqual(isValidSrtpKeyHex('a'.repeat(60)), true)

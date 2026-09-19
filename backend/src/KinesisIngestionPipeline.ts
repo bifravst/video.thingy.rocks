@@ -41,6 +41,13 @@ export type KinesisIngestionPipelineConfig = {
 		relayPortOffset?: number
 		/** rtpjitterbuffer latency in ms. Default 200. */
 		jitterBufferLatencyMs?: number
+		/**
+		 * Max bytes to hold in a starting pipeline's `pendingQueue` (live datagrams that
+		 * arrive while startup replay is still in flight - see writePacket/runStartForSrtpPort).
+		 * Default 10MB (DEFAULT_SRTP_PENDING_QUEUE_MAX_BYTES). Oldest datagrams are dropped
+		 * once exceeded, same pattern as index.ts's other per-port buffers/queues.
+		 */
+		pendingQueueMaxBytes?: number
 		keyStore: SrtpKeyStore
 	}
 }
@@ -52,6 +59,7 @@ const KINESIS_STREAM_NAME_PREFIX = 'video-streaming-2026-09-video'
 const DEFAULT_REORDER_BUFFER_SIZE = 128
 const DEFAULT_SRTP_RELAY_PORT_OFFSET = 10_000
 const DEFAULT_SRTP_JITTER_BUFFER_LATENCY_MS = 200
+const DEFAULT_SRTP_PENDING_QUEUE_MAX_BYTES = 10 * 1024 * 1024 // 10MB
 /** Grace period after spawning gst-launch-1.0 before replaying pre-buffered SRTP datagrams;
  * unlike the FIFO path (whose fs.open() blocks until filesrc opens for read), there is no
  * OS-level handshake for udpsrc binding a port, so we just wait a bit. A few early datagrams
@@ -207,6 +215,9 @@ type SrtpRelayPortPipeline = {
 	 */
 	ready: boolean
 	pendingQueue: Buffer[]
+	/** Running total of pendingQueue's byte size - see pendingQueueMaxBytes on the srtp
+	 * config; tracked alongside the array so writePacket doesn't need to re-sum it per push. */
+	pendingQueueBytes: number
 }
 
 type PortPipeline = FifoPortPipeline | SrtpRelayPortPipeline
@@ -1013,6 +1024,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			// replay (that previously let restart traffic race udpsrc's bind and get dropped).
 			ready: false,
 			pendingQueue: [],
+			pendingQueueBytes: 0,
 		}
 		this.activePipelines.set(port, pipeline)
 
@@ -1047,11 +1059,13 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		// Flush whatever writePacket() queued while replay was in flight, in the order it
 		// arrived, before accepting further direct sends - this is what stops live packets
 		// from overtaking (and causing anti-replay/jitter-buffer discard of) the replay. This
-		// queue is bounded by the grace period's real-time packet arrival rate (not the 10MB
-		// buffer), so it doesn't need the same batching/pacing.
+		// queue is bounded by pendingQueueMaxBytes (see writePacket), not the pre-start
+		// buffer's 10MB cap, but is normally much smaller in practice (just the grace
+		// period's real-time packet arrival), so it doesn't need the same batching/pacing.
 		pipeline.ready = true
 		const queued = pipeline.pendingQueue
 		pipeline.pendingQueue = []
+		pipeline.pendingQueueBytes = 0
 		for (const datagram of queued) {
 			void this.sendSrtpDatagram(port, pipeline, datagram, 'queued')
 		}
@@ -1164,7 +1178,25 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			if (!pipeline.ready) {
 				// Startup replay is still in flight - queue rather than send now, so this
 				// datagram can't overtake the older, still-buffered ones (see `ready` above).
+				// Bounded: a restart/resume can hold the pipeline in this not-yet-ready state
+				// for a while (waiting on the paced 10MB replay above), and a high-rate source
+				// pushing here the whole time would otherwise grow this array unboundedly -
+				// the 2x-threshold-style cap other per-port buffers/queues in index.ts use
+				// doesn't apply here since this array lives inside KinesisIngestionPipeline,
+				// not index.ts.
 				pipeline.pendingQueue.push(data)
+				pipeline.pendingQueueBytes += data.length
+				const maxPendingQueueBytes =
+					this.config.srtp?.pendingQueueMaxBytes ??
+					DEFAULT_SRTP_PENDING_QUEUE_MAX_BYTES
+				while (
+					pipeline.pendingQueueBytes > maxPendingQueueBytes &&
+					pipeline.pendingQueue.length > 1
+				) {
+					const dropped = pipeline.pendingQueue.shift()
+					if (dropped !== undefined)
+						pipeline.pendingQueueBytes -= dropped.length
+				}
 				return
 			}
 			void this.sendSrtpDatagram(port, pipeline, data, 'live')

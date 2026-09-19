@@ -281,6 +281,17 @@ export class StreamMetadataService {
 	 * Uses a strongly consistent read: this runs right before seeding a fresh pipeline after a
 	 * lock handoff, so an eventually-consistent read could still return the *previous*
 	 * owner's now-stale value even after it persisted a newer one.
+	 *
+	 * Known limitation: matching SSRC and key fingerprint proves the same *key* is in use,
+	 * not the same cryptographic *session* - a device that reboots and restarts its own RTP
+	 * sequence/ROC at zero while keeping the same provisioned key and SSRC looks identical to
+	 * a resumed session from here, so a high persisted ROC would incorrectly seed the fresh
+	 * one and srtpdec would reject it indefinitely. Resolving this needs either a
+	 * protocol-level session identifier the device sends (there isn't one in this static-key
+	 * design) or a heuristic risky enough (e.g. "assume reset if the first live sequence
+	 * looks too low") to introduce its own false positives; deliberately not attempted here.
+	 * If this happens, the fix today is operational: clear srtpRoc/srtpHighestSeq/
+	 * srtpRocSsrc/srtpRocKeyFingerprint for the affected slot's DynamoDB item.
 	 */
 	async getSrtpRocState(
 		port: number,

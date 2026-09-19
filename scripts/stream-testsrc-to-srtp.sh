@@ -28,6 +28,15 @@ PORT=$2
 HEX_KEY=${3:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab}
 SSRC=${4:-3735928559}
 
+# Must be purely decimal before the arithmetic comparisons below - a non-numeric value
+# (e.g. "abc") makes both `-lt`/`-gt` tests fail with "integer expression expected" while the
+# combined `||` condition still evaluates false, letting the script proceed to launch
+# gst-launch-1.0 with an invalid port.
+if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
+  echo "Error: port must be a decimal number"
+  exit 1
+fi
+
 if [ "$PORT" -lt 6000 ] || [ "$PORT" -gt 6009 ]; then
   echo "Error: Port must be between 6000 and 6009"
   exit 1

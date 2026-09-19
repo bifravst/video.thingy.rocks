@@ -31,6 +31,15 @@ SSRC=$3
 CIPHER=aes-128-icm
 AUTH=hmac-sha1-80
 
+# Must be purely decimal before the arithmetic comparisons below - a non-numeric value
+# (e.g. "abc") makes both `-lt`/`-gt` tests fail with "integer expression expected" while the
+# combined `||` condition still evaluates false, letting the script proceed to provision a
+# parameter path the backend will never load.
+if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
+  echo "Error: port must be a decimal number"
+  exit 1
+fi
+
 if [ "$PORT" -lt 6000 ] || [ "$PORT" -gt 6009 ]; then
   echo "Error: Port must be between 6000 and 6009"
   exit 1

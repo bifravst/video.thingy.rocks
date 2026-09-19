@@ -24,10 +24,13 @@ export type SrtpPortKey = {
  * keeps the same SSRC (the provisioning script permits this) - see StreamMetadata's
  * srtpRocKeyFingerprint doc comment for why SSRC alone can't catch that case. SHA-256 is a
  * one-way function, so this reveals nothing about keyHex; truncated since it only needs to
- * distinguish keys from each other, not resist adversarial collision search.
+ * distinguish keys from each other, not resist adversarial collision search. Normalizes case
+ * first - upper- and lower-case hex encode the same key bytes, so hashing the raw string
+ * would make reprovisioning the identical key with different casing look like a rotation and
+ * needlessly discard persisted ROC state.
  */
 export const keyFingerprint = (keyHex: string): string =>
-	createHash('sha256').update(keyHex).digest('hex').slice(0, 16)
+	createHash('sha256').update(keyHex.toLowerCase()).digest('hex').slice(0, 16)
 
 export type SrtpKeyStoreConfig = {
 	region?: string
