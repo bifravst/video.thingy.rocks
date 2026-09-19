@@ -34,11 +34,11 @@ kvssink tail as the unencrypted path. Keys are static and pre-shared, loaded
 once at process start from SSM Parameter Store (see
 `backend/src/SrtpKeyStore.ts`).
 
-**SRTP and unencrypted ingestion share the same Kinesis Video Streams**,
-numbered `1`-`10`. SRTP port 6000+N targets the same stream as unencrypted port
-5000+N (e.g. port 6000 and port 5000 both feed stream `1`). A device is assigned
-one port range or the other - never send both transports for the same numbered
-stream at once.
+**SRTP and unencrypted ingestion share the same Kinesis Video Streams**, named
+`video-streaming-2026-09-video-1` through `-10`. SRTP port 6000+N targets the
+same stream as unencrypted port 5000+N (e.g. port 6000 and port 5000 both feed
+`video-streaming-2026-09-video-1`). A device is assigned one port range or the
+other - never send both transports for the same numbered stream at once.
 
 **Key management is per-port**: each SRTP port (6000-6009) has its own key and a
 fixed, provisioned SSRC. The device must use a stable SSRC on a given port -
@@ -95,17 +95,18 @@ key/SSRC in step 2, pass them explicitly:
 
 The backend receives UDP on that port, relays it to GStreamer's `udpsrc`, and
 kvssink sends decrypted H.264 to the numbered Kinesis Video Stream for that
-port: port 6000 → stream `1`, port 6001 → stream `2`, ..., port 6009 → stream
-`10` (`port - 6000 + 1`) - the same stream the unencrypted path would use for
-the corresponding 5000+N port.
+port: port 6000 → `video-streaming-2026-09-video-1`, port 6001 →
+`video-streaming-2026-09-video-2`, ..., port 6009 →
+`video-streaming-2026-09-video-10` (`port - 6000 + 1`) - the same stream the
+unencrypted path would use for the corresponding 5000+N port.
 
 ## 4. Verify in AWS
 
 Same as the unencrypted path (see
 [TESTING-KINESIS-INGESTION.md](./TESTING-KINESIS-INGESTION.md#3-verify-in-aws)),
-using the stream number for the port you tested (e.g. port 6000 → stream `1`),
-and looking for "SRTP Kinesis ingestion started" (not "Kinesis ingestion
-started") in application logs.
+using the stream name for the port you tested (e.g. port 6000 →
+`video-streaming-2026-09-video-1`), and looking for "SRTP Kinesis ingestion
+started" (not "Kinesis ingestion started") in application logs.
 
 ## Troubleshooting
 
@@ -137,6 +138,26 @@ started") in application logs.
   GStreamer's `rtpjitterbuffer` for real RTP-sequence-aware reordering.
   Persistent issues here point to network loss/jitter upstream of the NLB, not
   the backend.
+
+- **Decryption/auth failures only after a restart, on an otherwise-healthy
+  long-running stream** - likely an SRTP rollover counter (ROC) mismatch. The
+  backend tracks and persists the ROC per stream slot (in DynamoDB, `srtpRoc`)
+  by observing the plaintext RTP sequence number of every SRTP datagram, and
+  seeds a fresh GStreamer pipeline with it (see
+  `KinesisIngestionPipeline.trackSrtpRoc`/`seedSrtpRoc`/`getSrtpRoc`) - without
+  this, a fresh `srtpdec` instance always starts at ROC 0, which breaks
+  decryption for any restart (GStreamer crash, redeploy, EC2 reboot) after the
+  sender's 16-bit sequence number has ever wrapped. This is a best-effort
+  estimate, not a guarantee - if it's ever visibly wrong, check the `srtpRoc`
+  value in the `StreamMetadata` DynamoDB item for the affected slot.
+
+- **Two producers competing for the same stream** - a device must use only one
+  of the unencrypted or SRTP transports per assigned stream slot (see
+  `backend/README.md`); the backend refuses to start a second producer for a
+  slot that already has one active (logged as "paired port for this stream slot
+  is already active"), and the DynamoDB lock is keyed by stream slot (not raw
+  port) so this is enforced across instances too. If you see this log line, some
+  client is sending on both port 5000+N and port 6000+N.
 
 - **Everything else** (credentials, `log-config`, kvssink plugin path, KVS
   timestamp/continuity errors) - see the shared troubleshooting section in

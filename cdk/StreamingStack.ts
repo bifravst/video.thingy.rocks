@@ -94,25 +94,23 @@ export class StreamingStack extends Stack {
 		// methods. Port 5000+n (unencrypted MPEG-TS) and port 6000+n (SRTP) both target the
 		// same stream (n+1) - a device is assigned one port range or the other, never both,
 		// so nothing needs to arbitrate between them beyond the existing per-port Kinesis
-		// lock (see StreamMetadataService). Stream names are plain device numbers ("1".."10"),
-		// matching backend/src/KinesisIngestionPipeline.ts's streamNameForPort().
+		// lock (see StreamMetadataService). Stream name prefix must match
+		// backend/src/KinesisIngestionPipeline.ts's KINESIS_STREAM_NAME_PREFIX (duplicated,
+		// not shared, since backend/ and cdk/ are deployed separately).
 		//
-		// IMPORTANT, by explicit design choice:
-		// - Kinesis Video Stream names cannot be changed in place (no rename API), so this is
-		//   a genuinely destructive migration for any already-deployed stack: deploying this
-		//   change replaces every existing stream (old logical IDs/names deleted, these new
-		//   ones created), discarding up to 30 days of retained media in the old streams and
-		//   breaking anything that referenced the old names. There is no way to preserve
-		//   history across this rename - export anything that matters before deploying.
-		// - Physical names are bare numbers, not stack-qualified, even though STACK_PREFIX
-		//   (see cdk/stackName.ts) supports naming multiple stacks. Two stacks deployed to the
-		//   same AWS account + region will collide on these names. This design assumes a
-		//   single deployed stack per account/region - do not deploy a second one alongside it.
+		// IMPORTANT: Kinesis Video Stream names cannot be changed in place (no rename API), so
+		// changing this prefix (or the stream count) is a genuinely destructive migration for
+		// any already-deployed stack: deploying such a change replaces every existing stream
+		// (old logical IDs/names deleted, new ones created), discarding up to 30 days of
+		// retained media in the old streams and breaking anything that referenced the old
+		// names. There is no way to preserve history across a rename - export anything that
+		// matters before deploying one.
+		const KINESIS_STREAM_NAME_PREFIX = 'video-streaming-2026-09-video'
 		const STREAM_COUNT = 10
 		const srtpPortRangeStart = 6000
 		const srtpPortRangeEnd = srtpPortRangeStart + STREAM_COUNT - 1
 		for (let i = 0; i < STREAM_COUNT; i++) {
-			const streamName = `${i + 1}`
+			const streamName = `${KINESIS_STREAM_NAME_PREFIX}-${i + 1}`
 			const stream = new kinesisvideo.CfnStream(
 				this,
 				`KinesisVideoStream${i + 1}`,
@@ -627,7 +625,7 @@ export class StreamingStack extends Stack {
 
 		const kvsIncomingMetrics: Record<string, cloudwatch.IMetric> = {}
 		this.kinesisVideoStreams.forEach((_, i) => {
-			const streamName = `${i + 1}`
+			const streamName = `${KINESIS_STREAM_NAME_PREFIX}-${i + 1}`
 			kvsIncomingMetrics[`s${i}`] = new cloudwatch.Metric({
 				namespace: 'AWS/KinesisVideo',
 				metricName: 'PutMedia.IncomingBytes',

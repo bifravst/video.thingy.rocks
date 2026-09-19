@@ -73,17 +73,19 @@ Or stream from a webcam:
 
 The backend receives UDP on that port, starts the GStreamer pipeline for that
 port, and kvssink sends H.264 to the numbered Kinesis Video Stream for that
-port: port 5000 → stream `1`, port 5001 → stream `2`, ..., port 5009 → stream
-`10` (`port - 5000 + 1`). SRTP port 6000+N targets the same stream as
-unencrypted port 5000+N - see
+port: port 5000 → stream `video-streaming-2026-09-video-1`, port 5001 →
+`video-streaming-2026-09-video-2`, ..., port 5009 →
+`video-streaming-2026-09-video-10` (`port - 5000 + 1`). SRTP port 6000+N targets
+the same stream as unencrypted port 5000+N - see
 [TESTING-SRTP-INGESTION.md](./TESTING-SRTP-INGESTION.md) - so don't send both to
 the same numbered port at once.
 
 ## 3. Verify in AWS
 
 1. **Kinesis Video Streams console**  
-   Open the stream for the port you used (e.g. port 5000 → stream `1`). Confirm
-   fragments are ingesting (e.g. “Fragment count” or “Ingestion” metrics).
+   Open the stream for the port you used (e.g. port 5000 →
+   `video-streaming-2026-09-video-1`). Confirm fragments are ingesting (e.g.
+   “Fragment count” or “Ingestion” metrics).
 
 2. **Playback (optional)**  
    Use “Playback” or “Get HLS streaming session URL” in the console to play the
@@ -255,5 +257,5 @@ escaping the bang (e.g. in bash: `gst-launch-1.0 -e fdsrc fd=0 \! fakesink`).
 # In an interactive shell, escape ! or run from a script to avoid history expansion.
 GST_PLUGIN_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build \
 LD_LIBRARY_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build \
-gst-launch-1.0 fdsrc fd=0 ! tsparse set-timestamps=true ! tsdemux name=d d. ! queue ! h264parse ! capsfilter caps="video/x-h264,stream-format=avc,alignment=au" ! kvssink stream-name="1" aws-region="eu-central-1" storage-size=128 log-config="/opt/video-streaming/kvs_log_configuration"
+gst-launch-1.0 fdsrc fd=0 ! tsparse set-timestamps=true ! tsdemux name=d d. ! queue ! h264parse ! capsfilter caps="video/x-h264,stream-format=avc,alignment=au" ! kvssink stream-name="video-streaming-2026-09-video-1" aws-region="eu-central-1" storage-size=128 log-config="/opt/video-streaming/kvs_log_configuration"
 ```

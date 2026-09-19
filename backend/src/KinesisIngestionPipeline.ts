@@ -31,9 +31,9 @@ export type KinesisIngestionPipelineConfig = {
 	 *
 	 * `portRange` must have the same number of ports as the top-level `portRange`: port
 	 * `portRange.start + i` (unencrypted) and `srtp.portRange.start + i` (SRTP) both target
-	 * the same Kinesis Video Stream, numbered `i + 1` (see streamNameForPort). A device is
-	 * assigned one port range or the other, never both, so nothing arbitrates between them
-	 * beyond the existing per-port Kinesis lock (StreamMetadataService).
+	 * the same Kinesis Video Stream (see streamNameForPort). A device is assigned one port
+	 * range or the other, never both, so nothing arbitrates between them beyond the existing
+	 * per-port Kinesis lock (StreamMetadataService).
 	 */
 	srtp?: {
 		portRange: { start: number; end: number }
@@ -44,6 +44,10 @@ export type KinesisIngestionPipelineConfig = {
 		keyStore: SrtpKeyStore
 	}
 }
+
+/** Must match cdk/StreamingStack.ts's KINESIS_STREAM_NAME_PREFIX (duplicated, not shared,
+ * since backend/ and cdk/ are deployed separately). */
+const KINESIS_STREAM_NAME_PREFIX = 'video-streaming-2026-09-video'
 
 const DEFAULT_REORDER_BUFFER_SIZE = 128
 const DEFAULT_SRTP_RELAY_PORT_OFFSET = 10_000
@@ -63,6 +67,38 @@ type ReorderState = {
 	nextSeq: number
 	nextToEmit: number
 	buffer: Map<number, Buffer>
+}
+
+/**
+ * Parses the RTP sequence number (bytes 2-3 of the fixed 12-byte header) from a plain RTP
+ * or SRTP datagram - both share the same header layout, and SRTP (RFC 3711) never encrypts
+ * the header, only the payload, so this needs no decryption. Returns undefined if the
+ * datagram is too short to contain a valid RTP/SRTP header. Exported for unit testing.
+ */
+export const parseRtpSequenceNumber = (
+	datagram: Buffer,
+): number | undefined => {
+	if (datagram.length < 12) return undefined
+	return datagram.readUInt16BE(2)
+}
+
+export type SrtpRocState = { lastSeq: number; roc: number }
+
+/**
+ * Advances an SRTP rollover-counter tracking state by one observed sequence number, using
+ * the standard rollover heuristic (RFC 3711 Appendix A): if the sequence number jumps
+ * backward by more than half the 16-bit range, the counter must have wrapped forward, so
+ * the rollover counter increments. `state` undefined means "first packet ever observed for
+ * this port" - starts at ROC 0, matching srtpdec's own default for a truly fresh session.
+ * Exported for unit testing.
+ */
+export const advanceSrtpRoc = (
+	state: SrtpRocState | undefined,
+	seq: number,
+): SrtpRocState => {
+	if (!state) return { lastSeq: seq, roc: 0 }
+	const wrapped = state.lastSeq > 0xc000 && seq < 0x4000
+	return { lastSeq: seq, roc: wrapped ? state.roc + 1 : state.roc }
 }
 
 /** Per-port throttle for GStreamer stderr warning categories. */
@@ -133,6 +169,19 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	private readonly activePipelines: Map<number, PortPipeline> = new Map()
 	/** Dedupe concurrent start(port) so only one credential fetch + spawn runs per port. */
 	private readonly pendingStarts: Map<number, Promise<void>> = new Map()
+	/**
+	 * Best-known SRTP rollover counter (ROC) per port, tracked by observing the plaintext RTP
+	 * sequence number of every SRTP datagram (SRTP never encrypts the RTP header - only the
+	 * payload - so this needs no decryption). A fresh srtpdec instance always starts at ROC
+	 * 0; without this, restarting GStreamer (crash, redeploy) or the whole process (EC2
+	 * reboot) after the sender's 16-bit sequence number has ever wrapped would seed the new
+	 * instance with the wrong ROC and it would never correctly decrypt again. See
+	 * trackSrtpRoc/seedSrtpRoc/getSrtpRoc.
+	 */
+	private readonly srtpRocByPort: Map<
+		number,
+		{ lastSeq: number; roc: number }
+	> = new Map()
 
 	constructor(config: KinesisIngestionPipelineConfig) {
 		super()
@@ -147,15 +196,40 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	}
 
 	/**
-	 * Kinesis Video Stream name for a port: the port's offset within its own range (0-based),
-	 * plus 1. Ports at the same offset in the unencrypted and SRTP ranges resolve to the same
-	 * stream name, e.g. portRange.start and srtp.portRange.start both map to "1".
+	 * Canonical stream-slot number (1-based): a port's offset within its own range, plus 1.
+	 * Ports at the same offset in the unencrypted and SRTP ranges resolve to the same slot,
+	 * e.g. portRange.start and srtp.portRange.start both map to slot 1. This is the identity
+	 * that should be used for anything shared between the two transports for the same
+	 * device - the Kinesis stream name (below) and the DynamoDB lock/heartbeat row (see
+	 * index.ts, which must key StreamMetadataService calls by this, not by the raw port -
+	 * otherwise port 5000 and port 6000 can independently "acquire" what look like separate
+	 * locks while actually contending for the same underlying stream).
 	 */
-	streamNameForPort(port: number): string {
+	streamSlotForPort(port: number): number {
 		const rangeStart = this.isSrtpPort(port)
 			? this.config.srtp!.portRange.start
 			: this.config.portRange.start
-		return String(port - rangeStart + 1)
+		return port - rangeStart + 1
+	}
+
+	/** Kinesis Video Stream name for a port: KINESIS_STREAM_NAME_PREFIX + streamSlotForPort. */
+	streamNameForPort(port: number): string {
+		return `${KINESIS_STREAM_NAME_PREFIX}-${this.streamSlotForPort(port)}`
+	}
+
+	/**
+	 * The other transport's port for the same stream slot as `port` (port 5000+n's pair is
+	 * 6000+n and vice versa), if SRTP is configured with a matching-length port range;
+	 * undefined otherwise. Used to refuse starting a second producer for a slot that
+	 * already has one active via the other transport.
+	 */
+	pairedPortFor(port: number): number | undefined {
+		const srtp = this.config.srtp
+		if (!srtp) return undefined
+		const slot = this.streamSlotForPort(port)
+		return this.isSrtpPort(port)
+			? this.config.portRange.start + slot - 1
+			: srtp.portRange.start + slot - 1
 	}
 
 	isPortInRange(port: number): boolean {
@@ -172,6 +246,47 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	 */
 	isActive(port: number): boolean {
 		return this.activePipelines.has(port)
+	}
+
+	/**
+	 * Updates this port's best-known SRTP ROC by observing one datagram's plaintext RTP
+	 * sequence number (SRTP/RFC 3711 never encrypts the header, only the payload, so this
+	 * needs no decryption). Uses advanceSrtpRoc's rollover heuristic. This is a best-effort
+	 * estimate for seeding a *future* restart, not a replacement for srtpdec/libsrtp's own
+	 * real-time sliding-window tracking during normal operation - an occasional misordered
+	 * packet right at a wrap boundary could misestimate by one, an acceptable residual risk
+	 * given the alternative (always assuming ROC 0) is far worse. Call for every SRTP
+	 * datagram, in arrival order, whether or not it's been sent on yet (including ones still
+	 * sitting in the pre-start buffer).
+	 */
+	private trackSrtpRoc(port: number, datagram: Buffer): void {
+		const seq = parseRtpSequenceNumber(datagram)
+		if (seq === undefined) return
+		this.srtpRocByPort.set(
+			port,
+			advanceSrtpRoc(this.srtpRocByPort.get(port), seq),
+		)
+	}
+
+	/** Current best-known SRTP ROC for a port (0 if never observed/seeded). */
+	getSrtpRoc(port: number): number {
+		return this.srtpRocByPort.get(port)?.roc ?? 0
+	}
+
+	/**
+	 * Seeds this port's ROC from persisted state (see index.ts, which loads it from
+	 * DynamoDB before starting an SRTP port's pipeline). Only raises the tracked value -
+	 * never regresses a live, more-current in-process estimate to an older persisted one
+	 * (e.g. on a same-process GStreamer-only restart, where we already have better
+	 * information than whatever was last flushed to DynamoDB).
+	 */
+	seedSrtpRoc(port: number, roc: number): void {
+		const state = this.srtpRocByPort.get(port)
+		if (!state) {
+			this.srtpRocByPort.set(port, { lastSeq: 0, roc })
+			return
+		}
+		if (roc > state.roc) state.roc = roc
 	}
 
 	/**
@@ -356,6 +471,26 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	): Promise<void> {
 		if (this.activePipelines.has(port)) return
 
+		// Refuse to start a second producer for a stream slot that already has one active via
+		// the other transport (e.g. port 5000 and port 6000 both map to the same Kinesis
+		// stream) - callers are expected to only ever use one transport per device, but this
+		// is the in-process backstop if that's ever violated (misconfiguration, migration,
+		// two clients hitting the same instance). The cross-instance case is covered
+		// separately by index.ts keying the DynamoDB lock by streamSlotForPort(), not by port.
+		const pairedPort = this.pairedPortFor(port)
+		if (pairedPort !== undefined && this.activePipelines.has(pairedPort)) {
+			this.logger.error(
+				'Refusing to start ingestion: paired port for this stream slot is already active',
+				new Error('Paired-port conflict'),
+				{
+					port,
+					pairedPort,
+					streamName: this.streamNameForPort(port),
+				},
+			)
+			return
+		}
+
 		if (this.isSrtpPort(port)) {
 			const initialDatagrams = Array.isArray(initialData)
 				? initialData
@@ -529,6 +664,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		logConfigPath: string
 		key: SrtpPortKey
 		jitterBufferLatencyMs: number
+		roc: number
 	}): string[] {
 		const {
 			relayPort,
@@ -537,10 +673,13 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			logConfigPath,
 			key,
 			jitterBufferLatencyMs,
+			roc,
 		} = params
 
 		// Verify caps field names/values (especially srtp-cipher/srtp-auth enum literals) against
 		// the actual installed GStreamer version via `gst-inspect-1.0 srtpdec` - see docs/TESTING-SRTP-INGESTION.md.
+		// "roc" seeds srtpdec's rollover counter (see trackSrtpRoc/getSrtpRoc) so a restart
+		// after the sender's sequence number has wrapped doesn't start back at ROC 0.
 		const caps = [
 			'application/x-srtp',
 			'media=(string)video',
@@ -553,6 +692,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			`srtp-auth=(string)${key.auth}`,
 			`srtcp-cipher=(string)${key.cipher}`,
 			`srtcp-auth=(string)${key.auth}`,
+			`roc=(uint)${roc}`,
 		].join(',')
 
 		return [
@@ -661,6 +801,12 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		const jitterBufferLatencyMs =
 			srtpConfig.jitterBufferLatencyMs ?? DEFAULT_SRTP_JITTER_BUFFER_LATENCY_MS
 
+		// Account for any rollover within the buffered data itself before seeding this
+		// pipeline instance's ROC (see trackSrtpRoc/getSrtpRoc).
+		for (const datagram of initialDatagrams) {
+			this.trackSrtpRoc(port, datagram)
+		}
+
 		const argv = this.buildSrtpPipelineArgs({
 			relayPort,
 			streamName,
@@ -668,6 +814,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			logConfigPath: this.logConfigPath(),
 			key,
 			jitterBufferLatencyMs,
+			roc: this.getSrtpRoc(port),
 		})
 
 		this.logger.info('GStreamer command (SRTP)', {
@@ -894,6 +1041,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		if (!pipeline) return
 
 		if (pipeline.transport === 'srtp-relay') {
+			this.trackSrtpRoc(port, data)
 			if (!pipeline.ready) {
 				// Startup replay is still in flight - queue rather than send now, so this
 				// datagram can't overtake the older, still-buffered ones (see `ready` above).

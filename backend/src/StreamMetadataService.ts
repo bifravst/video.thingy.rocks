@@ -1,6 +1,7 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
 import {
 	DynamoDBDocumentClient,
+	GetCommand,
 	PutCommand,
 	UpdateCommand,
 } from '@aws-sdk/lib-dynamodb'
@@ -9,6 +10,11 @@ import {
 export const KINESIS_LOCK_STALE_MS = 5 * 60 * 1000 // 5 minutes
 
 export type StreamMetadata = {
+	/**
+	 * Canonical stream-slot number (see KinesisIngestionPipeline.streamSlotForPort), NOT a
+	 * raw UDP port - callers must key every method below by that, not by port, so the
+	 * unencrypted and SRTP transports for the same device share one lock/heartbeat row.
+	 */
 	port: number
 	status: 'active' | 'inactive'
 	lastPacketTime: string // ISO 8601
@@ -17,6 +23,10 @@ export type StreamMetadata = {
 	lastFramePath?: string
 	hlsManifestPath?: string
 	rawStreamPath?: string
+	/** Best-known SRTP rollover counter for this slot - see
+	 * KinesisIngestionPipeline.getSrtpRoc/seedSrtpRoc. Only meaningful when the device uses
+	 * the SRTP transport; absent/0 otherwise. */
+	srtpRoc?: number
 	createdAt: string
 	updatedAt: string
 }
@@ -31,6 +41,8 @@ export class StreamMetadataService {
 	private readonly tableName: string
 	private readonly lastUpdateTimes: Map<number, number> = new Map()
 	private readonly updateThrottleMs = 15_000 // 15 seconds
+	private readonly lastSrtpRocUpdateTimes: Map<number, number> = new Map()
+	private readonly srtpRocUpdateThrottleMs = 15_000 // 15 seconds
 
 	constructor(config: StreamMetadataServiceConfig) {
 		const client = new DynamoDBClient({
@@ -228,6 +240,63 @@ export class StreamMetadataService {
 			)
 			this.lastUpdateTimes.delete(port)
 			throw error
+		}
+	}
+
+	/**
+	 * Reads the persisted SRTP rollover counter for a stream slot (0 if never persisted).
+	 * Called once before starting an SRTP port's pipeline, to seed srtpdec correctly across
+	 * process restarts (see KinesisIngestionPipeline.seedSrtpRoc) - a fresh GStreamer
+	 * instance always starts at ROC 0 otherwise, which breaks decryption after any sequence
+	 * number rollover in the sender's session.
+	 */
+	async getSrtpRoc(port: number): Promise<number> {
+		try {
+			const result = await this.docClient.send(
+				new GetCommand({ TableName: this.tableName, Key: { port } }),
+			)
+			const roc: unknown = result.Item?.srtpRoc
+			return typeof roc === 'number' ? roc : 0
+		} catch (error) {
+			console.error(
+				`[StreamMetadataService] Error reading SRTP ROC for port ${port}:`,
+				error,
+			)
+			return 0
+		}
+	}
+
+	/**
+	 * Persists the current SRTP ROC for a stream slot, throttled to once per
+	 * srtpRocUpdateThrottleMs unless `force` is set (e.g. on stream stop, to capture the
+	 * latest value before the slot potentially gets reassigned). Upserts the row (no
+	 * ConditionExpression) since this may run before any lock has ever been acquired for
+	 * this slot.
+	 */
+	async updateSrtpRoc(port: number, roc: number, force = false): Promise<void> {
+		const now = Date.now()
+		const lastUpdate = this.lastSrtpRocUpdateTimes.get(port) ?? 0
+		if (!force && now - lastUpdate < this.srtpRocUpdateThrottleMs) return
+		this.lastSrtpRocUpdateTimes.set(port, now)
+
+		try {
+			await this.docClient.send(
+				new UpdateCommand({
+					TableName: this.tableName,
+					Key: { port },
+					UpdateExpression: 'SET srtpRoc = :roc, updatedAt = :updatedAt',
+					ExpressionAttributeValues: {
+						':roc': roc,
+						':updatedAt': new Date().toISOString(),
+					},
+				}),
+			)
+		} catch (error) {
+			console.error(
+				`[StreamMetadataService] Error updating SRTP ROC for port ${port}:`,
+				error,
+			)
+			this.lastSrtpRocUpdateTimes.delete(port)
 		}
 	}
 
