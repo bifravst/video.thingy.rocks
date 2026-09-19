@@ -70,6 +70,13 @@ const SRTP_STARTUP_GRACE_MS = 300
  * the whole (potentially thousands-of-datagrams) buffer at once with no backpressure. */
 const SRTP_REPLAY_BATCH_SIZE = 50
 const SRTP_REPLAY_BATCH_PAUSE_MS = 10
+/** Bounds how long runStartForFifoPort waits for GStreamer's filesrc to open the FIFO for
+ * reading. Opening a FIFO for writing blocks at the OS level until *some* reader opens it -
+ * if GStreamer fails to spawn or exits before ever opening it (missing binary/plugin), that
+ * wait would otherwise hang forever, holding the Kinesis lock indefinitely with nothing to
+ * release/retry it. Generous (matches stop()'s own exit-wait budget) since a slow-but-normal
+ * startup shouldn't be mistaken for a hang. */
+const FIFO_OPEN_TIMEOUT_MS = 15_000
 
 type ReorderState = {
 	nextSeq: number
@@ -88,6 +95,19 @@ type ReorderState = {
  * before it can influence ROC tracking (see advanceSrtpRoc), not a determined spoofer - a
  * fully watertight fix would need per-packet authentication feedback from srtpdec, which
  * isn't exposed by this gst-launch-1.0-based architecture. Exported for unit testing.
+ *
+ * Known, accepted limitation (see index.ts's looksPlausibleRtp, which reuses this same
+ * check to gate lock acquisition/heartbeat/ROC-update eligibility): because this can't
+ * authenticate, a party who has learned a port's SSRC (not secret) can forge packets that
+ * pass it, and could use that to repeatedly acquire/refresh the shared stream lock (denying
+ * the legitimate device) or feed bogus sequence numbers into the persisted ROC estimate -
+ * srtpdec would still reject the forged payload's actual auth tag downstream, but only after
+ * this layer has already granted it lock/heartbeat/ROC eligibility. Closing this fully needs
+ * either real per-packet SRTP authentication computed here in Node (implementing RFC 3711's
+ * key derivation and HMAC verification independently of srtpdec) or a trusted-source
+ * admission control in front of these ports; both are out of scope for this static-caps
+ * gst-launch-1.0 architecture and deliberately not attempted rather than risk a subtly wrong
+ * from-scratch crypto implementation.
  */
 export const parseAuthenticRtpSequenceNumber = (
 	datagram: Buffer,
@@ -681,22 +701,88 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			env,
 		})
 
-		// Open FIFO for writing (blocks until GStreamer filesrc opens for read); then write initial data so pipeline has data when it starts.
-		const inputStream = await new Promise<Writable>((resolve, reject) => {
-			fs.open(fifoPath, 'w', (err, fd) => {
-				if (err) {
-					reject(err)
-					return
-				}
-				const w = fs.createWriteStream('', { fd, autoClose: true })
-				const data = initialData ?? Buffer.alloc(0)
-				if (data.length > 0) {
-					w.write(data, (e) => (e ? reject(e) : resolve(w)))
-				} else {
+		// Open FIFO for writing (blocks until GStreamer filesrc opens for read); then write
+		// initial data so pipeline has data when it starts. Raced against the child exiting
+		// or erroring first, and against a bounded timeout - opening a FIFO for writing
+		// blocks at the OS level until *some* reader appears, so without this, a GStreamer
+		// spawn failure or early exit (missing binary/plugin) would hang this wait forever,
+		// holding the Kinesis lock indefinitely with nothing to release/retry it. Temporary
+		// listeners here (not the permanent ones below) since gst's 'error' can fire before
+		// this function would otherwise start listening for it at all.
+		let inputStream: Writable
+		try {
+			inputStream = await new Promise<Writable>((resolve, reject) => {
+				let settled = false
+				const settleResolve = (w: Writable): void => {
+					if (settled) return
+					settled = true
+					clearTimeout(timer)
+					gst.off('exit', onEarlyExit)
+					gst.off('error', onEarlyError)
 					resolve(w)
 				}
+				const settleReject = (err: Error): void => {
+					if (settled) return
+					settled = true
+					clearTimeout(timer)
+					gst.off('exit', onEarlyExit)
+					gst.off('error', onEarlyError)
+					reject(err)
+				}
+
+				const onEarlyExit = (
+					code: number | null,
+					signal: string | null,
+				): void => {
+					settleReject(
+						new Error(
+							`GStreamer exited before opening the FIFO for reading (code=${code ?? 'null'}, signal=${signal ?? 'null'})`,
+						),
+					)
+				}
+				const onEarlyError = (err: Error): void => settleReject(err)
+				gst.once('exit', onEarlyExit)
+				gst.once('error', onEarlyError)
+
+				const timer = setTimeout(() => {
+					settleReject(
+						new Error(
+							`Timed out after ${FIFO_OPEN_TIMEOUT_MS}ms waiting for GStreamer to open the FIFO for reading`,
+						),
+					)
+				}, FIFO_OPEN_TIMEOUT_MS)
+
+				fs.open(fifoPath, 'w', (err, fd) => {
+					if (err) {
+						settleReject(err)
+						return
+					}
+					const w = fs.createWriteStream('', { fd, autoClose: true })
+					const data = initialData ?? Buffer.alloc(0)
+					if (data.length > 0) {
+						w.write(data, (e) => (e ? settleReject(e) : settleResolve(w)))
+					} else {
+						settleResolve(w)
+					}
+				})
 			})
-		})
+		} catch (err) {
+			// Nothing was registered in activePipelines yet - clean up the child/FIFO and
+			// rethrow so start()'s caller (index.ts's startPipelineOrReleaseLock) treats this
+			// as a failed start and releases the Kinesis lock instead of holding it forever.
+			this.logger.error(
+				'Failed to open FIFO for GStreamer within the startup window',
+				err instanceof Error ? err : new Error(String(err)),
+				{ port, streamName, fifoPath },
+			)
+			gst.kill('SIGTERM')
+			try {
+				fs.unlinkSync(fifoPath)
+			} catch {
+				// best-effort cleanup; nothing more to do if this fails
+			}
+			throw err instanceof Error ? err : new Error(String(err))
+		}
 		inputStream.on('error', (err: NodeJS.ErrnoException) => {
 			if (err.code !== 'EPIPE') {
 				this.logger.warn('GStreamer FIFO write error', {
@@ -721,12 +807,14 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		})
 		gst.on('error', (err) => {
 			this.logger.error('GStreamer error', err, { port, streamName })
+			// Only mutate/notify if the map still points to *this* pipeline instance - see
+			// the identical check (and rationale) on the SRTP path's handlers.
+			if (this.activePipelines.get(port) !== pipeline) return
 			this.activePipelines.delete(port)
+			this.emit('pipelineExited', { port, code: null, signal: null })
 		})
 		gst.on('exit', (code, signal) => {
-			// Emit before delete: if port was in activePipelines, this was an unexpected exit
-			// (intentional stop() removes from map before killing the process)
-			const wasUnexpected = this.activePipelines.has(port)
+			const wasUnexpected = this.activePipelines.get(port) === pipeline
 			this.logger.info('GStreamer exited', {
 				port,
 				streamName,
@@ -734,10 +822,9 @@ export class KinesisIngestionPipeline extends EventEmitter {
 				signal: signal ?? undefined,
 				unexpected: wasUnexpected,
 			})
+			if (!wasUnexpected) return
 			this.activePipelines.delete(port)
-			if (wasUnexpected) {
-				this.emit('pipelineExited', { port, code, signal })
-			}
+			this.emit('pipelineExited', { port, code, signal })
 		})
 
 		const reorderBufferSize =
@@ -747,7 +834,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			nextToEmit: 1,
 			buffer: new Map(),
 		}
-		this.activePipelines.set(port, {
+		const pipeline: FifoPortPipeline = {
 			transport: 'fifo',
 			gst,
 			inputStream,
@@ -755,7 +842,8 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			gstStderrThrottle,
 			gstStdoutThrottle,
 			fifoPath,
-		})
+		}
+		this.activePipelines.set(port, pipeline)
 		this.logger.info('Kinesis ingestion started', {
 			port,
 			streamName,
@@ -991,11 +1079,26 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		})
 		gst.on('error', (err) => {
 			this.logger.error('GStreamer error', err, { port, streamName })
+			// Only mutate/notify if the map still points to *this* pipeline instance - a
+			// stale event from an already-replaced (newer) pipeline for the same port must
+			// not delete that replacement's entry or trigger a spurious restart for it.
+			// (`pipeline` is assigned synchronously below with no intervening `await`, so by
+			// the time this handler can actually fire - always deferred by Node - it's set.)
+			if (this.activePipelines.get(port) !== pipeline) return
 			this.activePipelines.delete(port)
 			closeRelaySocket()
+			// Unlike 'exit', a spawn failure (missing binary/plugin) can fire 'error' without
+			// ever firing 'exit' - previously only 'exit' emitted 'pipelineExited', so this
+			// case silently left the Kinesis lock held with nothing telling index.ts to
+			// release/retry it.
+			this.emit('pipelineExited', { port, code: null, signal: null })
 		})
 		gst.on('exit', (code, signal) => {
-			const wasUnexpected = this.activePipelines.has(port)
+			// Same identity check as 'error' above: only the pipeline currently registered
+			// for this port may treat its own exit as unexpected. An intentional stop()
+			// deletes the map entry before killing the process, so its own exit correctly
+			// sees `!== pipeline` (or a newer pipeline's entry) and does nothing further here.
+			const wasUnexpected = this.activePipelines.get(port) === pipeline
 			this.logger.info('GStreamer exited', {
 				port,
 				streamName,
@@ -1003,11 +1106,10 @@ export class KinesisIngestionPipeline extends EventEmitter {
 				signal: signal ?? undefined,
 				unexpected: wasUnexpected,
 			})
+			if (!wasUnexpected) return
 			this.activePipelines.delete(port)
 			closeRelaySocket()
-			if (wasUnexpected) {
-				this.emit('pipelineExited', { port, code, signal })
-			}
+			this.emit('pipelineExited', { port, code, signal })
 		})
 
 		const pipeline: SrtpRelayPortPipeline = {

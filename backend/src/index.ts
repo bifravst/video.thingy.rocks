@@ -180,10 +180,15 @@ const clearLockHeld = (port: number): void => {
  * Stops the pipeline *before* clearing local ownership, not after - clearing first would let
  * the paired transport's cheap pairedPortHoldsLock check pass and start racing this port's
  * still-running producer immediately (this instance no longer owns the DynamoDB row either,
- * by construction, so there's nothing stopping a genuine two-producer window). Also re-arms
- * an empty pre-start buffer afterward if the stream is still active, so a later packet can
- * retry lock acquisition - without this, a stream that keeps sending after losing the lock
- * would be stranded until a full inactivity/resume cycle happens on its own.
+ * by construction, so there's nothing stopping a genuine two-producer window). Also applies
+ * the standard start backoff and re-arms an empty pre-start buffer afterward if the stream
+ * is still active, so a later packet can retry lock acquisition - without the backoff, a
+ * *transient* write failure (updateSrtpRoc/updateLastPacketTime return false for both a
+ * genuinely lost conditional lock and an ordinary DynamoDB error - see their own doc
+ * comments) would otherwise repeat this buffer/start/relinquish cycle (and the GStreamer
+ * spawn/kill churn that goes with it) at roughly one attempt per 10MB for as long as the
+ * outage lasts; without the re-arm at all, the stream would be stranded until a full
+ * inactivity/resume cycle happens on its own.
  */
 const relinquishPort = async (port: number): Promise<void> => {
 	console.warn(
@@ -193,6 +198,7 @@ const relinquishPort = async (port: number): Promise<void> => {
 		await kinesisIngestionPipeline.stop(port)
 	}
 	clearLockHeld(port)
+	nextStartAttemptAllowedAtByPort.set(port, Date.now() + START_RETRY_BACKOFF_MS)
 	if (
 		streamStateManager.getStreamState(port)?.status === 'active' &&
 		!preStartBufferByPort.has(port)
@@ -369,6 +375,22 @@ type PacketHandlerWithQueueDrain = PacketHandler & {
 const createPacketHandler = (
 	rangeConfig: PacketHandlerRangeConfig,
 ): PacketHandlerWithQueueDrain => {
+	/**
+	 * For SRTP ports, whether a datagram looks like RTP for the configured SSRC
+	 * (parseAuthenticRtpSequenceNumber) - a noise filter, NOT authentication (SSRC is not
+	 * secret; a deliberate spoofer who knows it can pass this check trivially - see that
+	 * function's own doc comment; a fully watertight fix needs per-packet auth feedback from
+	 * srtpdec, which this gst-launch-1.0-based architecture doesn't expose). For unencrypted
+	 * ports, or when there's no key loaded yet to validate against, always true (unchanged
+	 * behavior - start() already refuses and reports a missing key separately).
+	 */
+	const looksPlausibleRtp = (port: number, data: Buffer): boolean => {
+		if (!kinesisIngestionPipeline || !rangeConfig.isSrtp) return true
+		const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
+		if (ssrc === undefined) return true
+		return parseAuthenticRtpSequenceNumber(data, ssrc) !== undefined
+	}
+
 	const processPacket = async (
 		port: number,
 		data: Buffer,
@@ -389,25 +411,19 @@ const createPacketHandler = (
 		// on packets 2..N until we hit the threshold; otherwise we only enter on first packet.
 		//
 		// For SRTP ports specifically, also require the datagram to look like RTP for the
-		// configured SSRC (parseAuthenticRtpSequenceNumber - the same noise filter ROC
-		// tracking uses, not authentication) before it can count toward the threshold or
+		// configured SSRC (looksPlausibleRtp - the same noise filter ROC tracking uses, not
+		// authentication - see its own doc comment for why this can't stop a deliberate
+		// spoofer, only opportunistic noise) before it can count toward the threshold or
 		// trigger lock acquisition at all - these ports are public, and arbitrary traffic
 		// reaching 10MB would otherwise acquire the shared stream lock and start a producer
 		// with garbage input, denying a legitimate sender (routed to another instance) the
-		// slot. A missing key (ssrc undefined) is let through unfiltered here since it can't
-		// be validated anyway; start() already refuses and reports that case separately.
-		const isPlausibleForBuffering = ((): boolean => {
-			if (!kinesisIngestionPipeline || !rangeConfig.isSrtp) return true
-			const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
-			if (ssrc === undefined) return true
-			return parseAuthenticRtpSequenceNumber(data, ssrc) !== undefined
-		})()
+		// slot.
 		if (
 			kinesisIngestionPipeline &&
 			kinesisIngestionPipeline.isPortInRange(port) &&
 			!kinesisLockHeldForPorts.has(port) &&
 			(isFirstPacket || isResume || preStartBufferByPort.has(port)) &&
-			isPlausibleForBuffering
+			looksPlausibleRtp(port, data)
 		) {
 			let buf = preStartBufferByPort.get(port)
 			if (!buf) {
@@ -509,6 +525,19 @@ const createPacketHandler = (
 					instanceId,
 				)
 			} catch (err) {
+				// updateLastPacketTime uses a conditional write - ConditionalCheckFailedException
+				// specifically means another instance now owns this slot's lock, not a
+				// transient DynamoDB error. Continuing (as a plain log-and-continue would) lets
+				// this producer keep writing after someone else has taken the lock; unlike the
+				// SRTP path below, the FIFO/unencrypted path has no later ownership check to
+				// catch this, so it must stop here.
+				if (
+					err instanceof Error &&
+					err.name === 'ConditionalCheckFailedException'
+				) {
+					await relinquishPort(port)
+					return
+				}
 				console.error(`[Main] Error updating DynamoDB for port ${port}:`, err)
 			}
 
@@ -617,7 +646,19 @@ const createPacketHandler = (
 		// DynamoDB, credential retries, the paced SRTP startup replay) could delay it long
 		// enough for the inactivity timeout to fire a spurious onStreamStop while packets were
 		// still arriving, just not yet processed.
-		streamStateManager.onPacketReceived(port, timestamp)
+		//
+		// Skipped for a not-yet-locked port whose datagram doesn't look like plausible RTP
+		// (looksPlausibleRtp): marking the stream active here happens *before*
+		// processPacket's own plausibility check further down (which only gates entry into
+		// the buffering block) - without this, a single implausible datagram could consume
+		// the only isFirstPacket/isResume transition and mark the stream active without ever
+		// arming a pre-start buffer, leaving later genuinely-valid packets stuck (both
+		// transition flags now false, no buffer entry) until an inactivity cycle. Once the
+		// lock is already held, traffic is treated normally regardless - GStreamer/srtpdec's
+		// own validation is the authority at that point, not this pre-lock noise filter.
+		if (kinesisLockHeldForPorts.has(port) || looksPlausibleRtp(port, data)) {
+			streamStateManager.onPacketReceived(port, timestamp)
+		}
 
 		let state = queueStateByPort.get(port)
 		if (!state) {
@@ -1017,7 +1058,32 @@ const start = async (): Promise<void> => {
 		}
 		await healthServer.start()
 		await udpListener.start()
-		await srtpUdpListener?.start()
+		if (srtpUdpListener) {
+			// Isolated from the rest of startup, same rationale as the SRTP key-loading block
+			// above: UDPListener.start() rejects if any port in its range permanently fails to
+			// bind (see UDPListener.bindPort), and this used to sit in the same outer
+			// try/catch that exits the whole process on any failure - an SRTP-only bind
+			// problem (port conflict, misconfiguration) would then take down the
+			// already-started unencrypted listener too. Clean up any SRTP sockets that did
+			// bind before the failure, so a later retry (this instance's whole process still
+			// isn't restarting) doesn't leak them.
+			try {
+				await srtpUdpListener.start()
+			} catch (err) {
+				console.error(
+					'[Main] Failed to start SRTP UDP listener; SRTP ingestion will be unavailable until this is resolved. The unencrypted MPEG-TS path is unaffected. Error:',
+					err,
+				)
+				try {
+					await srtpUdpListener.stop()
+				} catch (stopErr) {
+					console.error(
+						'[Main] Error cleaning up partially-started SRTP UDP listener:',
+						stopErr,
+					)
+				}
+			}
+		}
 		console.log('[Main] Service started successfully')
 	} catch (error) {
 		console.error('[Main] Failed to start service:', error)
