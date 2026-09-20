@@ -652,6 +652,50 @@ void describe('KinesisIngestionPipeline', () => {
 			}
 		})
 
+		void it('holds SRTP datagrams while no pipeline is active and replays them in order on restart', async () => {
+			const receiver = await makeReceiver()
+			const { pipeline, children } = makeLifecycle()
+			try {
+				await pipeline.start(port, [datagram(1)])
+				await waitUntil(() => receiver.received.length === 1)
+
+				// Simulate an unexpected exit (crash/OOM): kill the child out from under the
+				// still-registered pipeline.
+				children[0]!.kill('SIGKILL')
+				await waitUntil(() => !pipeline.isActive(port))
+
+				// Datagrams arriving while no pipeline is active are held, not dropped -
+				// losing the first post-crash keyframe/SPS/PPS would delay recovery until
+				// the sender's next keyframe.
+				pipeline.writePacket(port, datagram(2))
+				pipeline.writePacket(port, datagram(3))
+
+				// The replacement pipeline (the throttled restart in index.ts) replays them,
+				// in order, as its first datagrams.
+				await pipeline.start(port, [])
+				await waitUntil(() => receiver.received.length === 3)
+				assert.deepStrictEqual(receiver.received.slice(1), [
+					datagram(2),
+					datagram(3),
+				])
+
+				// A datagram held while no pipeline is active is dropped once the port is
+				// intentionally stopped - the stop clears the hold (there is no replacement
+				// pipeline to replay into), so the next start begins from live traffic
+				// instead of stale pre-stop datagrams.
+				children[1]!.kill('SIGKILL')
+				await waitUntil(() => !pipeline.isActive(port))
+				pipeline.writePacket(port, datagram(4)) // held while down
+				await pipeline.stop(port) // intentional stop clears the hold
+				await pipeline.start(port, [])
+				await new Promise((r) => setTimeout(r, 100))
+				assert.strictEqual(receiver.received.length, 3)
+			} finally {
+				await pipeline.shutdown()
+				receiver.close()
+			}
+		})
+
 		void it('shutdown() refuses further starts and waits for still-running children to exit', async () => {
 			const { pipeline, spawnedCalls, children } = makeLifecycle()
 			await pipeline.start(port, [])

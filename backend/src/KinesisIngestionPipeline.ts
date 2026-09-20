@@ -296,6 +296,21 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	/** Dedupe concurrent start(port) so only one credential fetch + spawn runs per port. */
 	private readonly pendingStarts: Map<number, Promise<void>> = new Map()
 	/**
+	 * SRTP datagrams received while no pipeline is active for the port (e.g. the window
+	 * between an unexpected GStreamer exit and its throttled restart in index.ts, or while
+	 * any start is still resolving credentials/spawning): writePacket would otherwise drop
+	 * the payload entirely - only its ROC contribution would survive - losing the first
+	 * post-crash keyframe/SPS/PPS and delaying recovery until the sender's next keyframe.
+	 * Seeded into the replacement pipeline's pendingQueue at registration (see
+	 * runStartForSrtpPort), so it is sent in order after the startup replay and before any
+	 * live traffic. Bounded by the same pendingQueueMaxBytes cap; cleared by stop() - an
+	 * intentional stop has no replacement pipeline to replay into.
+	 */
+	private readonly srtpHoldByPort = new Map<
+		number,
+		{ chunks: Buffer[]; totalBytes: number }
+	>()
+	/**
 	 * Best-known SRTP rollover counter (ROC) per port, tracked by observing the plaintext RTP
 	 * sequence number of every SRTP datagram (SRTP never encrypts the RTP header - only the
 	 * payload - so this needs no decryption). A fresh srtpdec instance always starts at ROC
@@ -833,6 +848,14 @@ export class KinesisIngestionPipeline extends EventEmitter {
 				'Refusing to spawn GStreamer: pipeline manager is shut down',
 				{ port, streamName },
 			)
+			// mkfifo above already created the FIFO - a shutdown that raced this start
+			// (e.g. during its credential resolution) must not leave a stale one behind.
+			// Best-effort, same as the failure path below.
+			try {
+				fs.unlinkSync(fifoPath)
+			} catch {
+				// best-effort cleanup; nothing more to do if this fails
+			}
 			return
 		}
 		const gst = this.spawnProcess('sh', ['-c', shellCmd], {
@@ -1298,6 +1321,20 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		}
 		this.activePipelines.set(port, pipeline)
 
+		// Seed the pending queue with the datagrams held while no pipeline was active (see
+		// writePacket's hold): they predate everything that arrives from here on, and the
+		// queued-drain below sends them in order after the startup replay and before any
+		// live traffic. Doing this in the same synchronous block as the registration above
+		// closes the window atomically - writePacket stops holding (and starts queueing/
+		// relaying into this pipeline) exactly when the hold is picked up, so no datagram is
+		// both held and queued, and none is lost between the two.
+		const held = this.srtpHoldByPort.get(port)
+		if (held !== undefined) {
+			this.srtpHoldByPort.delete(port)
+			pipeline.pendingQueue.push(...held.chunks)
+			pipeline.pendingQueueBytes += held.totalBytes
+		}
+
 		// Unlike the FIFO path (whose fs.open() blocks until filesrc opens for read), there is
 		// no OS-level handshake for udpsrc binding a port - wait for GStreamer's own readiness
 		// signal (or the fallback timeout) before sending anything. Live packets queue in
@@ -1461,7 +1498,28 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		}
 
 		const pipeline = this.activePipelines.get(port)
-		if (!pipeline) return
+		if (!pipeline) {
+			// SRTP: hold the datagram for the replacement pipeline (see srtpHoldByPort)
+			// instead of dropping its payload; FIFO/MPEG-TS stays a plain drop, as before -
+			// that path's payload is self-synchronizing and recovers at the next sync
+			// point, so replaying stale bytes buys nothing.
+			if (!this.isSrtpPort(port)) return
+			let hold = this.srtpHoldByPort.get(port)
+			if (hold === undefined) {
+				hold = { chunks: [], totalBytes: 0 }
+				this.srtpHoldByPort.set(port, hold)
+			}
+			hold.chunks.push(data)
+			hold.totalBytes += data.length
+			const maxHoldBytes =
+				this.config.srtp?.pendingQueueMaxBytes ??
+				DEFAULT_SRTP_PENDING_QUEUE_MAX_BYTES
+			while (hold.totalBytes > maxHoldBytes && hold.chunks.length > 1) {
+				const dropped = hold.chunks.shift()
+				if (dropped !== undefined) hold.totalBytes -= dropped.length
+			}
+			return
+		}
 
 		if (pipeline.transport === 'srtp-relay') {
 			if (!pipeline.ready) {
@@ -1563,6 +1621,12 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	 * once the producer is really gone.
 	 */
 	async stop(port: number): Promise<void> {
+		// An intentional stop has no replacement pipeline to replay into - drop any
+		// datagrams held for one (see writePacket's hold) instead of replaying stale traffic
+		// into whatever starts next. Before the pipeline lookup: the hold exists exactly
+		// when no pipeline is active, which is also when the lookup below returns early.
+		this.srtpHoldByPort.delete(port)
+
 		const pipeline = this.activePipelines.get(port)
 		if (!pipeline) return
 
@@ -1653,6 +1717,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	async shutdown(): Promise<void> {
 		this.closed = true
 		await this.stopAll()
+		this.srtpHoldByPort.clear()
 		const stillRunning = Array.from(this.spawnedGst)
 		if (stillRunning.length > 0) {
 			this.logger.warn(
