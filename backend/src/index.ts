@@ -224,18 +224,22 @@ const FINAL_ROC_PERSIST_RETRY_DELAY_MS = 1_000
  * strongly consistent read may return a ROC that is stale by up to one rollover, and the
  * error logged here names the operational escape hatch for exactly that failure mode.
  *
- * Runs under the slot's mutex (withSlotLock) and re-reads the in-memory ROC state
- * immediately before every write attempt: onStreamStop/shutdown can reach this while the
- * UDP listener is still enqueueing packets, and a packet processed after an earlier
- * attempt failed can advance and persist a *newer* ROC - retrying with a state captured
- * before that packet would overwrite it again (both writes are conditional on this
- * instance being the lock owner, so the retry succeeds just the same), leaving the slot's
- * next owner seeded with a stale ROC if the intervening packet crossed a rollover. The
- * mutex excludes the per-packet lock-held bookkeeping in processPacket (which tracks a
- * datagram's ROC contribution and persists it) from the read+write here, so a packet
- * either fully completes before this loop runs (its state is included in the re-read
- * below and written again - never regressed) or runs after the handoff released the slot
- * and skips persisting entirely (it no longer holds the lock).
+ * Callers must hold the slot's mutex (withSlotLock) for the *entire* handoff - this
+ * persistence AND the releaseKinesisLock that follows it in the same critical section
+ * (see onStreamStop/shutdown) - and it re-reads the in-memory ROC state immediately
+ * before every write attempt: onStreamStop/shutdown can reach this while the UDP
+ * listener is still enqueueing packets, and a packet processed after an earlier attempt
+ * failed can advance and persist a *newer* ROC - retrying with a state captured before
+ * that packet would overwrite it again (both writes are conditional on this instance
+ * being the lock owner, so the retry succeeds just the same), leaving the slot's next
+ * owner seeded with a stale ROC if the intervening packet crossed a rollover. Held
+ * across the release as well, the mutex excludes the per-packet lock-held bookkeeping
+ * in processPacket (which tracks a datagram's ROC contribution and persists it) from
+ * the whole handoff: a packet either fully completes before it (its state is included
+ * in the re-read below and written again - never regressed, never lost to a release
+ * racing in between) or runs after the release, finds kinesisLockHeldForPorts no longer
+ * containing this port (cleared in the same critical section), and skips persisting
+ * entirely.
  */
 const persistSrtpRocForHandoff = async (
 	port: number,
@@ -249,31 +253,29 @@ const persistSrtpRocForHandoff = async (
 		kinesisIngestionPipeline.getConfiguredSrtpKeyFingerprint(port)
 
 	let persistedOk = false
-	await withSlotLock(slot, async () => {
-		for (let attempt = 1; attempt <= FINAL_ROC_PERSIST_ATTEMPTS; attempt++) {
-			// Fence: re-read the freshest in-memory state immediately before every
-			// attempt, not once before the loop - see the doc comment above.
-			const rocState = kinesisIngestionPipeline.getSrtpRocState(port)
-			const persisted = await streamMetadataService.updateSrtpRoc(
-				slot,
-				instanceId,
-				rocState.roc,
-				rocState.highestSeq,
-				ssrc,
-				keyFingerprint,
-				true,
-			)
-			if (persisted) {
-				persistedOk = true
-				return
-			}
-			if (attempt < FINAL_ROC_PERSIST_ATTEMPTS) {
-				await new Promise((resolve) =>
-					setTimeout(resolve, FINAL_ROC_PERSIST_RETRY_DELAY_MS),
-				)
-			}
+	for (let attempt = 1; attempt <= FINAL_ROC_PERSIST_ATTEMPTS; attempt++) {
+		// Fence: re-read the freshest in-memory state immediately before every
+		// attempt, not once before the loop - see the doc comment above.
+		const rocState = kinesisIngestionPipeline.getSrtpRocState(port)
+		const persisted = await streamMetadataService.updateSrtpRoc(
+			slot,
+			instanceId,
+			rocState.roc,
+			rocState.highestSeq,
+			ssrc,
+			keyFingerprint,
+			true,
+		)
+		if (persisted) {
+			persistedOk = true
+			break
 		}
-	})
+		if (attempt < FINAL_ROC_PERSIST_ATTEMPTS) {
+			await new Promise((resolve) =>
+				setTimeout(resolve, FINAL_ROC_PERSIST_RETRY_DELAY_MS),
+			)
+		}
+	}
 	if (persistedOk) return
 
 	console.error(
@@ -374,6 +376,14 @@ const startPipelineOrReleaseLock = async (
 ): Promise<void> => {
 	if (shuttingDown) return
 	if (!kinesisIngestionPipeline) return
+	// Never spawn a producer this instance doesn't hold the Kinesis lock for: the
+	// delayed 'pipelineExited' restart and the fire-and-forget streamStart resume both
+	// validate ownership before calling, but ownership can also be lost between that
+	// check and entry. Bailing here - before any DynamoDB read, credential resolution,
+	// spawn, or paced replay - avoids churning a full start sequence only for the
+	// post-start staleness check to stop its result again (an unowned producer writing
+	// to the stream in the meantime).
+	if (!kinesisLockHeldForPorts.has(port)) return
 	const slot = kinesisIngestionPipeline.streamSlotForPort(port)
 
 	// Captured synchronously (before any await below) - see portGeneration's doc comment.
@@ -911,21 +921,42 @@ const createPacketHandler = (
 			if (kinesisIngestionPipeline && kinesisLockHeldForPorts.has(port)) {
 				const slot = kinesisIngestionPipeline.streamSlotForPort(port)
 
-				// Guarantee clearLockHeld runs even if the release call below throws - without
-				// this, a thrown releaseKinesisLock left kinesisLockHeldForPorts permanently
-				// (and wrongly) marked as held, since the line clearing it was never reached.
-				try {
-					// Force (bypass the throttle) so the freshest state is captured before this
-					// slot potentially gets reassigned to a different port/instance, with
-					// bounded retries - handing the slot off after a silently failed final
-					// write would let the next owner seed a stale ROC (see
-					// persistSrtpRocForHandoff).
-					await persistSrtpRocForHandoff(port, slot)
+				// Hold the slot's mutex across the *entire* handoff - the final ROC
+				// persistence, the lock release, and clearing local ownership - not just
+				// the persistence: the UDP listener is still active here, and a packet
+				// entering processPacket() in the gap between a persistence-only mutex
+				// section ending and the release landing could advance the ROC, then
+				// have its own conditional updateSrtpRoc fail against the released
+				// lock - losing a rollover crossing that the slot's next owner needed
+				// to seed correctly. Under one critical section, a packet either fully
+				// completes before the handoff (its state is folded into the
+				// persistence's fence re-read and written again, never lost) or runs
+				// after it, finds kinesisLockHeldForPorts no longer containing this
+				// port (cleared below, in the same section), and skips persisting
+				// entirely.
+				//
+				// clearLockHeld runs even if a call below throws - without this, a
+				// thrown releaseKinesisLock left kinesisLockHeldForPorts permanently
+				// (and wrongly) marked as held, since the line clearing it was never
+				// reached.
+				await withSlotLock(slot, async () => {
+					// Ownership may have been lost while this section was queued for
+					// the mutex (e.g. a relinquish inside a packet's bookkeeping
+					// section) - there is then nothing left to hand off.
+					if (!kinesisLockHeldForPorts.has(port)) return
+					try {
+						// Force (bypass the throttle) so the freshest state is
+						// captured before this slot potentially gets reassigned to a
+						// different port/instance, with bounded retries - handing the
+						// slot off after a silently failed final write would let the
+						// next owner seed a stale ROC (see persistSrtpRocForHandoff).
+						await persistSrtpRocForHandoff(port, slot)
 
-					await streamMetadataService.releaseKinesisLock(slot, instanceId)
-				} finally {
-					clearLockHeld(port)
-				}
+						await streamMetadataService.releaseKinesisLock(slot, instanceId)
+					} finally {
+						clearLockHeld(port)
+					}
+				})
 			}
 
 			// A packet can arrive and mark the stream active again while the teardown above
@@ -1019,6 +1050,18 @@ if (kinesisIngestionPipeline) {
 				// The delay above can straddle a shutdown that started after this timer was
 				// scheduled - re-check so a restart can't spawn a producer teardown never stops.
 				if (shuttingDown) return
+				// It can equally straddle the stream going inactive (whose stop releases
+				// this port's lock) or the lock being lost outright (a failed conditional
+				// write): without ownership there is nothing to restart, and proceeding
+				// would spawn a producer this instance no longer holds the Kinesis lock
+				// for. The post-start staleness check in startPipelineOrReleaseLock would
+				// eventually stop it - but only after the full (expensive) start sequence
+				// (credential resolution, spawn, paced 10MB replay), during which the
+				// unowned producer is already writing to the stream, and a stale
+				// invocation's stop can even take out a pipeline a newer ownership epoch
+				// started. Revalidate both immediately before restarting.
+				if (streamStateManager.getStreamState(port)?.status !== 'active') return
+				if (!kinesisLockHeldForPorts.has(port)) return
 				lastPipelineRestartByPort.set(port, Date.now())
 				void startPipelineOrReleaseLock(port).catch((err) => {
 					console.error(
@@ -1091,9 +1134,14 @@ const shutdown = async (): Promise<void> => {
 	for (const port of kinesisLockHeldForPorts) {
 		const slot = kinesisIngestionPipeline?.streamSlotForPort(port) ?? port
 		// Same forced, retrying final persistence as onStreamStop's handoff - shutdown is
-		// also a handoff (to whatever instance takes over the slot next).
-		await persistSrtpRocForHandoff(port, slot)
-		await streamMetadataService.releaseKinesisLock(slot, instanceId)
+		// also a handoff (to whatever instance takes over the slot next) - wrapped in the
+		// slot's mutex together with the release, exactly like onStreamStop's handoff:
+		// sockets are stopped and queues drained by now, so nothing can contend, but
+		// the two handoff paths stay structurally identical.
+		await withSlotLock(slot, async () => {
+			await persistSrtpRocForHandoff(port, slot)
+			await streamMetadataService.releaseKinesisLock(slot, instanceId)
+		})
 	}
 	kinesisLockHeldForPorts.clear()
 
