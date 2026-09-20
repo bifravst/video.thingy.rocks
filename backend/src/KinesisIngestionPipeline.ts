@@ -1326,19 +1326,38 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			}
 		}
 
-		// Flush whatever writePacket() queued while replay was in flight, in the order it
-		// arrived, before accepting further direct sends - this is what stops live packets
-		// from overtaking (and causing anti-replay/jitter-buffer discard of) the replay. This
-		// queue is bounded by pendingQueueMaxBytes (see writePacket), not the pre-start
-		// buffer's 10MB cap, but is normally much smaller in practice (just the grace
-		// period's real-time packet arrival), so it doesn't need the same batching/pacing.
-		pipeline.ready = true
-		const queued = pipeline.pendingQueue
-		pipeline.pendingQueue = []
-		pipeline.pendingQueueBytes = 0
-		for (const datagram of queued) {
-			void this.sendSrtpDatagram(port, pipeline, datagram, 'queued')
+		// Drain whatever writePacket() queued while the replay was in flight, in arrival
+		// order, before accepting direct sends - this is what stops live packets from
+		// overtaking (and causing anti-replay/jitter-buffer discard of) the replay. The
+		// queue is drained with the same awaited, batch-paced sends as the initial replay:
+		// during a slow restart it can hold up to pendingQueueMaxBytes (10MB by default,
+		// thousands of datagrams), and firing that as one unawaited send() burst would
+		// overrun the loopback socket's/udpsrc's buffers and silently drop SRTP packets
+		// (including the first post-restart keyframe). New datagrams keep appending to the
+		// queue while `ready` is still false, so this loops until it has caught up with
+		// the live arrival rate - a normal stream's rate is far below the paced drain rate
+		// (~5000 datagrams/sec), so it converges quickly; the queue's byte cap bounds
+		// memory in the meantime, and a stop()/replacement during the drain exits via the
+		// staleness checks below.
+		let drainedFromQueue = 0
+		while (pipeline.pendingQueue.length > 0) {
+			if (this.activePipelines.get(port) !== pipeline) return
+			const datagram = pipeline.pendingQueue.shift()
+			if (datagram === undefined) break
+			pipeline.pendingQueueBytes -= datagram.length
+			await this.sendSrtpDatagram(port, pipeline, datagram, 'queued')
+			drainedFromQueue++
+			if (drainedFromQueue % SRTP_REPLAY_BATCH_SIZE === 0) {
+				await new Promise((resolve) =>
+					setTimeout(resolve, SRTP_REPLAY_BATCH_PAUSE_MS),
+				)
+				if (this.activePipelines.get(port) !== pipeline) return
+			}
 		}
+
+		// Caught up - accept direct (unawaited) sends from here on; at normal line rate
+		// these are one-at-a-time, nowhere near a burst.
+		pipeline.ready = true
 
 		this.logger.info('SRTP Kinesis ingestion started', {
 			port,

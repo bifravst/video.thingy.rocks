@@ -330,25 +330,52 @@ type PacketHandlerRangeConfig = {
  * own, since none of isFirstPacket/isResume/preStartBufferByPort.has(port) would hold once
  * the stream is already 'active' with no buffer entry.
  *
- * Releases the DynamoDB lock *before* clearing local ownership (kinesisLockHeldForPorts),
- * not after - this can run outside withSlotLock (e.g. from the 'pipelineExited' restart
- * callback), so clearing local ownership first would let the paired transport's cheap
- * pairedPortHoldsLock check pass and race tryAcquireKinesisLock while the DynamoDB row still
- * lists this instance as owner. Since tryAcquireKinesisLock's own-instance-id clause accepts
- * that, the paired port could acquire and start a pipeline moments before this release call
- * deletes kinesisOwnerInstanceId out from under it, leaving that new pipeline unowned.
+ * This is a handoff exactly like onStreamStop's: the freshest SRTP ROC state is persisted
+ * (forced, with bounded retries) *before* the lock is released, and both run under the
+ * slot's mutex - runStartForSrtpPort folds the whole pre-start buffer (up to 10MB of
+ * datagrams, possibly spanning a sequence-number rollover) into the in-memory estimate
+ * before spawning, so a start that then fails must not release the slot without that state
+ * or the next owner seeds srtpdec one rollover too low and cannot decrypt. The lock is
+ * still released *before* clearing local ownership (kinesisLockHeldForPorts) - clearing
+ * first would let the paired transport's cheap pairedPortHoldsLock check pass and race
+ * tryAcquireKinesisLock while the DynamoDB row still lists this instance as owner, and the
+ * paired port could acquire and start a pipeline moments before this release deletes
+ * kinesisOwnerInstanceId out from under it, leaving that new pipeline unowned.
+ *
+ * `holdsSlotMutex` must be true when the caller already runs inside withSlotLock for this
+ * slot (the buffering path in processPacket, which serializes acquire+start) - taking the
+ * mutex again here would deadlock the promise chain. When it is false (the pipelineExited
+ * restart and streamStart resume paths), the handoff takes the mutex itself, matching
+ * onStreamStop's structure.
  */
 const releaseLockBackoffAndRearm = async (
 	port: number,
 	slot: number,
 	initialData: Buffer | Buffer[] | undefined,
+	holdsSlotMutex = false,
 ): Promise<void> => {
+	const handoff = async (): Promise<void> => {
+		try {
+			// See above: persist the freshest SRTP ROC state while this instance still
+			// owns the slot, then release it - one critical section, same as onStreamStop.
+			// A no-op for unencrypted ports (persistSrtpRocForHandoff's own guards).
+			await persistSrtpRocForHandoff(port, slot)
+			await streamMetadataService.releaseKinesisLock(slot, instanceId)
+		} finally {
+			clearLockHeld(port)
+		}
+	}
 	try {
-		await streamMetadataService.releaseKinesisLock(slot, instanceId)
+		if (holdsSlotMutex) {
+			await handoff()
+		} else {
+			await withSlotLock(slot, handoff)
+		}
 	} catch (err) {
+		// clearLockHeld has already run via the finally above; log and continue so the
+		// backoff/re-arm below still happens - a thrown release must not strand the port.
 		console.error(`[Main] Error releasing Kinesis lock for port ${port}:`, err)
 	}
-	clearLockHeld(port)
 
 	nextStartAttemptAllowedAtByPort.set(port, Date.now() + START_RETRY_BACKOFF_MS)
 
@@ -373,6 +400,11 @@ const releaseLockBackoffAndRearm = async (
 const startPipelineOrReleaseLock = async (
 	port: number,
 	initialData?: Buffer | Buffer[],
+	// True when the caller already runs inside withSlotLock for this port's slot (the
+	// buffering path in processPacket) - threaded through to releaseLockBackoffAndRearm so
+	// its persist+release handoff runs inline instead of taking the mutex again (which
+	// would deadlock the promise chain).
+	holdsSlotMutex = false,
 ): Promise<void> => {
 	if (shuttingDown) return
 	if (!kinesisIngestionPipeline) return
@@ -417,7 +449,12 @@ const startPipelineOrReleaseLock = async (
 				console.error(
 					`[Main] Failed to read persisted SRTP ROC state for port ${port}; releasing lock`,
 				)
-				await releaseLockBackoffAndRearm(port, slot, initialData)
+				await releaseLockBackoffAndRearm(
+					port,
+					slot,
+					initialData,
+					holdsSlotMutex,
+				)
 				return
 			}
 			kinesisIngestionPipeline.seedSrtpRoc(port, persisted)
@@ -456,7 +493,7 @@ const startPipelineOrReleaseLock = async (
 	console.error(
 		`[Main] Kinesis ingestion pipeline failed to start for port ${port}; releasing lock`,
 	)
-	await releaseLockBackoffAndRearm(port, slot, initialData)
+	await releaseLockBackoffAndRearm(port, slot, initialData, holdsSlotMutex)
 }
 
 /** A PacketHandler plus a hook shutdown() uses to drain this handler's per-port queues before
@@ -487,7 +524,6 @@ const createPacketHandler = (
 	const processPacket = async (
 		port: number,
 		data: Buffer,
-		timestamp: Date,
 		// Snapshotted by enqueuePacket *before* it calls streamStateManager.onPacketReceived
 		// for this same packet - onPacketReceived immediately flips a missing/inactive
 		// stream to 'active', so deriving these from getStreamState(port) here (after the
@@ -597,7 +633,9 @@ const createPacketHandler = (
 						}
 						preStartBufferByPort.delete(port)
 						setLockHeld(port)
-						await startPipelineOrReleaseLock(port, initialData)
+						// holdsSlotMutex: we are inside withSlotLock above - releaseLockBackoffAndRearm
+						// must not take the slot's mutex again on its failure paths.
+						await startPipelineOrReleaseLock(port, initialData, true)
 					})
 				} catch (err) {
 					// A throw here is most plausibly tryAcquireKinesisLock's DynamoDB call
@@ -655,7 +693,18 @@ const createPacketHandler = (
 				try {
 					await streamMetadataService.updateLastPacketTime(
 						slot,
-						timestamp,
+						// The *current* time, not this datagram's arrival time: the bounded
+						// per-port queue can delay processPacket well behind actual arrival
+						// (DynamoDB retries, credential resolution, the paced 10MB SRTP
+						// startup replay), and lastPacketTime is the lock-freshness signal
+						// another instance's tryAcquireKinesisLock compares against the
+						// 5-minute staleness threshold - writing an arrival timestamp
+						// older than that would let another instance take over the slot
+						// while this listener is still receiving packets, briefly
+						// creating two producers. True arrival-time receipt (for
+						// inactivity detection) is recorded separately, immediately at
+						// enqueue, via streamStateManager.onPacketReceived.
+						new Date(),
 						instanceId,
 					)
 				} catch (err) {
@@ -734,7 +783,6 @@ const createPacketHandler = (
 		{
 			queue: {
 				data: Buffer
-				timestamp: Date
 				isFirstPacket: boolean
 				isResume: boolean
 			}[]
@@ -806,7 +854,7 @@ const createPacketHandler = (
 			queueStateByPort.set(port, state)
 		}
 
-		state.queue.push({ data, timestamp, isFirstPacket, isResume })
+		state.queue.push({ data, isFirstPacket, isResume })
 		state.totalBytes += data.length
 
 		// If eviction below drops the packet carrying the only isFirstPacket/isResume
@@ -843,7 +891,6 @@ const createPacketHandler = (
 					await processPacket(
 						port,
 						next.data,
-						next.timestamp,
 						next.isFirstPacket,
 						next.isResume,
 					)
