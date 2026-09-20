@@ -61,7 +61,13 @@ What a client/device needs to send:
   SSRC alone would be rejected as a mismatch) - or ask the operator to clear the
   port's persisted ROC state in DynamoDB (`srtpRoc`/`srtpHighestSeq`/
   `srtpRocSsrc`/`srtpRocKeyFingerprint` on the stream slot's `StreamMetadata`
-  item), which needs no restart.
+  item) **and restart the backend**: clearing DynamoDB alone is not enough,
+  because the backend keeps its per-port in-memory ROC estimate until the
+  process restarts (a stream stopping does not clear it, and
+  `KinesisIngestionPipeline.seedSrtpRoc` deliberately never replaces a
+  more-current in-memory estimate with a lower persisted value) - a sender
+  restarted against the same still-running process would still be seeded with
+  the old ROC and never authenticate.
 - **Encryption**: a static, pre-shared 30-byte SRTP master key + salt (60 hex
   characters), using **aes-128-icm** for encryption and **hmac-sha1-80** for
   authentication - the only suite this service supports. Keys are exchanged

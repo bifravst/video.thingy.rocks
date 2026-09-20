@@ -462,6 +462,16 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	 * the tracked extended index - never regresses a live, more-current in-process estimate to
 	 * an older persisted one (e.g. on a same-process GStreamer-only restart, where we already
 	 * have better information than whatever was last flushed to DynamoDB).
+	 *
+	 * The in-memory estimate is only ever cleared by a process restart: a stream stopping
+	 * does not reset it, and clearing the persisted DynamoDB fields alone does not either
+	 * (a cleared slot reads back as {roc: 0, highestSeq: 0}, which this deliberately ignores
+	 * in favor of the live estimate). The documented fresh-session recovery of clearing
+	 * srtpRoc/srtpHighestSeq/srtpRocSsrc/srtpRocKeyFingerprint from the slot's
+	 * StreamMetadata item therefore also requires a backend restart, or the sender
+	 * restarted against the same still-running process is still seeded with the old ROC
+	 * and cannot authenticate - see docs/TESTING-SRTP-INGESTION.md ("Session continuity")
+	 * and backend/README.md.
 	 */
 	seedSrtpRoc(port: number, seeded: SrtpRocState): void {
 		const state = this.srtpRocByPort.get(port)

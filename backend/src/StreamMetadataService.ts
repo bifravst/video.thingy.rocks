@@ -295,7 +295,9 @@ export class StreamMetadataService {
 	 * risky enough (e.g. "assume reset if the first live sequence looks too low") to introduce
 	 * its own false positives; deliberately not attempted here. If it happens anyway, the fix
 	 * today is operational: clear srtpRoc/srtpHighestSeq/srtpRocSsrc/srtpRocKeyFingerprint
-	 * for the affected slot's DynamoDB item.
+	 * for the affected slot's DynamoDB item and restart the backend - its in-memory ROC
+	 * estimate for the port lives until the process restarts (see
+	 * KinesisIngestionPipeline.seedSrtpRoc).
 	 */
 	async getSrtpRocState(
 		port: number,

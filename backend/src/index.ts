@@ -223,6 +223,19 @@ const FINAL_ROC_PERSIST_RETRY_DELAY_MS = 1_000
  * handoff does NOT silently proceed as if persistence had succeeded: the next owner's
  * strongly consistent read may return a ROC that is stale by up to one rollover, and the
  * error logged here names the operational escape hatch for exactly that failure mode.
+ *
+ * Runs under the slot's mutex (withSlotLock) and re-reads the in-memory ROC state
+ * immediately before every write attempt: onStreamStop/shutdown can reach this while the
+ * UDP listener is still enqueueing packets, and a packet processed after an earlier
+ * attempt failed can advance and persist a *newer* ROC - retrying with a state captured
+ * before that packet would overwrite it again (both writes are conditional on this
+ * instance being the lock owner, so the retry succeeds just the same), leaving the slot's
+ * next owner seeded with a stale ROC if the intervening packet crossed a rollover. The
+ * mutex excludes the per-packet lock-held bookkeeping in processPacket (which tracks a
+ * datagram's ROC contribution and persists it) from the read+write here, so a packet
+ * either fully completes before this loop runs (its state is included in the re-read
+ * below and written again - never regressed) or runs after the handoff released the slot
+ * and skips persisting entirely (it no longer holds the lock).
  */
 const persistSrtpRocForHandoff = async (
 	port: number,
@@ -232,30 +245,39 @@ const persistSrtpRocForHandoff = async (
 	const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
 	if (!kinesisIngestionPipeline.isSrtpPort(port) || ssrc === undefined) return
 
-	const rocState = kinesisIngestionPipeline.getSrtpRocState(port)
 	const keyFingerprint =
 		kinesisIngestionPipeline.getConfiguredSrtpKeyFingerprint(port)
 
-	for (let attempt = 1; attempt <= FINAL_ROC_PERSIST_ATTEMPTS; attempt++) {
-		const persisted = await streamMetadataService.updateSrtpRoc(
-			slot,
-			instanceId,
-			rocState.roc,
-			rocState.highestSeq,
-			ssrc,
-			keyFingerprint,
-			true,
-		)
-		if (persisted) return
-		if (attempt < FINAL_ROC_PERSIST_ATTEMPTS) {
-			await new Promise((resolve) =>
-				setTimeout(resolve, FINAL_ROC_PERSIST_RETRY_DELAY_MS),
+	let persistedOk = false
+	await withSlotLock(slot, async () => {
+		for (let attempt = 1; attempt <= FINAL_ROC_PERSIST_ATTEMPTS; attempt++) {
+			// Fence: re-read the freshest in-memory state immediately before every
+			// attempt, not once before the loop - see the doc comment above.
+			const rocState = kinesisIngestionPipeline.getSrtpRocState(port)
+			const persisted = await streamMetadataService.updateSrtpRoc(
+				slot,
+				instanceId,
+				rocState.roc,
+				rocState.highestSeq,
+				ssrc,
+				keyFingerprint,
+				true,
 			)
+			if (persisted) {
+				persistedOk = true
+				return
+			}
+			if (attempt < FINAL_ROC_PERSIST_ATTEMPTS) {
+				await new Promise((resolve) =>
+					setTimeout(resolve, FINAL_ROC_PERSIST_RETRY_DELAY_MS),
+				)
+			}
 		}
-	}
+	})
+	if (persistedOk) return
 
 	console.error(
-		`[Main] Failed to persist final SRTP ROC state for port ${port} (slot ${slot}) after ${FINAL_ROC_PERSIST_ATTEMPTS} attempts. The next owner of this slot may seed a stale ROC - if decryption fails after a handoff, clear srtpRoc/srtpHighestSeq/srtpRocSsrc/srtpRocKeyFingerprint on the slot's StreamMetadata item (see docs/TESTING-SRTP-INGESTION.md).`,
+		`[Main] Failed to persist final SRTP ROC state for port ${port} (slot ${slot}) after ${FINAL_ROC_PERSIST_ATTEMPTS} attempts. The next owner of this slot may seed a stale ROC - if decryption fails after a handoff, clear srtpRoc/srtpHighestSeq/srtpRocSsrc/srtpRocKeyFingerprint on the slot's StreamMetadata item and restart the backend (its in-memory ROC estimate for the port lives until the process restarts - see docs/TESTING-SRTP-INGESTION.md).`,
 	)
 }
 
@@ -590,74 +612,87 @@ const createPacketHandler = (
 		if (kinesisIngestionPipeline && kinesisLockHeldForPorts.has(port)) {
 			const slot = kinesisIngestionPipeline.streamSlotForPort(port)
 
-			// Track this datagram's ROC contribution BEFORE taking the snapshot persisted
-			// below - otherwise a datagram that crosses the sequence-number wrap is only
-			// tracked later (in writePacket), so the heartbeat persists the *previous* ROC,
-			// and the 15s persistence throttle can keep "succeeding" without ever writing
-			// the new one. A crash in that window would leave DynamoDB one ROC behind, and
-			// the restarted pipeline would be seeded with stale state it can never
-			// authenticate against (until the sender wraps again - effectively forever).
-			// This is idempotent with writePacket's own tracking of the same datagram
-			// (advanceSrtpRoc only ever raises the tracked state).
-			const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
-			const rocBefore =
-				ssrc !== undefined
-					? kinesisIngestionPipeline.getSrtpRocState(port)
-					: undefined
-			if (ssrc !== undefined) {
-				kinesisIngestionPipeline.trackSrtpRoc(port, data)
-			}
+			// Serialized against the final handoff persistence (persistSrtpRocForHandoff)
+			// via the slot's mutex: tracking this datagram's ROC contribution and persisting
+			// it must not interleave with the handoff's read+write - the handoff's retry
+			// (this instance is still the lock owner, so its conditional write succeeds)
+			// could otherwise overwrite the newer ROC this section just persisted, and the
+			// slot's next owner would be seeded with a stale one. Re-check ownership inside:
+			// the mutex wait can straddle this port losing the lock (e.g. to the handoff
+			// holding the mutex), and continuing to write as a non-owner is exactly the
+			// competing-producer problem the lock exists to prevent.
+			await withSlotLock(slot, async () => {
+				if (!kinesisLockHeldForPorts.has(port)) return
 
-			try {
-				await streamMetadataService.updateLastPacketTime(
-					slot,
-					timestamp,
-					instanceId,
-				)
-			} catch (err) {
-				// updateLastPacketTime uses a conditional write - ConditionalCheckFailedException
-				// specifically means another instance now owns this slot's lock, not a
-				// transient DynamoDB error. Continuing (as a plain log-and-continue would) lets
-				// this producer keep writing after someone else has taken the lock; unlike the
-				// SRTP path below, the FIFO/unencrypted path has no later ownership check to
-				// catch this, so it must stop here.
-				if (
-					err instanceof Error &&
-					err.name === 'ConditionalCheckFailedException'
-				) {
-					await relinquishPort(port)
-					return
+				// Track this datagram's ROC contribution BEFORE taking the snapshot persisted
+				// below - otherwise a datagram that crosses the sequence-number wrap is only
+				// tracked later (in writePacket), so the heartbeat persists the *previous* ROC,
+				// and the 15s persistence throttle can keep "succeeding" without ever writing
+				// the new one. A crash in that window would leave DynamoDB one ROC behind, and
+				// the restarted pipeline would be seeded with stale state it can never
+				// authenticate against (until the sender wraps again - effectively forever).
+				// This is idempotent with writePacket's own tracking of the same datagram
+				// (advanceSrtpRoc only ever raises the tracked state).
+				const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
+				const rocBefore =
+					ssrc !== undefined
+						? kinesisIngestionPipeline.getSrtpRocState(port)
+						: undefined
+				if (ssrc !== undefined) {
+					kinesisIngestionPipeline.trackSrtpRoc(port, data)
 				}
-				console.error(`[Main] Error updating DynamoDB for port ${port}:`, err)
-			}
 
-			// Persist the best-known SRTP rollover-tracking state alongside the heartbeat
-			// (throttled internally, safe to call every packet) - see
-			// KinesisIngestionPipeline.getSrtpRocState. If this reports we're no longer the
-			// slot's owner (a condition-checked write), stop writing to Kinesis for a stream
-			// we've lost the lock for instead of continuing as a competing producer. The one
-			// event that must never wait out the throttle is a rollover counter *change*
-			// (detected above, before this datagram was folded in) - force the write through
-			// then, since that value is exactly what a restart needs to decrypt again.
-			if (ssrc !== undefined) {
-				const rocState = kinesisIngestionPipeline.getSrtpRocState(port)
-				const keyFingerprint =
-					kinesisIngestionPipeline.getConfiguredSrtpKeyFingerprint(port)
-				const rolloverCrossed =
-					rocBefore !== undefined && rocBefore.roc !== rocState.roc
-				const stillOwner = await streamMetadataService.updateSrtpRoc(
-					slot,
-					instanceId,
-					rocState.roc,
-					rocState.highestSeq,
-					ssrc,
-					keyFingerprint,
-					rolloverCrossed,
-				)
-				if (!stillOwner) {
-					await relinquishPort(port)
+				try {
+					await streamMetadataService.updateLastPacketTime(
+						slot,
+						timestamp,
+						instanceId,
+					)
+				} catch (err) {
+					// updateLastPacketTime uses a conditional write - ConditionalCheckFailedException
+					// specifically means another instance now owns this slot's lock, not a
+					// transient DynamoDB error. Continuing (as a plain log-and-continue would) lets
+					// this producer keep writing after someone else has taken the lock; unlike the
+					// SRTP path below, the FIFO/unencrypted path has no later ownership check to
+					// catch this, so it must stop here.
+					if (
+						err instanceof Error &&
+						err.name === 'ConditionalCheckFailedException'
+					) {
+						await relinquishPort(port)
+						return
+					}
+					console.error(`[Main] Error updating DynamoDB for port ${port}:`, err)
 				}
-			}
+
+				// Persist the best-known SRTP rollover-tracking state alongside the heartbeat
+				// (throttled internally, safe to call every packet) - see
+				// KinesisIngestionPipeline.getSrtpRocState. If this reports we're no longer the
+				// slot's owner (a condition-checked write), stop writing to Kinesis for a stream
+				// we've lost the lock for instead of continuing as a competing producer. The one
+				// event that must never wait out the throttle is a rollover counter *change*
+				// (detected above, before this datagram was folded in) - force the write through
+				// then, since that value is exactly what a restart needs to decrypt again.
+				if (ssrc !== undefined) {
+					const rocState = kinesisIngestionPipeline.getSrtpRocState(port)
+					const keyFingerprint =
+						kinesisIngestionPipeline.getConfiguredSrtpKeyFingerprint(port)
+					const rolloverCrossed =
+						rocBefore !== undefined && rocBefore.roc !== rocState.roc
+					const stillOwner = await streamMetadataService.updateSrtpRoc(
+						slot,
+						instanceId,
+						rocState.roc,
+						rocState.highestSeq,
+						ssrc,
+						keyFingerprint,
+						rolloverCrossed,
+					)
+					if (!stillOwner) {
+						await relinquishPort(port)
+					}
+				}
+			})
 		}
 
 		// Feed packet to Kinesis only if we hold the lock. Skip if this packet was passed as initialData.

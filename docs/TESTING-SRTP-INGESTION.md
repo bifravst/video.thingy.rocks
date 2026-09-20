@@ -53,9 +53,15 @@ below after it has exited, either:
    it - `./scripts/provision-srtp-key.sh <port> <newKeyHex> <newSsrc>`, then
    restart/redeploy the instance(s) (keys and SSRCs are resolved once at process
    start) - and pass that key/SSRC to the sender, **or**
-2. keep the same key/SSRC and clear the slot's persisted ROC fields
+2. keep the same key/SSRC, clear the slot's persisted ROC fields
    (`srtpRoc`/`srtpHighestSeq`/`srtpRocSsrc`/`srtpRocKeyFingerprint`) from the
-   `StreamMetadata` DynamoDB item first.
+   `StreamMetadata` DynamoDB item, **and restart the backend on the instance(s)
+   receiving the stream** - clearing DynamoDB alone is not enough: the backend
+   keeps its per-port in-memory ROC estimate until the process restarts (a
+   stream stopping does not clear it, and `KinesisIngestionPipeline.seedSrtpRoc`
+   deliberately never replaces a more-current in-memory estimate with a lower
+   persisted value), so a sender restarted against the same still-running
+   process would still be seeded with the old ROC and fail to decrypt.
 
 Note that passing a fresh SSRC to the sender **alone** does not work: the
 backend's `srtpdec` is pinned to the SSRC loaded from SSM at startup, so every
@@ -178,7 +184,9 @@ started" (not "Kinesis ingestion started") in application logs.
   sender's 16-bit sequence number has ever wrapped. This is a best-effort
   estimate, not a guarantee - if it's ever visibly wrong, check the
   `srtpRoc`/`srtpHighestSeq` values in the `StreamMetadata` DynamoDB item for
-  the affected slot. This state is only trusted when both `srtpRocSsrc` and
+  the affected slot (clearing them as a fresh-session reset also requires a
+  backend restart to take effect - see "Session continuity" above, which
+  explains why). This state is only trusted when both `srtpRocSsrc` and
   `srtpRocKeyFingerprint` (a non-secret hash of the key, see
   `SrtpKeyStore.keyFingerprint`) still match the currently-configured key - a
   key rotated in SSM without changing the SSRC would otherwise seed a fresh
