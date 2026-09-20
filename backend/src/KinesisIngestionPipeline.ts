@@ -414,8 +414,16 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	 * tracking during normal operation. Call for every SRTP datagram, in arrival order,
 	 * whether or not it's been sent on yet (including ones still sitting in the pre-start
 	 * buffer).
+	 *
+	 * Idempotent for the same datagram: advanceSrtpRoc only raises the tracked highest
+	 * extended index, so tracking the same (or an older) datagram a second time is a no-op.
+	 * This lets index.ts call it for a datagram *before* taking the ROC snapshot it persists
+	 * in the same heartbeat (see processPacket) without writePacket's own tracking of that
+	 * same datagram double-counting anything.
+	 *
+	 * Public rather than private for that pre-heartbeat caller.
 	 */
-	private trackSrtpRoc(port: number, datagram: Buffer): void {
+	trackSrtpRoc(port: number, datagram: Buffer): void {
 		const expectedSsrc = this.getConfiguredSrtpSsrc(port)
 		if (expectedSsrc === undefined) return
 		const seq = parseAuthenticRtpSequenceNumber(datagram, expectedSsrc)

@@ -208,6 +208,58 @@ const relinquishPort = async (port: number): Promise<void> => {
 }
 
 /**
+ * Attempts for the final, throttled-bypassing SRTP ROC persistence before handing a slot
+ * over (onStreamStop/shutdown) - see persistSrtpRocForHandoff.
+ */
+const FINAL_ROC_PERSIST_ATTEMPTS = 3
+const FINAL_ROC_PERSIST_RETRY_DELAY_MS = 1_000
+
+/**
+ * Persists the freshest SRTP rollover-tracking state for a slot one last time before this
+ * instance hands the slot over (onStreamStop) or exits (shutdown), with bounded retries.
+ * updateSrtpRoc returns false both for a lost conditional lock (retrying is pointless, but
+ * the release below is equally conditional and will no-op) and for an ordinary DynamoDB
+ * failure - so the write is retried a few times before giving up. If it still fails, the
+ * handoff does NOT silently proceed as if persistence had succeeded: the next owner's
+ * strongly consistent read may return a ROC that is stale by up to one rollover, and the
+ * error logged here names the operational escape hatch for exactly that failure mode.
+ */
+const persistSrtpRocForHandoff = async (
+	port: number,
+	slot: number,
+): Promise<void> => {
+	if (!kinesisIngestionPipeline) return
+	const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
+	if (!kinesisIngestionPipeline.isSrtpPort(port) || ssrc === undefined) return
+
+	const rocState = kinesisIngestionPipeline.getSrtpRocState(port)
+	const keyFingerprint =
+		kinesisIngestionPipeline.getConfiguredSrtpKeyFingerprint(port)
+
+	for (let attempt = 1; attempt <= FINAL_ROC_PERSIST_ATTEMPTS; attempt++) {
+		const persisted = await streamMetadataService.updateSrtpRoc(
+			slot,
+			instanceId,
+			rocState.roc,
+			rocState.highestSeq,
+			ssrc,
+			keyFingerprint,
+			true,
+		)
+		if (persisted) return
+		if (attempt < FINAL_ROC_PERSIST_ATTEMPTS) {
+			await new Promise((resolve) =>
+				setTimeout(resolve, FINAL_ROC_PERSIST_RETRY_DELAY_MS),
+			)
+		}
+	}
+
+	console.error(
+		`[Main] Failed to persist final SRTP ROC state for port ${port} (slot ${slot}) after ${FINAL_ROC_PERSIST_ATTEMPTS} attempts. The next owner of this slot may seed a stale ROC - if decryption fails after a handoff, clear srtpRoc/srtpHighestSeq/srtpRocSsrc/srtpRocKeyFingerprint on the slot's StreamMetadata item (see docs/TESTING-SRTP-INGESTION.md).`,
+	)
+}
+
+/**
  * Per-port buffer of packets before we start GStreamer. We wait until at least
  * kinesisMinBytesBeforeStart (10 MB) to avoid treating port scans as video streams.
  */
@@ -516,6 +568,16 @@ const createPacketHandler = (
 						await startPipelineOrReleaseLock(port, initialData)
 					})
 				} catch (err) {
+					// A throw here is most plausibly tryAcquireKinesisLock's DynamoDB call
+					// failing mid-outage - the buffer stays armed (it is only cleared once
+					// acquisition succeeds), so without a backoff here every subsequent
+					// packet would re-cross the already-met threshold and retry the
+					// conditional write at packet rate, flooding DynamoDB and logs. Same
+					// backoff as the acquired === false path.
+					nextStartAttemptAllowedAtByPort.set(
+						port,
+						Date.now() + START_RETRY_BACKOFF_MS,
+					)
 					console.error(
 						`[Main] Error acquiring Kinesis lock / starting ingestion for port ${port}:`,
 						err,
@@ -527,6 +589,25 @@ const createPacketHandler = (
 		// Only update DynamoDB lastPacketTime if we hold the lock
 		if (kinesisIngestionPipeline && kinesisLockHeldForPorts.has(port)) {
 			const slot = kinesisIngestionPipeline.streamSlotForPort(port)
+
+			// Track this datagram's ROC contribution BEFORE taking the snapshot persisted
+			// below - otherwise a datagram that crosses the sequence-number wrap is only
+			// tracked later (in writePacket), so the heartbeat persists the *previous* ROC,
+			// and the 15s persistence throttle can keep "succeeding" without ever writing
+			// the new one. A crash in that window would leave DynamoDB one ROC behind, and
+			// the restarted pipeline would be seeded with stale state it can never
+			// authenticate against (until the sender wraps again - effectively forever).
+			// This is idempotent with writePacket's own tracking of the same datagram
+			// (advanceSrtpRoc only ever raises the tracked state).
+			const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
+			const rocBefore =
+				ssrc !== undefined
+					? kinesisIngestionPipeline.getSrtpRocState(port)
+					: undefined
+			if (ssrc !== undefined) {
+				kinesisIngestionPipeline.trackSrtpRoc(port, data)
+			}
+
 			try {
 				await streamMetadataService.updateLastPacketTime(
 					slot,
@@ -554,12 +635,16 @@ const createPacketHandler = (
 			// (throttled internally, safe to call every packet) - see
 			// KinesisIngestionPipeline.getSrtpRocState. If this reports we're no longer the
 			// slot's owner (a condition-checked write), stop writing to Kinesis for a stream
-			// we've lost the lock for instead of continuing as a competing producer.
-			const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
+			// we've lost the lock for instead of continuing as a competing producer. The one
+			// event that must never wait out the throttle is a rollover counter *change*
+			// (detected above, before this datagram was folded in) - force the write through
+			// then, since that value is exactly what a restart needs to decrypt again.
 			if (ssrc !== undefined) {
 				const rocState = kinesisIngestionPipeline.getSrtpRocState(port)
 				const keyFingerprint =
 					kinesisIngestionPipeline.getConfiguredSrtpKeyFingerprint(port)
+				const rolloverCrossed =
+					rocBefore !== undefined && rocBefore.roc !== rocState.roc
 				const stillOwner = await streamMetadataService.updateSrtpRoc(
 					slot,
 					instanceId,
@@ -567,6 +652,7 @@ const createPacketHandler = (
 					rocState.highestSeq,
 					ssrc,
 					keyFingerprint,
+					rolloverCrossed,
 				)
 				if (!stillOwner) {
 					await relinquishPort(port)
@@ -795,22 +881,11 @@ const createPacketHandler = (
 				// (and wrongly) marked as held, since the line clearing it was never reached.
 				try {
 					// Force (bypass the throttle) so the freshest state is captured before this
-					// slot potentially gets reassigned to a different port/instance.
-					const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
-					if (kinesisIngestionPipeline.isSrtpPort(port) && ssrc !== undefined) {
-						const rocState = kinesisIngestionPipeline.getSrtpRocState(port)
-						const keyFingerprint =
-							kinesisIngestionPipeline.getConfiguredSrtpKeyFingerprint(port)
-						await streamMetadataService.updateSrtpRoc(
-							slot,
-							instanceId,
-							rocState.roc,
-							rocState.highestSeq,
-							ssrc,
-							keyFingerprint,
-							true,
-						)
-					}
+					// slot potentially gets reassigned to a different port/instance, with
+					// bounded retries - handing the slot off after a silently failed final
+					// write would let the next owner seed a stale ROC (see
+					// persistSrtpRocForHandoff).
+					await persistSrtpRocForHandoff(port, slot)
 
 					await streamMetadataService.releaseKinesisLock(slot, instanceId)
 				} finally {
@@ -980,24 +1055,9 @@ const shutdown = async (): Promise<void> => {
 
 	for (const port of kinesisLockHeldForPorts) {
 		const slot = kinesisIngestionPipeline?.streamSlotForPort(port) ?? port
-		const ssrc = kinesisIngestionPipeline?.getConfiguredSrtpSsrc(port)
-		if (
-			kinesisIngestionPipeline?.isSrtpPort(port) === true &&
-			ssrc !== undefined
-		) {
-			const rocState = kinesisIngestionPipeline.getSrtpRocState(port)
-			const keyFingerprint =
-				kinesisIngestionPipeline.getConfiguredSrtpKeyFingerprint(port)
-			await streamMetadataService.updateSrtpRoc(
-				slot,
-				instanceId,
-				rocState.roc,
-				rocState.highestSeq,
-				ssrc,
-				keyFingerprint,
-				true,
-			)
-		}
+		// Same forced, retrying final persistence as onStreamStop's handoff - shutdown is
+		// also a handoff (to whatever instance takes over the slot next).
+		await persistSrtpRocForHandoff(port, slot)
 		await streamMetadataService.releaseKinesisLock(slot, instanceId)
 	}
 	kinesisLockHeldForPorts.clear()

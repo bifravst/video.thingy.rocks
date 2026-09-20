@@ -28,17 +28,13 @@ PORT=$2
 HEX_KEY=${3:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab}
 SSRC=${4:-3735928559}
 
-# Must be purely decimal before the arithmetic comparisons below - a non-numeric value
-# (e.g. "abc") makes both `-lt`/`-gt` tests fail with "integer expression expected" while the
-# combined `||` condition still evaluates false, letting the script proceed to launch
-# gst-launch-1.0 with an invalid port.
-if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
-  echo "Error: port must be a decimal number"
-  exit 1
-fi
-
-if [ "$PORT" -lt 6000 ] || [ "$PORT" -gt 6009 ]; then
-  echo "Error: Port must be between 6000 and 6009"
+# Validate the exact canonical port form - no shell integer arithmetic: values outside
+# Bash's integer range make both `-lt`/`-gt` tests fail open ("integer expression
+# expected" evaluates false), and the combined condition would let the script proceed to
+# launch gst-launch-1.0 with an invalid port. The exact-match regex rejects all of those
+# (as well as non-canonical forms like "06000").
+if ! [[ "$PORT" =~ ^600[0-9]$ ]]; then
+  echo "Error: port must be one of 6000-6009, in canonical decimal form (no leading zeros)"
   exit 1
 fi
 

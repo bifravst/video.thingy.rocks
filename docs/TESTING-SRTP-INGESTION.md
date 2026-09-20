@@ -76,10 +76,14 @@ cd backend && node --no-warnings --experimental-transform-types --test src/SrtpK
 
 ## 2. Provision a test key
 
-Generate fresh test key material and provision it for a port (e.g. 6000):
+Generate fresh test key material and provision it for a port (e.g. 6000). **Save
+the generated key in a shell variable** - it is needed again in step 3, and the
+sender will not authenticate against the backend if you let it fall back to its
+built-in test key:
 
 ```bash
-./scripts/provision-srtp-key.sh 6000 "$(openssl rand -hex 30)" 3735928559
+TEST_KEY=$(openssl rand -hex 30)
+./scripts/provision-srtp-key.sh 6000 "$TEST_KEY" 3735928559
 ```
 
 Restart or redeploy the instance(s) so the backend picks up the new parameter
@@ -98,18 +102,17 @@ Get an instance IP (same script as the unencrypted path):
 ./scripts/get-instance-ip.sh
 ```
 
-Stream a synthetic SRTP test source to a port (6000-6009):
+Stream a synthetic SRTP test source to a port (6000-6009), passing **the same
+key and SSRC you provisioned in step 2** (here `"$TEST_KEY"` from that step and
+the provisioned SSRC):
 
 ```bash
-./scripts/stream-testsrc-to-srtp.sh <instance-ip> 6000
+./scripts/stream-testsrc-to-srtp.sh <instance-ip> 6000 "$TEST_KEY" 3735928559
 ```
 
-This uses a **test-only** key/SSRC by default - if you provisioned a different
-key/SSRC in step 2, pass them explicitly:
-
-```bash
-./scripts/stream-testsrc-to-srtp.sh <instance-ip> 6000 <hexKey> <ssrc>
-```
+The script's built-in default key/SSRC are for local testing only and will
+**not** authenticate against a backend provisioned with your own key - always
+pass the provisioned values explicitly.
 
 The backend receives UDP on that port, relays it to GStreamer's `udpsrc`, and
 kvssink sends decrypted H.264 to the numbered Kinesis Video Stream for that
