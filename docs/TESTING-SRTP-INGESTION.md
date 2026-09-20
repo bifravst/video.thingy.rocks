@@ -47,9 +47,20 @@ continuity**: a device must never restart its RTP sequence numbering while
 keeping the same key and SSRC (the backend persists rollover-counter state under
 that identity and would seed the fresh session with the previous session's ROC -
 see backend/README.md, "Session continuity"). When re-running the test sender
-below after it has exited, pass a fresh SSRC, or clear the slot's persisted ROC
-fields (`srtpRoc`/`srtpHighestSeq`/`srtpRocSsrc`/`srtpRocKeyFingerprint`) from
-the `StreamMetadata` DynamoDB item first.
+below after it has exited, either:
+
+1. provision a **fresh key/SSRC pair** for the port and make the backend load
+   it - `./scripts/provision-srtp-key.sh <port> <newKeyHex> <newSsrc>`, then
+   restart/redeploy the instance(s) (keys and SSRCs are resolved once at process
+   start) - and pass that key/SSRC to the sender, **or**
+2. keep the same key/SSRC and clear the slot's persisted ROC fields
+   (`srtpRoc`/`srtpHighestSeq`/`srtpRocSsrc`/`srtpRocKeyFingerprint`) from the
+   `StreamMetadata` DynamoDB item first.
+
+Note that passing a fresh SSRC to the sender **alone** does not work: the
+backend's `srtpdec` is pinned to the SSRC loaded from SSM at startup, so every
+packet would be rejected as an SSRC (or key) mismatch until the parameter is
+reprovisioned and the backend has loaded it.
 
 ## 1. Unit tests
 

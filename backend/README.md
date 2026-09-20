@@ -54,11 +54,14 @@ What a client/device needs to send:
   packets until the sender wraps around to that ROC again (effectively forever).
   If a device cannot guarantee monotonic sequence numbers across its restarts
   (e.g. the bundled test sender, which restarts at a fixed sequence offset),
-  reprovision it with a **new key or SSRC** (see
-  `../scripts/provision-srtp-key.sh`) whenever it restarts its sequence, or ask
-  the operator to clear the port's persisted ROC state in DynamoDB
-  (`srtpRoc`/`srtpHighestSeq`/`srtpRocSsrc`/`srtpRocKeyFingerprint` on the
-  stream slot's `StreamMetadata` item).
+  have the operator reprovision it with a **new key or SSRC** whenever it
+  restarts its sequence - via `../scripts/provision-srtp-key.sh`, followed by a
+  backend restart/redeploy, since keys and SSRCs are resolved once at process
+  start and `srtpdec` is pinned to the SSRC loaded then (a fresh sender-side
+  SSRC alone would be rejected as a mismatch) - or ask the operator to clear the
+  port's persisted ROC state in DynamoDB (`srtpRoc`/`srtpHighestSeq`/
+  `srtpRocSsrc`/`srtpRocKeyFingerprint` on the stream slot's `StreamMetadata`
+  item), which needs no restart.
 - **Encryption**: a static, pre-shared 30-byte SRTP master key + salt (60 hex
   characters), using **aes-128-icm** for encryption and **hmac-sha1-80** for
   authentication - the only suite this service supports. Keys are exchanged
