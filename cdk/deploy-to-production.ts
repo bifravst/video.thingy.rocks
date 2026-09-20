@@ -33,6 +33,22 @@ const options = commandLineArgs([
 		name: 'stackName',
 		type: String,
 	},
+	{
+		// The serving ingest-fleet generation (see StreamingStack's fleet-generation
+		// machinery): bump for a change that must not be rolled out with old and new
+		// instances serving side by side.
+		name: 'fleetGeneration',
+		type: String,
+	},
+	{
+		// Retains the previous ingest fleet (and, for the empty legacy value, the old
+		// Kinesis Video Streams) through the cutover deploy; drop it on the cleanup
+		// deploy once the old fleet's flows have drained. Pass an EMPTY value
+		// (--retainFleetGeneration "") to retain the currently deployed, unsuffixed
+		// legacy resources.
+		name: 'retainFleetGeneration',
+		type: String,
+	},
 ])
 
 const iam = new IAMClient({})
@@ -51,6 +67,14 @@ const ctx = {
 		await readFile(path.join(process.cwd(), 'cdk.context.json'), 'utf-8'),
 	),
 	version,
+	// Fleet-generation contexts (see StreamingStack): passed through as app context so
+	// the cutover procedure is a deploy-flag, not a cdk.context.json edit.
+	...(options.fleetGeneration !== undefined
+		? { fleetGeneration: options.fleetGeneration }
+		: {}),
+	...(options.retainFleetGeneration !== undefined
+		? { retainFleetGeneration: options.retainFleetGeneration }
+		: {}),
 }
 
 console.log(

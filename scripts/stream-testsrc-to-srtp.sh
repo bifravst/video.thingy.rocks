@@ -43,6 +43,16 @@ if ! [[ "$HEX_KEY" =~ ^[0-9a-fA-F]{60}$ ]]; then
   exit 1
 fi
 
+# Validate the optional SSRC exactly like provision-srtp-key.sh does - canonical decimal
+# uint32, rejected by string length first because bash's `[` cannot compare
+# out-of-range integers and fails open ("integer expression expected" evaluates false).
+# A typo, negative value, or value above uint32 would otherwise pass this script and
+# only surface later as an opaque gst-launch-1.0 pipeline/property error.
+if ! [[ "$SSRC" =~ ^(0|[1-9][0-9]*)$ ]] || [ "${#SSRC}" -gt 10 ] || [ "$SSRC" -gt 4294967295 ]; then
+  echo "Error: ssrc must be a canonical decimal uint32 (0-4294967295, no leading zeros)"
+  exit 1
+fi
+
 if ! command -v gst-launch-1.0 &> /dev/null; then
   echo "Error: gst-launch-1.0 is not installed"
   echo "Install with: sudo apt install gstreamer1.0-tools gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-plugins-good (Ubuntu/Debian) or brew install gstreamer gst-plugins-bad gst-plugins-ugly gst-plugins-good (macOS)"

@@ -92,6 +92,16 @@ export class StreamingStack extends Stack {
 			removalPolicy: RemovalPolicy.DESTROY,
 		})
 
+		// Fleet-generation contexts, read early because several resource families below
+		// depend on them (the streams here, the fleets/target groups later). See the full
+		// cutover rationale and procedure at createIngestFleet below.
+		const servingGeneration =
+			(this.node.tryGetContext('fleetGeneration') as string | undefined) ??
+			'gen2'
+		const retainedGeneration = this.node.tryGetContext(
+			'retainFleetGeneration',
+		) as string | undefined
+
 		// Kinesis Video Streams: one per device, numbered 1-10, shared by both ingestion
 		// methods. Port 5000+n (unencrypted MPEG-TS) and port 6000+n (SRTP) both target the
 		// same stream (n+1) - a device is assigned one port range or the other, never both,
@@ -125,6 +135,26 @@ export class StreamingStack extends Stack {
 			this.kinesisVideoStreams.push(stream)
 		}
 
+		// During the legacy migration cutover (retainFleetGeneration set to the empty
+		// legacy generation), also keep the currently deployed, unsuffixed Kinesis Video
+		// Streams in the template: without this, the same update that renames every
+		// stream deletes the old ones while the retained legacy fleet - still the sole
+		// NLB receiver until the readiness-gated listener flip - keeps ingesting into the
+		// old names. Old code writing to deleted streams is an outage. Recreating them
+		// here with their original logical IDs and unchanged properties is a no-op
+		// update for CloudFormation (the resources already exist), so they survive the
+		// cutover deploy; the cleanup deploy (dropping the retainFleetGeneration context)
+		// removes this block and deletes them once traffic has moved to the new streams.
+		if (retainedGeneration === '') {
+			for (let port = 5000; port <= 5009; port++) {
+				new kinesisvideo.CfnStream(this, `KinesisVideoStream${port}`, {
+					name: `${this.stackName}-video-${port}`,
+					dataRetentionInHours: Duration.days(30).toHours(),
+					mediaType: 'video/h264',
+				})
+			}
+		}
+
 		this.udpSecurityGroup = new ec2.SecurityGroup(this, 'UDPSecurityGroup', {
 			vpc: this.vpc,
 			description: 'Security group for UDP video ingestion',
@@ -154,7 +184,12 @@ export class StreamingStack extends Stack {
 			ec2.Port.udpRange(6000, 6009),
 			'Allow SRTP video ingestion on ports 6000-6009 (IPv6)',
 		)
-		// Allow TCP health checks from NLB (originates within VPC)
+		// Allow TCP health checks from NLB (originates within VPC). Port 9999 is the
+		// unencrypted transport's readiness signal (the backend opens it only once the
+		// unencrypted listener is bound); port 9998 is the SRTP transport's (opened only
+		// after the SRTP keys are loaded AND the SRTP listener is bound - see
+		// backend/src/HealthServer.ts), so the two transports' target groups can gate
+		// their health checks separately.
 		this.udpSecurityGroup.addIngressRule(
 			ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
 			ec2.Port.tcp(9999),
@@ -164,6 +199,16 @@ export class StreamingStack extends Stack {
 			ec2.Peer.anyIpv6(),
 			ec2.Port.tcp(9999),
 			'Allow NLB TCP health checks on port 9999 (IPv6)',
+		)
+		this.udpSecurityGroup.addIngressRule(
+			ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
+			ec2.Port.tcp(9998),
+			'Allow NLB TCP health checks on port 9998 (SRTP readiness)',
+		)
+		this.udpSecurityGroup.addIngressRule(
+			ec2.Peer.anyIpv6(),
+			ec2.Port.tcp(9998),
+			'Allow NLB TCP health checks on port 9998 (SRTP readiness, IPv6)',
 		)
 
 		// Allow HTTPS egress for AWS service communication
@@ -321,11 +366,11 @@ export class StreamingStack extends Stack {
 			1,
 		)
 
-		// Fleet generations: scopes the Auto Scaling Groups and their NLB target groups,
-		// so a breaking rollout can be deployed as a *full-fleet cutover* with the old
-		// fleet retained through the switch, instead of the rolling update configured
-		// below. A rolling update replaces instances one batch at a time while the whole
-		// fleet keeps serving the same NLB target groups - fine for compatible changes,
+		// Fleet generation: scopes the Auto Scaling Groups and their NLB target groups so
+		// a breaking rollout can be deployed as a *full-fleet cutover* instead of a rolling
+		// update (see the servingGeneration/retainedGeneration contexts read near the top
+		// of this constructor). A rolling update replaces instances one batch at a time
+		// while the whole fleet keeps serving the same NLB target groups - fine for compatible changes,
 		// but this update renames every Kinesis Video Stream and moves the DynamoDB lock
 		// key from the raw port (5000-5009) to the stream slot (1-10): during a rolling
 		// overlap, old instances would write to the old {stackName}-video-5000 stream
@@ -358,12 +403,6 @@ export class StreamingStack extends Stack {
 		// same new code as the serving fleet - no old/new scheme split during the
 		// overlap. Within an unchanged generation, ordinary stack updates are normal
 		// rolling updates again.
-		const servingGeneration =
-			(this.node.tryGetContext('fleetGeneration') as string | undefined) ??
-			'gen2'
-		const retainedGeneration = this.node.tryGetContext(
-			'retainFleetGeneration',
-		) as string | undefined
 		if (
 			retainedGeneration !== undefined &&
 			retainedGeneration === servingGeneration
@@ -426,6 +465,12 @@ export class StreamingStack extends Stack {
 			const createTargetGroup = (
 				id: string,
 				port: number,
+				// Readiness signal this target group gates on: 9999 = unencrypted path
+				// (bound listener), 9998 = SRTP path (keys + bound listener) - see
+				// backend/src/HealthServer.ts and the security-group rules above. A
+				// transport whose prerequisites are unavailable therefore reports its
+				// own targets unhealthy, without affecting the other transport's.
+				healthPort: number,
 			): elbv2.NetworkTargetGroup => {
 				const targetGroup = new elbv2.NetworkTargetGroup(this, id, {
 					vpc: this.vpc,
@@ -435,7 +480,7 @@ export class StreamingStack extends Stack {
 					ipAddressType: elbv2.TargetGroupIpAddressType.IPV6,
 					healthCheck: {
 						protocol: elbv2.Protocol.TCP,
-						port: '9999',
+						port: String(healthPort),
 						healthyThresholdCount: 2,
 						unhealthyThresholdCount: 2,
 						interval: Duration.seconds(10),
@@ -452,13 +497,13 @@ export class StreamingStack extends Stack {
 			const unencryptedTargetGroups: elbv2.NetworkTargetGroup[] = []
 			for (let port = 5000; port <= 5009; port++) {
 				unencryptedTargetGroups.push(
-					createTargetGroup(`TargetGroup${port}${suffix}`, port),
+					createTargetGroup(`TargetGroup${port}${suffix}`, port, 9999),
 				)
 			}
 			const srtpTargetGroups: elbv2.NetworkTargetGroup[] = []
 			for (let port = 6000; port <= 6009; port++) {
 				srtpTargetGroups.push(
-					createTargetGroup(`SrtpTargetGroup${port}${suffix}`, port),
+					createTargetGroup(`SrtpTargetGroup${port}${suffix}`, port, 9998),
 				)
 			}
 			// Register the fleet's instances in all of its target groups
@@ -547,9 +592,11 @@ export class StreamingStack extends Stack {
 		// at that point can leave every listener with zero healthy targets (a full ingest
 		// outage). This gate blocks the listener update until every target group of the
 		// serving generation reports at least ASG_MIN_CAPACITY healthy targets - the
-		// same TCP:9999 health check the NLB itself uses, which instances only pass once
-		// their user data has verified the GStreamer elements and built kvssink (see
-		// cdk/user-data.sh) - so the cutover flips traffic only to a fleet that is
+		// same per-transport TCP health checks (9999 unencrypted, 9998 SRTP) the NLB
+		// itself uses, which instances only pass once their user data has verified the
+		// GStreamer elements and built kvssink (see cdk/user-data.sh) and the backend has
+		// loaded the SRTP keys and bound both listeners (see backend/src/HealthServer.ts)
+		// - so the cutover flips traffic only to a fleet that is
 		// genuinely ready to ingest.
 		//
 		// The CDK custom-resource provider framework drives the wait: isComplete is

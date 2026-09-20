@@ -228,7 +228,18 @@ const relinquishPort = async (
 		streamStateManager.getStreamState(port)?.status === 'active' &&
 		!preStartBufferByPort.has(port)
 	) {
-		preStartBufferByPort.set(port, { chunks: [], totalBytes: 0 })
+		// Merge any datagrams held while no pipeline was active (writePacket's hold)
+		// into the re-armed buffer, ahead of everything buffered from here on - they are
+		// the oldest pending data, and leaving them in the hold would make the next start
+		// replay newer buffered chunks first and seed the older held packets into the new
+		// pipeline's pendingQueue, letting newer sequence numbers overtake the older held
+		// keyframe/SPS/PPS (same ordering the other re-arm paths preserve via
+		// takeHeldDatagrams).
+		const held = kinesisIngestionPipeline?.takeHeldDatagrams(port) ?? []
+		preStartBufferByPort.set(port, {
+			chunks: held,
+			totalBytes: held.reduce((sum, chunk) => sum + chunk.length, 0),
+		})
 	}
 }
 
@@ -385,6 +396,13 @@ type PacketHandlerRangeConfig = {
  * `persistRoc` is false only for the failed-persisted-ROC-read path in
  * startPipelineOrReleaseLock - see that call site for why a forced {0,0} write must be
  * avoided there.
+ *
+ * `isStale` is the calling invocation's ownership-epoch check (see
+ * startPipelineOrReleaseLock), re-run *inside* the handoff's critical section: for the
+ * restart/resume callers the handoff takes the slot's mutex itself, and the mutex wait
+ * can straddle a newer invocation re-acquiring this slot - an older invocation
+ * resuming then would release the row and clear the local ownership the *newer* owner
+ * just established. The in-section re-check abandons the handoff instead.
  */
 const releaseLockBackoffAndRearm = async (
 	port: number,
@@ -397,8 +415,16 @@ const releaseLockBackoffAndRearm = async (
 	// read was supposed to protect - the very outcome that path exists to avoid. Final ROC
 	// persistence stays enabled everywhere state was successfully loaded or observed.
 	persistRoc = true,
+	// The calling invocation's staleness check (undefined when the caller has no epoch
+	// to protect), re-run inside the handoff's critical section - see above.
+	isStale?: () => boolean,
 ): Promise<void> => {
 	const handoff = async (): Promise<void> => {
+		// Re-checked under the mutex: the wait can straddle a newer ownership epoch
+		// taking this slot - this invocation no longer speaks for the port, and
+		// releasing the row / clearing local ownership would tear down the newer owner.
+		// (undefined = no epoch to protect - proceed with the handoff.)
+		if (isStale?.() === true) return
 		try {
 			// See above: persist the freshest SRTP ROC state while this instance still
 			// owns the slot, then release it - one critical section, same as onStreamStop.
@@ -491,7 +517,6 @@ const startPipelineOrReleaseLock = async (
 	// rather than guessing - spawning without confirmation is exactly the
 	// competing-producer problem the lock exists to prevent.
 	let stillOwner: boolean
-	let ownershipUnknown = false
 	try {
 		stillOwner = await streamMetadataService.tryAcquireKinesisLock(
 			slot,
@@ -503,17 +528,29 @@ const startPipelineOrReleaseLock = async (
 			err,
 		)
 		stillOwner = false
-		ownershipUnknown = true
 	}
 	if (!stillOwner) {
 		console.error(
 			`[Main] No longer the owner of the Kinesis lock for port ${port}; abandoning pipeline start`,
 		)
-		// On a transient confirmation error the row's ownership is unknown - this
-		// instance may still own it, so attempt a conditional release (see
-		// relinquishPort) rather than leaving the row parked under this instance until
-		// the staleness threshold expires.
-		await relinquishPort(port, ownershipUnknown ? { slot } : undefined)
+		// The re-arm path, NOT relinquishPort: (a) the threshold path has already
+		// deleted the pre-start buffer, and its packets exist only in initialData -
+		// relinquishPort would re-arm an empty buffer and drop them; (b) for the
+		// restart/resume callers this runs outside the slot mutex, where an older
+		// invocation could resume after a newer epoch re-acquired the slot and clear
+		// that newer owner - releaseLockBackoffAndRearm re-checks this invocation's
+		// staleness inside the critical section and abandons instead. Its conditional
+		// release also covers the "row ownership unknown" transient-error case above
+		// (a no-op when another instance owns the row), and its re-arm merges any held
+		// datagrams ahead of initialData, keeping one oldest-first replay sequence.
+		await releaseLockBackoffAndRearm(
+			port,
+			slot,
+			initialData,
+			holdsSlotMutex,
+			true,
+			isStale,
+		)
 		return
 	}
 	if (isStale()) return // ownership changed while awaiting DynamoDB; abandon
@@ -552,6 +589,7 @@ const startPipelineOrReleaseLock = async (
 					initialData,
 					holdsSlotMutex,
 					false,
+					isStale,
 				)
 				return
 			}
@@ -591,7 +629,14 @@ const startPipelineOrReleaseLock = async (
 	console.error(
 		`[Main] Kinesis ingestion pipeline failed to start for port ${port}; releasing lock`,
 	)
-	await releaseLockBackoffAndRearm(port, slot, initialData, holdsSlotMutex)
+	await releaseLockBackoffAndRearm(
+		port,
+		slot,
+		initialData,
+		holdsSlotMutex,
+		true,
+		isStale,
+	)
 }
 
 /** A PacketHandler plus a hook shutdown() uses to drain this handler's per-port queues before
@@ -622,6 +667,38 @@ const createPacketHandler = (
 		const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
 		if (ssrc === undefined) return false
 		return parseAuthenticRtpSequenceNumber(data, ssrc) !== undefined
+	}
+
+	/**
+	 * Keeps a datagram whose processing observed ownership loss from being silently
+	 * dropped: without this, a datagram that entered processPacket while the lock was
+	 * still held - but whose turn awaited the handoff's slot-mutex section (or a
+	 * relinquish) until after clearLockHeld - would be skipped by both the buffering
+	 * path above (lock held when it was evaluated) and the writePacket tail below (lock
+	 * no longer held), losing e.g. the first resumed keyframe/SPS/PPS. The per-port
+	 * queue is strictly serial, so nothing newer was buffered meanwhile: append to the
+	 * port's re-armed pre-start buffer when one exists (its chunks predate this
+	 * datagram); otherwise hold it for the next start via writePacket's hold (the re-arm
+	 * paths merge holds ahead of everything buffered later, so ordering is preserved
+	 * either way).
+	 */
+	const keepOrphanedDatagram = (port: number, data: Buffer): void => {
+		const buf = preStartBufferByPort.get(port)
+		if (buf === undefined) {
+			// No buffer armed (stream inactive edge cases): writePacket holds it when no
+			// pipeline is active - and relays into a newer epoch's active pipeline if one
+			// took over this slot in the meantime, which is correct ingestion either way.
+			kinesisIngestionPipeline?.writePacket(port, data)
+			return
+		}
+		buf.chunks.push(data)
+		buf.totalBytes += data.length
+		// Same bounded-cap eviction as the buffering block above (keeps the newest chunk).
+		const maxBufferedBytes = rangeConfig.minBytesBeforeStart * 2
+		while (buf.totalBytes > maxBufferedBytes && buf.chunks.length > 1) {
+			const dropped = buf.chunks.shift()
+			if (dropped !== undefined) buf.totalBytes -= dropped.length
+		}
 	}
 
 	const processPacket = async (
@@ -779,7 +856,16 @@ const createPacketHandler = (
 			// holding the mutex), and continuing to write as a non-owner is exactly the
 			// competing-producer problem the lock exists to prevent.
 			await withSlotLock(slot, async () => {
-				if (!kinesisLockHeldForPorts.has(port)) return
+				if (!kinesisLockHeldForPorts.has(port)) {
+					// Ownership was lost while this packet's turn waited behind the
+					// handoff's mutex section (see onStreamStop) - neither the buffering
+					// path above (lock was held when it was evaluated) nor the
+					// writePacket tail below (lock no longer held) would keep this
+					// datagram. Route it so the first resumed keyframe/SPS/PPS is not
+					// lost.
+					keepOrphanedDatagram(port, data)
+					return
+				}
 
 				// Track this datagram's ROC contribution BEFORE taking the snapshot persisted
 				// below - otherwise a datagram that crosses the sequence-number wrap is only
@@ -828,6 +914,10 @@ const createPacketHandler = (
 						err.name === 'ConditionalCheckFailedException'
 					) {
 						await relinquishPort(port)
+						// This datagram arrived while the lock was held but is now
+						// orphaned by the ownership loss - keep it (see
+						// keepOrphanedDatagram).
+						keepOrphanedDatagram(port, data)
 						return
 					}
 					console.error(`[Main] Error updating DynamoDB for port ${port}:`, err)
@@ -859,6 +949,9 @@ const createPacketHandler = (
 					if (result === 'lostLock') {
 						// Another instance owns the row - there is nothing left to release.
 						await relinquishPort(port)
+						// This datagram is orphaned by the ownership loss - keep it (see
+						// keepOrphanedDatagram).
+						keepOrphanedDatagram(port, data)
 					} else if (result === 'writeError') {
 						// The write failed without proving ownership loss: this producer
 						// must still stop, but the row may still be ours - attempt a
@@ -866,6 +959,7 @@ const createPacketHandler = (
 						// of waiting out the 5-minute staleness threshold with nobody
 						// ingesting.
 						await relinquishPort(port, { slot })
+						keepOrphanedDatagram(port, data)
 					}
 				}
 			})
@@ -1289,6 +1383,13 @@ if (srtpUdpListener && srtpPacketHandler) {
 }
 
 const healthServer = new HealthServer()
+/**
+ * SRTP-transport readiness signal (see HealthServer): opened only once the SRTP keys are
+ * loaded and the SRTP listener is bound, and health-checked by the SRTP target groups
+ * (TCP 9998, see cdk/StreamingStack.ts). While it stays closed, SRTP target groups
+ * report this instance unhealthy - for both the NLB and the fleet-cutover readiness gate.
+ */
+const srtpHealthServer = new HealthServer(9998)
 
 // Graceful shutdown handler
 const shutdown = async (): Promise<void> => {
@@ -1299,6 +1400,7 @@ const shutdown = async (): Promise<void> => {
 	console.log('[Main] Shutting down...')
 
 	await healthServer.stop()
+	await srtpHealthServer.stop()
 	await udpListener.stop()
 	await srtpUdpListener?.stop()
 	streamStateManager.stop()
@@ -1387,14 +1489,21 @@ const start = async (): Promise<void> => {
 
 	try {
 		await ensureAwsCredentials()
-		// Start the health server and the unencrypted MPEG-TS listener *before* the
-		// optional SRTP key loading below: during an SSM outage or throttling, its SDK
-		// retries and connection timeouts can stall startup for minutes - the existing
-		// ingest path (and health checks) must not wait on an additive dependency of the
-		// SRTP ports alone.
-		await healthServer.start()
+		// The unencrypted listener starts first: during an SSM outage or throttling, the
+		// SRTP key loading below can stall for minutes (SDK retries, connection
+		// timeouts) - the existing ingest path must not wait on an additive dependency
+		// of the SRTP ports alone.
 		await udpListener.start()
 
+		// Health ports open only after the transports they gate are usable (see
+		// HealthServer): the NLB's target-group health checks and the fleet-cutover
+		// readiness gate treat an open port as "this instance can ingest on this
+		// transport", so they must never open before the paths behind them exist.
+		// TCP 9999 gates the unencrypted path (listener bound above); TCP 9998
+		// additionally gates the SRTP path (keys + listener below).
+		await healthServer.start()
+
+		let srtpKeysLoaded = false
 		if (srtpEnabled && srtpKeyStore) {
 			const ports: number[] = []
 			for (
@@ -1413,6 +1522,7 @@ const start = async (): Promise<void> => {
 			// is retried on the next restart.
 			try {
 				await srtpKeyStore.loadPorts(ports)
+				srtpKeysLoaded = true
 			} catch (err) {
 				console.error(
 					'[Main] Failed to load SRTP keys from SSM; SRTP ingestion will be unavailable until this is resolved. The unencrypted MPEG-TS path is unaffected. Error:',
@@ -1420,6 +1530,7 @@ const start = async (): Promise<void> => {
 				)
 			}
 		}
+		let srtpListenerUp = false
 		if (srtpUdpListener) {
 			// Isolated from the rest of startup, same rationale as the SRTP key-loading block
 			// above: UDPListener.start() rejects if any port in its range permanently fails to
@@ -1431,6 +1542,7 @@ const start = async (): Promise<void> => {
 			// isn't restarting) doesn't leak them.
 			try {
 				await srtpUdpListener.start()
+				srtpListenerUp = true
 			} catch (err) {
 				console.error(
 					'[Main] Failed to start SRTP UDP listener; SRTP ingestion will be unavailable until this is resolved. The unencrypted MPEG-TS path is unaffected. Error:',
@@ -1444,6 +1556,22 @@ const start = async (): Promise<void> => {
 						stopErr,
 					)
 				}
+			}
+		}
+
+		// The SRTP readiness port opens only when the whole SRTP path is usable: keys
+		// loaded AND listener bound. If either failed (isolated above, so the unencrypted
+		// path keeps serving), it stays closed - the SRTP target groups then report this
+		// instance unhealthy, the fleet-cutover readiness gate blocks a switch onto it,
+		// and the ASG eventually replaces it, instead of any of them treating a
+		// Kinesis/SRTP-broken instance as ingest-ready.
+		if (srtpEnabled) {
+			if (srtpKeysLoaded && srtpListenerUp) {
+				await srtpHealthServer.start()
+			} else {
+				console.error(
+					'[Main] SRTP ingestion is not ready (keys or listener unavailable); the SRTP health port stays closed, so the SRTP target groups report this instance unhealthy.',
+				)
 			}
 		}
 		console.log('[Main] Service started successfully')
