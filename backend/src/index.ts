@@ -419,12 +419,21 @@ const releaseLockBackoffAndRearm = async (
 	// to protect), re-run inside the handoff's critical section - see above.
 	isStale?: () => boolean,
 ): Promise<void> => {
+	// Set when the handoff abandoned itself as stale (see below) - the outer function
+	// must then skip its backoff/re-arm work entirely: this invocation no longer speaks
+	// for the port, and applying its (older-epoch) backoff or overwriting
+	// preStartBufferByPort with its initialData would clobber the retry state of the
+	// newer local owner that took the slot.
+	let handoffAbandonedAsStale = false
 	const handoff = async (): Promise<void> => {
 		// Re-checked under the mutex: the wait can straddle a newer ownership epoch
 		// taking this slot - this invocation no longer speaks for the port, and
 		// releasing the row / clearing local ownership would tear down the newer owner.
 		// (undefined = no epoch to protect - proceed with the handoff.)
-		if (isStale?.() === true) return
+		if (isStale?.() === true) {
+			handoffAbandonedAsStale = true
+			return
+		}
 		try {
 			// See above: persist the freshest SRTP ROC state while this instance still
 			// owns the slot, then release it - one critical section, same as onStreamStop.
@@ -448,6 +457,11 @@ const releaseLockBackoffAndRearm = async (
 		// backoff/re-arm below still happens - a thrown release must not strand the port.
 		console.error(`[Main] Error releasing Kinesis lock for port ${port}:`, err)
 	}
+
+	// A stale invocation must not touch the port's retry state (see
+	// handoffAbandonedAsStale): the newer owner that took the slot owns the backoff
+	// clock and the pre-start buffer from here on.
+	if (handoffAbandonedAsStale) return
 
 	nextStartAttemptAllowedAtByPort.set(port, Date.now() + START_RETRY_BACKOFF_MS)
 
@@ -954,10 +968,18 @@ const createPacketHandler = (
 						keepOrphanedDatagram(port, data)
 					} else if (result === 'writeError') {
 						// The write failed without proving ownership loss: this producer
-						// must still stop, but the row may still be ours - attempt a
-						// conditional release so another instance can take over instead
-						// of waiting out the 5-minute staleness threshold with nobody
-						// ingesting.
+						// must still stop, but the row may still be ours. Unlike a lost
+						// lock, the current packet's ROC advance may not have reached
+						// DynamoDB - so run the same bounded, forced final persistence
+						// every other handoff path uses (still under this slot's mutex -
+						// the heartbeat section runs inside withSlotLock), so a transient
+						// write that recovers during the handoff still lands the freshest
+						// state before the release, instead of the next owner reading
+						// stale state and failing SRTP decryption indefinitely.
+						await persistSrtpRocForHandoff(port, slot)
+						// Attempt a conditional release so another instance can take over
+						// instead of waiting out the 5-minute staleness threshold with
+						// nobody ingesting.
 						await relinquishPort(port, { slot })
 						keepOrphanedDatagram(port, data)
 					}
@@ -1504,14 +1526,15 @@ const start = async (): Promise<void> => {
 		await healthServer.start()
 
 		let srtpKeysLoaded = false
+		let allSrtpPortsKeyed = false
+		const srtpPorts: number[] = []
 		if (srtpEnabled && srtpKeyStore) {
-			const ports: number[] = []
 			for (
 				let port = config.srtpPortRange.start;
 				port <= config.srtpPortRange.end;
 				port++
 			) {
-				ports.push(port)
+				srtpPorts.push(port)
 			}
 			// Isolated from the outer try/catch: an SSM outage/throttling/permissions error
 			// here must not abort startup of the unencrypted MPEG-TS path (5000-5009), which
@@ -1521,12 +1544,30 @@ const start = async (): Promise<void> => {
 			// keyless SRTP port, so nothing is buffered or lock-attempted for it) until this
 			// is retried on the next restart.
 			try {
-				await srtpKeyStore.loadPorts(ports)
+				await srtpKeyStore.loadPorts(srtpPorts)
 				srtpKeysLoaded = true
 			} catch (err) {
 				console.error(
 					'[Main] Failed to load SRTP keys from SSM; SRTP ingestion will be unavailable until this is resolved. The unencrypted MPEG-TS path is unaffected. Error:',
 					err,
+				)
+			}
+			// "loadPorts did not throw" does not mean every configured port has a usable
+			// key: SrtpKeyStore skips missing, non-SecureString, and malformed parameters
+			// individually, and a keyless SRTP port discards every datagram it receives.
+			// The shared SRTP readiness signal (port 9998, health-checked by all ten SRTP
+			// target groups) may only open when EVERY configured port is keyed - otherwise
+			// it would mark non-ingesting ports healthy and let the cutover gate switch
+			// traffic onto them.
+			allSrtpPortsKeyed =
+				srtpKeysLoaded &&
+				srtpPorts.every((port) => srtpKeyStore.hasKeyForPort(port))
+			if (srtpKeysLoaded && !allSrtpPortsKeyed) {
+				const keylessPorts = srtpPorts.filter(
+					(port) => !srtpKeyStore.hasKeyForPort(port),
+				)
+				console.error(
+					`[Main] SRTP keys are missing or invalid for ports ${keylessPorts.join(', ')} (skipped at load time); the SRTP readiness port stays closed so no SRTP traffic is routed to non-ingesting ports.`,
 				)
 			}
 		}
@@ -1560,17 +1601,35 @@ const start = async (): Promise<void> => {
 		}
 
 		// The SRTP readiness port opens only when the whole SRTP path is usable: keys
-		// loaded AND listener bound. If either failed (isolated above, so the unencrypted
-		// path keeps serving), it stays closed - the SRTP target groups then report this
-		// instance unhealthy, the fleet-cutover readiness gate blocks a switch onto it,
-		// and the ASG eventually replaces it, instead of any of them treating a
-		// Kinesis/SRTP-broken instance as ingest-ready.
+		// for EVERY configured port loaded (SrtpKeyStore skips bad parameters
+		// individually, so "load did not throw" is not enough - see above), the SRTP
+		// listener bound, and the SRTP GStreamer elements verified by user data
+		// (SRTP_ELEMENTS_OK, warning-only there so an SRTP-only gap never takes the
+		// unencrypted path down). If any of these failed (isolated above, so the
+		// unencrypted path keeps serving), it stays closed - the SRTP target groups then
+		// report this instance unhealthy, the fleet-cutover readiness gate blocks a
+		// switch onto it, and the NLB never routes SRTP traffic to a non-ingesting
+		// port, instead of any of them treating a Kinesis/SRTP-broken instance as
+		// ingest-ready.
 		if (srtpEnabled) {
-			if (srtpKeysLoaded && srtpListenerUp) {
+			const srtpElementsOk = process.env.SRTP_ELEMENTS_OK === '1'
+			if (
+				srtpKeysLoaded &&
+				allSrtpPortsKeyed &&
+				srtpListenerUp &&
+				srtpElementsOk
+			) {
 				await srtpHealthServer.start()
 			} else {
+				const reason = !srtpKeysLoaded
+					? 'keys unavailable (SSM load failed)'
+					: !allSrtpPortsKeyed
+						? 'one or more configured ports have no usable key'
+						: !srtpListenerUp
+							? 'listener unavailable'
+							: 'GStreamer SRTP elements missing'
 				console.error(
-					'[Main] SRTP ingestion is not ready (keys or listener unavailable); the SRTP health port stays closed, so the SRTP target groups report this instance unhealthy.',
+					`[Main] SRTP ingestion is not ready (${reason}); the SRTP health port stays closed, so the SRTP target groups report this instance unhealthy.`,
 				)
 			}
 		}

@@ -98,7 +98,7 @@ export class StreamingStack extends Stack {
 		const servingGeneration =
 			(this.node.tryGetContext('fleetGeneration') as string | undefined) ??
 			'gen2'
-		const retainedGeneration = this.node.tryGetContext(
+		let retainedGeneration = this.node.tryGetContext(
 			'retainFleetGeneration',
 		) as string | undefined
 
@@ -327,7 +327,62 @@ export class StreamingStack extends Stack {
 			.replace(/__SRTP_PORT_RANGE_START__/g, String(srtpPortRangeStart))
 			.replace(/__SRTP_PORT_RANGE_END__/g, String(srtpPortRangeEnd))
 
-		const userData = ec2.UserData.custom(userDataScript)
+		// The *legacy* user data, frozen byte-for-byte from the currently deployed
+		// (pre-SRTP) stack: the retained legacy fleet's launch template (see
+		// createIngestFleet below) must keep rendering EXACTLY the resource that is
+		// deployed, so CloudFormation sees no change to it - any change would bump its
+		// version number and roll the retained fleet onto the new code mid-cutover,
+		// mixing the old (raw-port lock, old stream names) and new (slot lock, new
+		// stream names) schemes on instances that still receive listener traffic.
+		// Placeholders match the legacy set (the legacy backend had no SRTP
+		// configuration).
+		const legacyUserDataScript = readFileSync(
+			join(__dirname, 'user-data-legacy.sh'),
+			'utf-8',
+		)
+			.replace(/__AWS_REGION__/g, this.region)
+			.replace(/__TABLE_NAME__/g, this.streamTable.tableName)
+			.replace(/__CODE_BUCKET__/g, this.codeBucket.bucketName)
+			.replace(/__KINESIS_STREAM_PREFIX__/g, `${this.stackName}-video`)
+
+		/**
+		 * Builds a fleet's launch template (same shape for every fleet: instance type,
+		 * AMI, role, security group, IMDSv2, public IP, primary IPv6 - only the user
+		 * data and construct ID differ). The generation-scoped ID keeps each fleet's
+		 * template independent: a user-data change rolls only the generation whose
+		 * script changed.
+		 */
+		const createFleetLaunchTemplate = (
+			id: string,
+			script: string,
+		): ec2.LaunchTemplate => {
+			const template = new ec2.LaunchTemplate(this, id, {
+				instanceType: ec2.InstanceType.of(
+					ec2.InstanceClass.R8G,
+					ec2.InstanceSize.XLARGE,
+				),
+				machineImage: ec2.MachineImage.latestAmazonLinux2023({
+					cpuType: ec2.AmazonLinuxCpuType.ARM_64,
+				}),
+				role: this.ec2Role,
+				securityGroup: this.udpSecurityGroup,
+				userData: ec2.UserData.custom(script),
+				requireImdsv2: true,
+				associatePublicIpAddress: true,
+			})
+			// NLB IPv6 target groups with instance targets require the instance's primary
+			// network interface to have a primary IPv6 address.
+			const cfnTemplate = template.node.defaultChild as ec2.CfnLaunchTemplate
+			cfnTemplate.addPropertyOverride(
+				'LaunchTemplateData.NetworkInterfaces.0.PrimaryIpv6',
+				true,
+			)
+			cfnTemplate.addPropertyOverride(
+				'LaunchTemplateData.NetworkInterfaces.0.Ipv6AddressCount',
+				1,
+			)
+			return template
+		}
 
 		const publicSubnets = this.vpc.selectSubnets({
 			subnetType: ec2.SubnetType.PUBLIC,
@@ -336,35 +391,6 @@ export class StreamingStack extends Stack {
 			throw new Error('No public subnets available')
 		}
 		const primarySubnet = publicSubnets[0]!
-
-		// Create Launch Template explicitly (AWS is deprecating Launch Configurations)
-		const launchTemplate = new ec2.LaunchTemplate(this, 'LaunchTemplate', {
-			instanceType: ec2.InstanceType.of(
-				ec2.InstanceClass.R8G,
-				ec2.InstanceSize.XLARGE,
-			),
-			machineImage: ec2.MachineImage.latestAmazonLinux2023({
-				cpuType: ec2.AmazonLinuxCpuType.ARM_64,
-			}),
-			role: this.ec2Role,
-			securityGroup: this.udpSecurityGroup,
-			userData,
-			requireImdsv2: true,
-			associatePublicIpAddress: true,
-		})
-
-		// NLB IPv6 target groups with instance targets require the instance's primary
-		// network interface to have a primary IPv6 address.
-		const cfnLaunchTemplate = launchTemplate.node
-			.defaultChild as ec2.CfnLaunchTemplate
-		cfnLaunchTemplate.addPropertyOverride(
-			'LaunchTemplateData.NetworkInterfaces.0.PrimaryIpv6',
-			true,
-		)
-		cfnLaunchTemplate.addPropertyOverride(
-			'LaunchTemplateData.NetworkInterfaces.0.Ipv6AddressCount',
-			1,
-		)
 
 		// Fleet generation: scopes the Auto Scaling Groups and their NLB target groups so
 		// a breaking rollout can be deployed as a *full-fleet cutover* instead of a rolling
@@ -384,25 +410,46 @@ export class StreamingStack extends Stack {
 		// existing UDP flows pinned to old targets by stickiness keep being served until
 		// they idle out):
 		//
-		//   1. Cutover deploy: `-c fleetGeneration=<new> -c retainFleetGeneration=<old>`
-		//      creates the new fleet alongside the retained old one. The readiness gate
-		//      below blocks the stable listeners' re-pointing until the new fleet is
-		//      *ingesting-ready* (instances only pass the target-group health check after
-		//      user data has verified the GStreamer elements and built kvssink - see
-		//      cdk/user-data.sh). The retained fleet keeps its (now listener-less) target
-		//      groups and registered instances, so old flows continue to drain through
-		//      the switch instead of being cut off mid-check.
-		//   2. Cleanup deploy: `-c fleetGeneration=<new>` only, once the retained fleet's
-		//      remaining flows have drained past the NLB UDP flow idle timeout - deletes
-		//      the retained fleet.
+		//   1. Cutover deploy: `--fleetGeneration <new> --retainFleetGeneration <old>`
+		//      creates the new fleet alongside the retained old one. The readiness gates
+		//      below block the stable listeners' re-pointing until the new fleet is
+		//      *ingesting-ready* (instances only pass the target-group health checks after
+		//      user data has verified the GStreamer elements and built kvssink, and the
+		//      backend has loaded every SRTP key and bound both listeners - see
+		//      cdk/user-data.sh and backend/src/HealthServer.ts). The retained fleet keeps
+		//      its (now listener-less) target groups, its prior launch-template version,
+		//      and registered instances, so old flows continue to drain through the
+		//      switch instead of being cut off or refreshed mid-check.
+		//   2. Cleanup deploy: `--fleetGeneration <new> --retainFleetGeneration skip`,
+		//      once the retained fleet's remaining flows have drained past the NLB UDP
+		//      flow idle timeout - deletes the retained fleet.
 		//
-		// For THIS update the old fleet is the currently deployed, unsuffixed resources:
-		// deploy with `-c fleetGeneration=gen2 -c retainFleetGeneration=` (empty value =
-		// the legacy unsuffixed IDs) to retain it. The retained legacy ASG picks up this
-		// branch's launch template (rolling in-place refresh), so its instances run the
-		// same new code as the serving fleet - no old/new scheme split during the
-		// overlap. Within an unchanged generation, ordinary stack updates are normal
-		// rolling updates again.
+		// For THIS update the old fleet is the currently deployed, unsuffixed legacy
+		// resources: deploy the cutover with `--fleetGeneration gen2
+		// --retainFleetGeneration ""` (empty value = the legacy unsuffixed IDs). The
+		// retained legacy fleet is byte-identical to what is deployed (its launch
+		// template renders the frozen cdk/user-data-legacy.sh, so CloudFormation sees no
+		// change and never rolls it onto the new code mid-cutover - a refresh would mix
+		// the raw-port-lock/old-stream-name scheme with the slot-lock/new-stream-name
+		// scheme on instances still receiving listener traffic). Within an unchanged
+		// generation, ordinary stack updates are normal rolling updates again.
+		//
+		// The retention context is REQUIRED: without it, deploying this update onto the
+		// legacy stack would remove the unsuffixed ASG, target groups, and old Kinesis
+		// streams from the template in the same update that flips the listeners, and
+		// CloudFormation can delete those still-serving resources before the
+		// readiness-gated listener update completes. 'skip' (no previous generation -
+		// fresh stacks, or the cleanup deploy) is the only way to deploy without
+		// retention.
+		if (retainedGeneration === undefined) {
+			throw new Error(
+				`Missing required context 'retainFleetGeneration': this update migrates the deployed ingest fleet, so every deploy must state what to retain - pass '' (the legacy unsuffixed generation) for the cutover, a previous generation name (e.g. 'gen2') for a later cutover, or 'skip' when there is no previous generation to keep (fresh stacks, or the cleanup deploy after a completed cutover)`,
+			)
+		}
+		if (retainedGeneration === 'skip') {
+			// No retention: 'skip' is the explicit "nothing to retain" choice.
+			retainedGeneration = undefined as string | undefined
+		}
 		if (
 			retainedGeneration !== undefined &&
 			retainedGeneration === servingGeneration
@@ -413,31 +460,47 @@ export class StreamingStack extends Stack {
 		}
 		/** Minimum number of instances each fleet keeps - also the number of healthy
 		 * targets each target group must report before the NLB listeners cut over to it
-		 * (see the FleetCutoverReadiness gate below). */
+		 * (see the FleetCutoverReadiness gates below). */
 		const ASG_MIN_CAPACITY = 2
-		/** How long a newly launched instance may take to pass the target groups' health
-		 * check: cdk/user-data.sh only starts the service (thereby opening the health
-		 * port) after the kvssink build and GStreamer verification, so bootstrap takes
-		 * tens of minutes on a fresh instance. Also bounds the readiness gate's wait. */
-		const ASG_HEALTH_CHECK_GRACE = Duration.minutes(60)
+		/** How long the readiness gates may wait for a freshly launched instance to
+		 * pass its target groups' health checks: cdk/user-data.sh only starts the
+		 * service (thereby opening the health ports) after the kvssink build and
+		 * GStreamer verification, so bootstrap takes tens of minutes on a fresh
+		 * instance. */
+		const FLEET_READINESS_TIMEOUT = Duration.minutes(60)
 
 		/**
-		 * Builds one ingest fleet (an ASG and its 20 NLB target groups, with the fleet's
-		 * instances registered in them) for a generation. An empty generation produces
-		 * the *legacy, unsuffixed* construct IDs (`UDPListenerASG`, `TargetGroup5000`,
-		 * ...) so the currently deployed fleet can be retained - updated in place, never
-		 * replaced - through a cutover; a non-empty generation scopes all of a fleet's
-		 * resources, so bumping it creates a replacement fleet. All fleets share the
-		 * launch template.
+		 * Builds one ingest fleet (an ASG and its NLB target groups, with the fleet's
+		 * instances registered in them) for a generation.
+		 *
+		 * An EMPTY generation produces the *legacy, unsuffixed* fleet
+		 * (`UDPListenerASG`, `TargetGroup5000`, ...): byte-identical to what the
+		 * pre-SRTP stack deployed (launch template rendering the frozen legacy user
+		 * data, ELB health checks with the original 5-minute grace, the ten unencrypted
+		 * target groups only), so a retention deploy renders a no-op for it - no
+		 * launch-template version bump, no rolling refresh, no property drift that
+		 * could trigger replacement mid-cutover. The legacy fleet has no SRTP target
+		 * groups at all (the pre-SRTP stack had none).
+		 *
+		 * A non-empty generation scopes all of a fleet's resources (bumping it creates
+		 * a replacement fleet) and uses EC2 health checks: with ELB checks, ANY
+		 * attached target group - including a transport-specific failure such as SRTP
+		 * keys unavailable keeping port 9998 closed - would mark the instance unhealthy
+		 * and put the fleet into replacement churn, defeating the intended isolation
+		 * of SRTP failures from the unencrypted path. EC2 checks still replace
+		 * instances on real instance-level failures; transport readiness is the NLB's
+		 * and the cutover gates' job, not the ASG's.
 		 */
 		const createIngestFleet = (
 			generation: string,
+			launchTemplate: ec2.LaunchTemplate,
 		): {
 			asg: autoscaling.AutoScalingGroup
 			unencryptedTargetGroups: elbv2.NetworkTargetGroup[]
 			srtpTargetGroups: elbv2.NetworkTargetGroup[]
 		} => {
-			const suffix = generation === '' ? '' : `-${generation}`
+			const isLegacy = generation === ''
+			const suffix = isLegacy ? '' : `-${generation}`
 			const asg = new autoscaling.AutoScalingGroup(
 				this,
 				`UDPListenerASG${suffix}`,
@@ -454,13 +517,18 @@ export class StreamingStack extends Stack {
 					}),
 				},
 			)
-			// Use ELB health checks (the NLB target groups') so the ASG only considers an
-			// instance healthy once its health port answers - which cdk/user-data.sh only
-			// opens after the instance can actually ingest. The grace period must cover
-			// the full bootstrap, including the kvssink build.
 			const cfnAsg = asg.node.defaultChild as autoscaling.CfnAutoScalingGroup
-			cfnAsg.healthCheckType = 'ELB'
-			cfnAsg.healthCheckGracePeriod = ASG_HEALTH_CHECK_GRACE.toSeconds()
+			if (isLegacy) {
+				// Byte-compatible with the deployed legacy ASG: any change here would
+				// be an update to the retained fleet in the cutover deploy.
+				cfnAsg.healthCheckType = 'ELB'
+				cfnAsg.healthCheckGracePeriod = Duration.minutes(5).toSeconds()
+			} else {
+				// See the doc comment above: EC2 health keeps a transport-specific
+				// readiness failure (e.g. SRTP keys unavailable) from churning the
+				// whole fleet.
+				cfnAsg.healthCheckType = 'EC2'
+			}
 
 			const createTargetGroup = (
 				id: string,
@@ -501,10 +569,15 @@ export class StreamingStack extends Stack {
 				)
 			}
 			const srtpTargetGroups: elbv2.NetworkTargetGroup[] = []
-			for (let port = 6000; port <= 6009; port++) {
-				srtpTargetGroups.push(
-					createTargetGroup(`SrtpTargetGroup${port}${suffix}`, port, 9998),
-				)
+			if (!isLegacy) {
+				// The legacy (pre-SRTP) stack had no SRTP target groups - the retained
+				// legacy fleet must keep exactly its original ten, or the cutover deploy
+				// would change (and refresh) it.
+				for (let port = 6000; port <= 6009; port++) {
+					srtpTargetGroups.push(
+						createTargetGroup(`SrtpTargetGroup${port}${suffix}`, port, 9998),
+					)
+				}
 			}
 			// Register the fleet's instances in all of its target groups
 			for (const targetGroup of [
@@ -519,11 +592,28 @@ export class StreamingStack extends Stack {
 		// The serving fleet receives all listener traffic; the (optional) retained fleet
 		// stays alive through a cutover without any listeners pointing at it (created for
 		// its side effects: its ASG keeps its instances registered in its target groups
-		// so draining flows are served until the cleanup deploy removes it).
-		const servingFleet = createIngestFleet(servingGeneration)
+		// so draining flows are served until the cleanup deploy removes it). The legacy
+		// retained fleet uses the frozen legacy launch template (construct ID
+		// 'LaunchTemplate', byte-identical to the deployed one); every other fleet uses
+		// a generation-scoped template with the current user data.
+		const servingFleet = createIngestFleet(
+			servingGeneration,
+			createFleetLaunchTemplate(
+				`LaunchTemplate-${servingGeneration}`,
+				userDataScript,
+			),
+		)
 		this.autoScalingGroup = servingFleet.asg
 		if (retainedGeneration !== undefined) {
-			createIngestFleet(retainedGeneration)
+			createIngestFleet(
+				retainedGeneration,
+				retainedGeneration === ''
+					? createFleetLaunchTemplate('LaunchTemplate', legacyUserDataScript)
+					: createFleetLaunchTemplate(
+							`LaunchTemplate-${retainedGeneration}`,
+							userDataScript,
+						),
+			)
 		}
 
 		const eip = new ec2.CfnEIP(this, 'NLB-EIP', {
@@ -558,14 +648,16 @@ export class StreamingStack extends Stack {
 
 		// Create UDP listeners for ports 5000-5009, forwarding to the *serving* fleet's
 		// target groups (the listener IDs are stable across generations - a cutover
-		// updates the listeners' default actions, never replaces them).
-		const nlbListeners: elbv2.NetworkListener[] = []
+		// updates the listeners' default actions, never replaces them). The listener
+		// sets are kept separate by transport so each can be gated on its own
+		// transport's readiness below.
+		const unencryptedListeners: elbv2.NetworkListener[] = []
 		for (const [
 			i,
 			targetGroup,
 		] of servingFleet.unencryptedTargetGroups.entries()) {
 			const port = 5000 + i
-			nlbListeners.push(
+			unencryptedListeners.push(
 				this.networkLoadBalancer.addListener(`UDPListener${port}`, {
 					port,
 					protocol: elbv2.Protocol.UDP,
@@ -575,9 +667,10 @@ export class StreamingStack extends Stack {
 		}
 
 		// Same for the SRTP ports 6000-6009
+		const srtpListeners: elbv2.NetworkListener[] = []
 		for (const [i, targetGroup] of servingFleet.srtpTargetGroups.entries()) {
 			const port = 6000 + i
-			nlbListeners.push(
+			srtpListeners.push(
 				this.networkLoadBalancer.addListener(`SrtpUDPListener${port}`, {
 					port,
 					protocol: elbv2.Protocol.UDP,
@@ -586,29 +679,41 @@ export class StreamingStack extends Stack {
 			)
 		}
 
-		// Deployment-time readiness gate for the fleet cutover: the ASG resource alone
-		// reaching CREATE_COMPLETE proves nothing about the *instances* - they may still
-		// be bootstrapping, so re-pointing the stable listeners at the new target groups
-		// at that point can leave every listener with zero healthy targets (a full ingest
-		// outage). This gate blocks the listener update until every target group of the
-		// serving generation reports at least ASG_MIN_CAPACITY healthy targets - the
-		// same per-transport TCP health checks (9999 unencrypted, 9998 SRTP) the NLB
-		// itself uses, which instances only pass once their user data has verified the
-		// GStreamer elements and built kvssink (see cdk/user-data.sh) and the backend has
-		// loaded the SRTP keys and bound both listeners (see backend/src/HealthServer.ts)
-		// - so the cutover flips traffic only to a fleet that is
-		// genuinely ready to ingest.
+		// Deployment-time readiness gates for the fleet cutover, one per transport:
+		// the ASG resource alone reaching CREATE_COMPLETE proves nothing about the
+		// *instances* - they may still be bootstrapping, so re-pointing the stable
+		// listeners at the new target groups at that point can leave every listener with
+		// zero healthy targets (a full ingest outage). Each gate blocks its own
+		// transport's listener updates until every target group of the serving
+		// generation for THAT transport reports at least ASG_MIN_CAPACITY healthy
+		// targets - the same per-transport TCP health checks (9999 unencrypted, 9998
+		// SRTP) the NLB itself uses, which instances only pass once their user data has
+		// verified the GStreamer elements and built kvssink (see cdk/user-data.sh) and
+		// the backend has loaded every SRTP key and bound both listeners (see
+		// backend/src/HealthServer.ts) - so the cutover flips traffic only to a fleet
+		// that is genuinely ready to ingest.
 		//
-		// The CDK custom-resource provider framework drives the wait: isComplete is
-		// polled once a minute for up to ASG_HEALTH_CHECK_GRACE (an hour, covering the
-		// long instance bootstrap including the kvssink build). Transient
-		// DescribeTargetHealth errors are treated as "not ready yet" and retried on the
-		// next interval, and if a handler throws or the fleet never becomes ready, the
-		// framework itself sends CloudFormation a bounded FAILED response (never a
-		// hung update) and the deployment rolls back - with the retained old fleet still
-		// sole receiver until the verified flip. The gate is scoped by the serving
-		// generation so each cutover runs a fresh check; within an unchanged generation
-		// its properties are stable, so ordinary stack updates do not re-run it.
+		// Splitting the gates by transport keeps an SRTP-only dependency failure
+		// (e.g. keys not yet provisioned) from delaying the *unencrypted* listeners'
+		// re-pointing behind SRTP readiness: each listener set waits only on its own
+		// transport's target groups. Note that fleet-wide SRTP readiness remains a
+		// *deployment requirement* of the cutover by design: if the SRTP gate ultimately
+		// fails, the stack update fails and rolls back as a whole - a cutover onto a
+		// fleet that cannot ingest SRTP traffic must not silently proceed. Provision
+		// every port's key (see scripts/provision-srtp-key.sh and
+		// docs/TESTING-SRTP-INGESTION.md) before deploying one.
+		//
+		// The CDK custom-resource provider framework drives each wait: isComplete is
+		// polled once a minute for up to FLEET_READINESS_TIMEOUT (an hour, covering
+		// the long instance bootstrap including the kvssink build). Transient
+		// DescribeTargetHealth errors are treated as "not ready yet" and retried on
+		// the next interval, and if a handler throws or the fleet never becomes ready,
+		// the framework itself sends CloudFormation a bounded FAILED response (never a
+		// hung update) and the deployment rolls back - with the retained old fleet
+		// still sole receiver until the verified flip. The gates are scoped by the
+		// serving generation so each cutover runs fresh checks; within an unchanged
+		// generation their properties are stable, so ordinary stack updates do not
+		// re-run them.
 		const fleetReadinessEntry = join(
 			__dirname,
 			'..',
@@ -668,41 +773,54 @@ export class StreamingStack extends Stack {
 				onEventHandler: fleetReadinessOnEvent,
 				isCompleteHandler: fleetReadinessIsComplete,
 				queryInterval: Duration.minutes(1),
-				totalTimeout: ASG_HEALTH_CHECK_GRACE,
+				totalTimeout: FLEET_READINESS_TIMEOUT,
 			},
 		)
 		// (A raw CfnResource with a Custom:: type - the L2 CustomResource's type
 		// declarations are truncated in this aws-cdk-lib version; ServiceToken is what
 		// CloudFormation's custom-resource framework reads, everything else passes
 		// through to the provider's onEvent/isComplete handlers.)
-		const fleetCutoverReadiness = new CfnResource(
-			this,
-			`FleetCutoverReadinessCR-${servingGeneration}`,
-			{
+		const createReadinessGate = (
+			id: string,
+			targetGroups: elbv2.NetworkTargetGroup[],
+		): CfnResource =>
+			new CfnResource(this, id, {
 				type: 'Custom::FleetCutoverReadiness',
 				properties: {
 					ServiceToken: fleetCutoverReadinessProvider.serviceToken,
-					TargetGroupArns: [
-						...servingFleet.unencryptedTargetGroups.map(
-							(targetGroup) => targetGroup.targetGroupArn,
-						),
-						...servingFleet.srtpTargetGroups.map(
-							(targetGroup) => targetGroup.targetGroupArn,
-						),
-					],
+					TargetGroupArns: targetGroups.map(
+						(targetGroup) => targetGroup.targetGroupArn,
+					),
 					MinHealthyTargets: ASG_MIN_CAPACITY,
 				},
-			},
+			})
+		const unencryptedReadinessGate = createReadinessGate(
+			`FleetCutoverReadinessUnencryptedCR-${servingGeneration}`,
+			servingFleet.unencryptedTargetGroups,
 		)
-		// The gate runs once the serving ASG exists (it registers the instances into the
-		// target groups it depends on), and the listeners depend on the gate - so the
-		// cutover order is: new fleet up and ingest-ready -> listeners flip -> the
-		// retained old fleet (still serving its draining flows, untouched by this
-		// update) is removed on the next deploy. Within an unchanged generation this
-		// dependency chain is a no-op.
-		fleetCutoverReadiness.node.addDependency(this.autoScalingGroup)
-		for (const listener of nlbListeners) {
-			listener.node.addDependency(fleetCutoverReadiness)
+		const srtpReadinessGate =
+			servingFleet.srtpTargetGroups.length > 0
+				? createReadinessGate(
+						`FleetCutoverReadinessSrtpCR-${servingGeneration}`,
+						servingFleet.srtpTargetGroups,
+					)
+				: undefined
+		// Each gate runs once the serving ASG exists (it registers the instances into
+		// the target groups it depends on), and each listener set depends on its own
+		// transport's gate - so the cutover order per transport is: new fleet up and
+		// ingest-ready -> that transport's listeners flip -> the retained old fleet
+		// (still serving its draining flows, untouched by this update) is removed on
+		// the next deploy. Within an unchanged generation these dependency chains are
+		// a no-op.
+		unencryptedReadinessGate.node.addDependency(this.autoScalingGroup)
+		for (const listener of unencryptedListeners) {
+			listener.node.addDependency(unencryptedReadinessGate)
+		}
+		if (srtpReadinessGate !== undefined) {
+			srtpReadinessGate.node.addDependency(this.autoScalingGroup)
+			for (const listener of srtpListeners) {
+				listener.node.addDependency(srtpReadinessGate)
+			}
 		}
 
 		// Lambda: set streams to inactive when marked active but no frame in 5 minutes

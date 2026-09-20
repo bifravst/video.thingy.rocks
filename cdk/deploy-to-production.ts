@@ -42,10 +42,11 @@ const options = commandLineArgs([
 	},
 	{
 		// Retains the previous ingest fleet (and, for the empty legacy value, the old
-		// Kinesis Video Streams) through the cutover deploy; drop it on the cleanup
-		// deploy once the old fleet's flows have drained. Pass an EMPTY value
-		// (--retainFleetGeneration "") to retain the currently deployed, unsuffixed
-		// legacy resources.
+		// Kinesis Video Streams) through the cutover deploy. REQUIRED on every deploy:
+		// pass "" (empty) to retain the currently deployed unsuffixed legacy resources
+		// (the migration cutover), a previous generation name (e.g. "gen2") for a later
+		// cutover, or "skip" when there is nothing to retain (fresh stacks, or the
+		// cleanup deploy once the retained fleet's flows have drained).
 		name: 'retainFleetGeneration',
 		type: String,
 	},

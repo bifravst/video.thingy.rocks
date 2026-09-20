@@ -41,9 +41,17 @@ export const onEvent = async (
 	const minHealthyTargets = Number(
 		event.ResourceProperties.MinHealthyTargets ?? 0,
 	)
-	if (targetGroupArns.length === 0 || minHealthyTargets <= 0) {
+	// Number() happily yields NaN or Infinity for malformed input, and NaN passes a
+	// naive `<= 0` check while making every `healthyCount < NaN` comparison false -
+	// a malformed property would report the fleet ready without validating anything.
+	// Require a positive integer.
+	if (
+		targetGroupArns.length === 0 ||
+		!Number.isInteger(minHealthyTargets) ||
+		minHealthyTargets <= 0
+	) {
 		throw new Error(
-			'ResourceProperties must include TargetGroupArns and a positive MinHealthyTargets',
+			'ResourceProperties must include TargetGroupArns and a positive integer MinHealthyTargets',
 		)
 	}
 	return {}
@@ -64,6 +72,19 @@ export const isComplete = async (
 	const minHealthyTargets = Number(
 		event.ResourceProperties.MinHealthyTargets ?? 0,
 	)
+	// Re-validated here (not just in onEvent): a NaN/Infinity threshold would make
+	// every health comparison below false and report the fleet ready without checking
+	// anything. Throwing makes the provider framework send CloudFormation a bounded
+	// FAILED response.
+	if (
+		!Number.isInteger(minHealthyTargets) ||
+		minHealthyTargets <= 0 ||
+		targetGroupArns.length === 0
+	) {
+		throw new Error(
+			'ResourceProperties must include TargetGroupArns and a positive integer MinHealthyTargets',
+		)
+	}
 
 	const unhealthy: string[] = []
 	for (const targetGroupArn of targetGroupArns) {
