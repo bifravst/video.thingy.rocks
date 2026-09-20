@@ -298,6 +298,12 @@ export class StreamMetadataService {
 	 * for the affected slot's DynamoDB item and restart the backend - its in-memory ROC
 	 * estimate for the port lives until the process restarts (see
 	 * KinesisIngestionPipeline.seedSrtpRoc).
+	 *
+	 * Note that the {roc: 0, highestSeq: 0} returned for a cleared or identity-mismatched
+	 * item is a fresh-session *sentinel*, not a real observed state:
+	 * KinesisIngestionPipeline.seedSrtpRoc deliberately does not install it as a tracked
+	 * baseline, so the first observed datagram is classified by advanceSrtpRoc's genuine
+	 * first-packet branch instead of against an artificial zero baseline.
 	 */
 	async getSrtpRocState(
 		port: number,

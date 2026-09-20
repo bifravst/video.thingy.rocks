@@ -73,6 +73,23 @@ void describe('KinesisIngestionPipeline', () => {
 			assert.deepStrictEqual(state, { highestSeq: 100, roc: 0 })
 		})
 
+		void it('classifies any first sequence from a {0,0} baseline as ROC 0, matching a never-seen port', () => {
+			// A {roc: 0, highestSeq: 0} state can arrive from a cleared or
+			// identity-mismatched persisted item (see
+			// StreamMetadataService.getSrtpRocState) and must classify the first observed
+			// datagram exactly like the uninitialized (undefined-state) branch does - or
+			// a fresh sender whose randomized starting sequence is in the upper half of
+			// the 16-bit space would be misclassified as already one rollover ahead,
+			// persisted as such, and seed the *next* restart one ROC too high (which
+			// srtpdec cannot decrypt until the sender wraps again).
+			for (const seq of [1, 0x7fff, 0x8000, 40000, 0xffff]) {
+				assert.deepStrictEqual(advanceSrtpRoc({ highestSeq: 0, roc: 0 }, seq), {
+					highestSeq: seq,
+					roc: 0,
+				})
+			}
+		})
+
 		void it('does not increment ROC for ordinary forward progress', () => {
 			let state = advanceSrtpRoc(undefined, 100)
 			state = advanceSrtpRoc(state, 101)
@@ -395,6 +412,40 @@ void describe('KinesisIngestionPipeline', () => {
 			const state = pipeline.getSrtpRocState(6000)
 			assert.strictEqual(state.roc, 5)
 			assert.strictEqual(state.highestSeq, 40000)
+		})
+
+		void it('tracks a fresh sender at ROC 0 after seeding the {0,0} fresh-session sentinel', () => {
+			// End-to-end guard for the sentinel StreamMetadataService.getSrtpRocState
+			// returns for a cleared/identity-mismatched persisted item: seeding it must
+			// leave a fresh sender's first datagram (with a randomized starting sequence,
+			// here well above the midpoint) classified at ROC 0 - never one rollover ahead,
+			// which would later be persisted and make the next restart undecryptable.
+			// seedSrtpRoc deliberately does not install {0,0} as a tracked baseline (the
+			// first packet takes advanceSrtpRoc's genuine first-packet branch instead),
+			// and the spec above locks in that the heuristic agrees even if it did.
+			const keyStore = {
+				getKeyForPort: () => ({
+					keyHex: 'a'.repeat(60),
+					ssrc: 42,
+					cipher: 'x',
+					auth: 'y',
+				}),
+			} as unknown as SrtpKeyStore
+			const pipeline = new KinesisIngestionPipeline({
+				region: 'eu-central-1',
+				portRange: { start: 5000, end: 5009 },
+				srtp: { portRange: { start: 6000, end: 6009 }, keyStore },
+			})
+			pipeline.seedSrtpRoc(6000, { roc: 0, highestSeq: 0 })
+			const datagram = Buffer.alloc(12)
+			datagram[0] = 0x80 // RTP version 2
+			datagram.writeUInt32BE(42, 8)
+			datagram.writeUInt16BE(40000, 2)
+			pipeline.trackSrtpRoc(6000, datagram)
+			assert.deepStrictEqual(pipeline.getSrtpRocState(6000), {
+				highestSeq: 40000,
+				roc: 0,
+			})
 		})
 	})
 })

@@ -77,10 +77,14 @@ const SRTP_REPLAY_BATCH_PAUSE_MS = 10
  * release/retry it. Generous (matches stop()'s own exit-wait budget) since a slow-but-normal
  * startup shouldn't be mistaken for a hang. */
 const FIFO_OPEN_TIMEOUT_MS = 15_000
-/** Bounds how long shutdown()'s sweep waits for a still-running GStreamer child to exit
- * after SIGTERM before escalating to SIGKILL - matches stop()'s own exit-wait budget, so
- * shutdown cannot hang indefinitely on a child that refuses to die. */
+/** Bounds how long killAndWait waits for a still-running GStreamer child to exit after
+ * SIGTERM before escalating to SIGKILL - matches stop()'s EOS grace-wait budget, so no
+ * caller can hang indefinitely on a child that refuses to die. */
 const CHILD_EXIT_TIMEOUT_MS = 15_000
+/** Grace period for a child's exit event to arrive after SIGKILL: SIGKILL cannot be
+ * caught or ignored, but reaping the child (and delivering its 'exit' event) is still
+ * asynchronous, so this bounds the final wait in killAndWait. */
+const CHILD_SIGKILL_GRACE_MS = 1_000
 
 type ReorderState = {
 	nextSeq: number
@@ -480,6 +484,21 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	seedSrtpRoc(port: number, seeded: SrtpRocState): void {
 		const state = this.srtpRocByPort.get(port)
 		if (!state) {
+			// {roc: 0, highestSeq: 0} here is not a real observed state - it is what
+			// StreamMetadataService.getSrtpRocState returns for a missing or
+			// identity-mismatched (e.g. cleared, or key/SSRC-rotated) persisted item: a
+			// fresh-session *sentinel*. Installing it as an initialized baseline would
+			// make the first observed datagram bypass advanceSrtpRoc's genuine
+			// first-packet branch and be classified against that baseline instead. The
+			// current nearest-index heuristic happens to produce ROC 0 from a {0,0}
+			// baseline for any first sequence number (locked in by the spec), so the two
+			// are equivalent today - but conflating "initialized" with "fresh" like that
+			// is exactly the kind of implicit invariant a future heuristic change could
+			// silently break into an off-by-one-ROC misclassification, which would then
+			// be persisted and seed the *next* restart one rollover too high (undecryptable
+			// until the sender wraps again). Leave tracking uninitialized instead: a
+			// fresh session's first observed datagram is advanceSrtpRoc's job to start.
+			if (seeded.roc === 0 && seeded.highestSeq === 0) return
 			this.srtpRocByPort.set(port, seeded)
 			return
 		}
@@ -850,13 +869,18 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			// Nothing was registered in activePipelines yet - clean up the child/FIFO and
 			// rethrow so start()'s caller (index.ts's startPipelineOrReleaseLock) treats this
 			// as a failed start and releases the Kinesis lock instead of holding it forever.
+			// The child is killed and its actual exit *awaited* (escalating to SIGKILL if
+			// needed - see killAndWait) *before* it is removed from spawnedGst: untracking a
+			// still-live child here would leave it running with no owner AND invisible to
+			// shutdown()'s orphan sweep, free to keep writing to the Kinesis stream after
+			// this instance has already released its lock.
 			this.logger.error(
 				'Failed to open FIFO for GStreamer within the startup window',
 				err instanceof Error ? err : new Error(String(err)),
 				{ port, streamName, fifoPath },
 			)
+			await this.killAndWait(gst, { port, pid: gst.pid, fifoPath })
 			this.spawnedGst.delete(gst)
-			gst.kill('SIGTERM')
 			try {
 				fs.unlinkSync(fifoPath)
 			} catch {
@@ -1425,8 +1449,58 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	}
 
 	/**
+	 * Waits (bounded) for a child's 'exit' event. Returns immediately if the child has
+	 * already exited.
+	 */
+	private async waitForChildExit(
+		gst: ReturnType<typeof spawn>,
+		timeoutMs: number,
+	): Promise<void> {
+		if (gst.exitCode !== null || gst.signalCode !== null) return
+		await new Promise<void>((resolve) => {
+			const t = setTimeout(resolve, timeoutMs)
+			gst.once('exit', () => {
+				clearTimeout(t)
+				resolve()
+			})
+		})
+	}
+
+	/**
+	 * Ensures a GStreamer child is *actually gone* before returning: SIGTERM (idempotent,
+	 * and the first real signal for paths that never sent one - e.g. stop()'s FIFO arm,
+	 * which first gives filesrc a natural EOS), a bounded wait for the exit event, then
+	 * SIGKILL, with a short bounded wait for that too.
+	 *
+	 * kill() only *signals* the process; every path that releases stream ownership (stop(),
+	 * a failed FIFO startup, shutdown()'s orphan sweep) must wait for the real exit, or a
+	 * still-draining kvssink producer can outlive its owner and keep writing while another
+	 * instance acquires the same Kinesis stream - exactly the competing-producer problem
+	 * the lock exists to prevent. A child that failed to spawn (missing binary/plugin)
+	 * never had a process to signal - its 'error' event has already fired and been
+	 * consumed by the start path's own handler - so there is nothing to wait for.
+	 */
+	private async killAndWait(
+		gst: ReturnType<typeof spawn>,
+		logContext: Record<string, unknown>,
+	): Promise<void> {
+		if (gst.pid === undefined) return
+		gst.kill('SIGTERM')
+		await this.waitForChildExit(gst, CHILD_EXIT_TIMEOUT_MS)
+		if (gst.exitCode !== null || gst.signalCode !== null) return
+		this.logger.warn(
+			'GStreamer child did not exit after SIGTERM; sending SIGKILL',
+			logContext,
+		)
+		gst.kill('SIGKILL')
+		await this.waitForChildExit(gst, CHILD_SIGKILL_GRACE_MS)
+	}
+
+	/**
 	 * Stops the pipeline for a port: flushes reorder buffer (FIFO) or closes the relay
-	 * socket (SRTP), then waits for process exit.
+	 * socket (SRTP), then waits for process exit, escalating to SIGKILL (bounded) if the
+	 * child does not exit - so callers only release the Kinesis lock / hand the slot over
+	 * once the producer is really gone.
 	 */
 	async stop(port: number): Promise<void> {
 		const pipeline = this.activePipelines.get(port)
@@ -1479,7 +1553,13 @@ export class KinesisIngestionPipeline extends EventEmitter {
 				error: err instanceof Error ? err.message : String(err),
 			})
 		}
-		gst.kill('SIGTERM')
+		// The wait above was the EOS/SIGTERM grace period; if it timed out without the
+		// child exiting, escalate (SIGTERM again - for the FIFO arm it is the first real
+		// signal, since its only prior prompt to exit was the natural EOS - then SIGKILL)
+		// and wait for the *actual* exit before returning: callers release the Kinesis
+		// lock / hand the slot over next, and a resistant kvssink producer that outlives
+		// this owner is exactly the competing-producer problem the lock exists to prevent.
+		await this.killAndWait(gst, { port, pid: gst.pid })
 		this.logger.info('Kinesis ingestion stopped', { port })
 	}
 
@@ -1501,14 +1581,14 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	 * process.exit() does not signal children - is swept from spawnedGst so no orphaned
 	 * kvssink producer keeps writing to Kinesis with no owner.
 	 *
-	 * The sweep *waits* for each swept child to actually exit, with a bounded timeout and
-	 * forced termination: kill() only signals the process (asynchronously), so returning
-	 * while a child is still draining would let index.ts release its Kinesis lock and
-	 * process.exit(0) underneath it - the still-running producer would keep writing to
-	 * the stream while another instance acquires it, exactly the competing-producer
-	 * problem the lock exists to prevent. The exit/error handlers registered at spawn
-	 * remove each child from spawnedGst as soon as it is gone, so the snapshot below only
-	 * ever contains genuinely still-running children.
+	 * The sweep *waits* for each swept child to actually exit (via killAndWait), with a
+	 * bounded timeout and forced termination: kill() only signals the process
+	 * (asynchronously), so returning while a child is still draining would let index.ts
+	 * release its Kinesis lock and process.exit(0) underneath it - the still-running
+	 * producer would keep writing to the stream while another instance acquires it,
+	 * exactly the competing-producer problem the lock exists to prevent. The exit/error
+	 * handlers registered at spawn remove each child from spawnedGst as soon as it is
+	 * gone, so the snapshot below only ever contains genuinely still-running children.
 	 */
 	async shutdown(): Promise<void> {
 		this.closed = true
@@ -1520,28 +1600,9 @@ export class KinesisIngestionPipeline extends EventEmitter {
 				{ children: stillRunning.length },
 			)
 		}
-		for (const gst of stillRunning) {
-			gst.kill('SIGTERM')
-		}
 		await Promise.all(
 			stillRunning.map(async (gst) => {
-				await new Promise<void>((resolve) => {
-					const timeout = setTimeout(() => {
-						this.logger.warn(
-							'GStreamer child did not exit after SIGTERM; sending SIGKILL',
-							{ pid: gst.pid },
-						)
-						gst.kill('SIGKILL')
-						// SIGKILL cannot be caught or ignored, but reaping the child is
-						// still asynchronous - give the exit event a brief moment to
-						// arrive before giving up on it entirely.
-						setTimeout(resolve, 1_000)
-					}, CHILD_EXIT_TIMEOUT_MS)
-					gst.once('exit', () => {
-						clearTimeout(timeout)
-						resolve()
-					})
-				})
+				await this.killAndWait(gst, { pid: gst.pid })
 			}),
 		)
 	}
