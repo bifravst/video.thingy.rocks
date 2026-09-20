@@ -50,7 +50,11 @@ fi
 # else either breaks the JSON below (e.g. "abc", or "0123" which JSON forbids as a leading
 # zero) or gets silently rejected later by backend/src/SrtpKeyStore.ts's own uint32 check.
 # Catch it here so this script doesn't report success for a value that will never work.
-if ! [[ "$SSRC" =~ ^(0|[1-9][0-9]*)$ ]] || [ "$SSRC" -gt 4294967295 ]; then
+# Values longer than 10 decimal digits are rejected by *string length* first: they can
+# never be <= 4294967295, and bash's `[` cannot compare them as integers at all (it
+# prints "integer expression expected" and exits with an error status, which the `if`
+# below then treats as a false condition - letting the invalid value through).
+if ! [[ "$SSRC" =~ ^(0|[1-9][0-9]*)$ ]] || [ "${#SSRC}" -gt 10 ] || [ "$SSRC" -gt 4294967295 ]; then
   echo "Error: ssrc must be a canonical decimal uint32 (0-4294967295, no leading zeros)"
   exit 1
 fi

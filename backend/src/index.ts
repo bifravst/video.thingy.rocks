@@ -424,6 +424,38 @@ const startPipelineOrReleaseLock = async (
 		(portGeneration.get(port) ?? 0) !== generation ||
 		!kinesisLockHeldForPorts.has(port)
 
+	// The local ownership set above can be stale: during a DynamoDB outage long enough for
+	// the row's heartbeat to expire, another instance can acquire this slot while this
+	// process still believes it holds it (the heartbeat *writes* were failing, not the
+	// local bookkeeping). Before spawning another producer - most importantly from the
+	// delayed 'pipelineExited' restart - confirm ownership of the actual DynamoDB row:
+	// tryAcquireKinesisLock is idempotent for the current owner (and re-claims an
+	// expired-but-uncontested row, refreshing its heartbeat); only a *different* owner's
+	// row makes it fail. A transient DynamoDB error is treated like any other failed start
+	// rather than guessing - spawning without confirmation is exactly the
+	// competing-producer problem the lock exists to prevent.
+	let stillOwner: boolean
+	try {
+		stillOwner = await streamMetadataService.tryAcquireKinesisLock(
+			slot,
+			instanceId,
+		)
+	} catch (err) {
+		console.error(
+			`[Main] Error confirming Kinesis lock ownership for port ${port}:`,
+			err,
+		)
+		stillOwner = false
+	}
+	if (!stillOwner) {
+		console.error(
+			`[Main] No longer the owner of the Kinesis lock for port ${port}; abandoning pipeline start`,
+		)
+		await relinquishPort(port)
+		return
+	}
+	if (isStale()) return // ownership changed while awaiting DynamoDB; abandon
+
 	if (kinesisIngestionPipeline.isSrtpPort(port)) {
 		// Seed from persisted state before spawning - a fresh srtpdec instance always starts
 		// at ROC 0 otherwise, which breaks decryption after any sequence-number rollover in
@@ -511,13 +543,18 @@ const createPacketHandler = (
 	 * secret; a deliberate spoofer who knows it can pass this check trivially - see that
 	 * function's own doc comment; a fully watertight fix needs per-packet auth feedback from
 	 * srtpdec, which this gst-launch-1.0-based architecture doesn't expose). For unencrypted
-	 * ports, or when there's no key loaded yet to validate against, always true (unchanged
-	 * behavior - start() already refuses and reports a missing key separately).
+	 * ports, always true. For an SRTP port with no key loaded (SSM missing/failed - keys are
+	 * resolved once at process start), the port can never ingest anything, so *nothing* is
+	 * admitted: letting arbitrary datagrams through would mark the stream active, fill the
+	 * pre-start buffer, and temporarily acquire the shared slot lock before pipeline startup
+	 * rejects the missing key - denying the paired unencrypted port the slot it could
+	 * legitimately use for that whole window. Datagrams on such a port are ignored
+	 * entirely (no stream activity, no buffering, no lock attempts).
 	 */
 	const looksPlausibleRtp = (port: number, data: Buffer): boolean => {
 		if (!kinesisIngestionPipeline || !rangeConfig.isSrtp) return true
 		const ssrc = kinesisIngestionPipeline.getConfiguredSrtpSsrc(port)
-		if (ssrc === undefined) return true
+		if (ssrc === undefined) return false
 		return parseAuthenticRtpSequenceNumber(data, ssrc) !== undefined
 	}
 
@@ -565,8 +602,14 @@ const createPacketHandler = (
 			// Cap buffered bytes while a port is backing off after a failed start (see
 			// startPipelineOrReleaseLock) - a long backoff window against a high-bitrate
 			// source shouldn't retain unbounded memory just because we're not retrying yet.
+			// The newest chunk is always preserved (length > 1, like the other bounded
+			// queues): with KINESIS_MIN_BYTES_BEFORE_START configured below half a
+			// datagram's size - including zero - a "drop until under the cap" loop that
+			// could empty the buffer would discard every packet right after buffering it,
+			// so the threshold check starts the pipeline with empty initialData and the
+			// first packet is lost.
 			const maxBufferedBytes = rangeConfig.minBytesBeforeStart * 2
-			while (buf.totalBytes > maxBufferedBytes && buf.chunks.length > 0) {
+			while (buf.totalBytes > maxBufferedBytes && buf.chunks.length > 1) {
 				const dropped = buf.chunks.shift()
 				if (dropped !== undefined) buf.totalBytes -= dropped.length
 			}
@@ -1244,6 +1287,14 @@ const start = async (): Promise<void> => {
 
 	try {
 		await ensureAwsCredentials()
+		// Start the health server and the unencrypted MPEG-TS listener *before* the
+		// optional SRTP key loading below: during an SSM outage or throttling, its SDK
+		// retries and connection timeouts can stall startup for minutes - the existing
+		// ingest path (and health checks) must not wait on an additive dependency of the
+		// SRTP ports alone.
+		await healthServer.start()
+		await udpListener.start()
+
 		if (srtpEnabled && srtpKeyStore) {
 			const ports: number[] = []
 			for (
@@ -1257,7 +1308,9 @@ const start = async (): Promise<void> => {
 			// here must not abort startup of the unencrypted MPEG-TS path (5000-5009), which
 			// does not depend on SRTP keys at all. SRTP ports will simply have no key loaded
 			// (KinesisIngestionPipeline already logs and refuses ingestion per-port when that
-			// happens) until this is retried on the next restart.
+			// happens - and index.ts's looksPlausibleRtp admits no traffic at all for a
+			// keyless SRTP port, so nothing is buffered or lock-attempted for it) until this
+			// is retried on the next restart.
 			try {
 				await srtpKeyStore.loadPorts(ports)
 			} catch (err) {
@@ -1267,8 +1320,6 @@ const start = async (): Promise<void> => {
 				)
 			}
 		}
-		await healthServer.start()
-		await udpListener.start()
 		if (srtpUdpListener) {
 			// Isolated from the rest of startup, same rationale as the SRTP key-loading block
 			// above: UDPListener.start() rejects if any port in its range permanently fails to

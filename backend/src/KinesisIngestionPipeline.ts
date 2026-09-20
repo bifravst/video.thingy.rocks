@@ -96,6 +96,9 @@ const SRTP_REPLAY_BATCH_PAUSE_MS = 10
  * release/retry it. Generous (matches stop()'s own exit-wait budget) since a slow-but-normal
  * startup shouldn't be mistaken for a hang. */
 const FIFO_OPEN_TIMEOUT_MS = 15_000
+/** How often runStartForFifoPort re-probes whether GStreamer's filesrc has opened the FIFO
+ * for reading yet (see openFifoWriterFd's nonblocking probe). */
+const FIFO_OPEN_PROBE_INTERVAL_MS = 50
 /** Bounds how long killAndWait waits for a still-running GStreamer child to exit after
  * SIGTERM before escalating to SIGKILL - matches stop()'s EOS grace-wait budget, so no
  * caller can hang indefinitely on a child that refuses to die. */
@@ -784,6 +787,67 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	}
 
 	/**
+	 * Opens a FIFO for writing without ever parking a libuv threadpool worker on the open
+	 * itself. A plain blocking fs.open('w') on a FIFO parks its worker until a reader
+	 * (GStreamer's filesrc) appears - if the child never opens its end (missing
+	 * binary/plugin, early exit), that worker stays blocked forever (unlinking the FIFO
+	 * does not wake it), and repeated failed starts exhaust the small (default 4) worker
+	 * pool, stalling every fs operation in the process. Instead: probe with
+	 * O_WRONLY|O_NONBLOCK, which the kernel completes immediately - with ENXIO while no
+	 * reader exists, successfully once one does - and only perform the real blocking-mode
+	 * open (which completes immediately once a reader is confirmed) for the returned fd.
+	 * `shouldAbort` is polled between probes so the caller's timeout / child-exit guards
+	 * cancel the wait; a reader vanishing in the microseconds between probe and open can
+	 * still park one worker (bounded by those same guards), but only in that vanishing
+	 * race, not on every failed start.
+	 */
+	private async openFifoWriterFd(
+		fifoPath: string,
+		shouldAbort: () => boolean,
+	): Promise<number> {
+		for (;;) {
+			if (shouldAbort()) {
+				throw new Error(
+					'Aborted waiting for GStreamer to open the FIFO for reading',
+				)
+			}
+			const probed = await new Promise<number | undefined>(
+				(resolve, reject) => {
+					fs.open(
+						fifoPath,
+						fs.constants.O_WRONLY | fs.constants.O_NONBLOCK,
+						(err, fd) => {
+							if (err !== null) {
+								// ENXIO is the expected "no reader yet" signal; anything
+								// else (e.g. ENOENT if the FIFO vanished) is a real error.
+								if (err.code === 'ENXIO') resolve(undefined)
+								else reject(err)
+								return
+							}
+							resolve(fd)
+						},
+					)
+				},
+			)
+			if (probed !== undefined) {
+				// Reader confirmed: discard the nonblocking probe fd and open in blocking
+				// mode for the write stream (blocking write semantics are what the
+				// reorder-buffered stream and the initial-data write rely on).
+				fs.close(probed, () => {})
+				return await new Promise<number>((resolve, reject) => {
+					fs.open(fifoPath, 'w', (err, fd) => {
+						if (err !== null) reject(err)
+						else resolve(fd)
+					})
+				})
+			}
+			await new Promise((resolve) =>
+				setTimeout(resolve, FIFO_OPEN_PROBE_INTERVAL_MS),
+			)
+		}
+	}
+
+	/**
 	 * Single-run start logic for a FIFO/MPEG-TS port (credentials + spawn). Call only via
 	 * start() so dedupe applies. If initialData is provided, it is written to stdin
 	 * immediately after spawn so fdsrc has data when it first reads.
@@ -915,19 +979,23 @@ export class KinesisIngestionPipeline extends EventEmitter {
 					)
 				}, FIFO_OPEN_TIMEOUT_MS)
 
-				fs.open(fifoPath, 'w', (err, fd) => {
-					if (err) {
-						settleReject(err)
-						return
+				// The open itself never parks a threadpool worker (see openFifoWriterFd);
+				// `settled` doubles as its abort flag so the timeout above and the child's
+				// early exit/error both cancel it.
+				void (async () => {
+					try {
+						const fd = await this.openFifoWriterFd(fifoPath, () => settled)
+						const w = fs.createWriteStream('', { fd, autoClose: true })
+						const data = initialData ?? Buffer.alloc(0)
+						if (data.length > 0) {
+							w.write(data, (e) => (e ? settleReject(e) : settleResolve(w)))
+						} else {
+							settleResolve(w)
+						}
+					} catch (err) {
+						settleReject(err instanceof Error ? err : new Error(String(err)))
 					}
-					const w = fs.createWriteStream('', { fd, autoClose: true })
-					const data = initialData ?? Buffer.alloc(0)
-					if (data.length > 0) {
-						w.write(data, (e) => (e ? settleReject(e) : settleResolve(w)))
-					} else {
-						settleResolve(w)
-					}
-				})
+				})()
 			})
 		} catch (err) {
 			// Nothing was registered in activePipelines yet - clean up the child/FIFO and
