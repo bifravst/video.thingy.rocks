@@ -5,22 +5,8 @@ import {
 
 const elbv2 = new ElasticLoadBalancingV2Client({})
 
-/** How often the readiness check polls target-group health. */
-const POLL_INTERVAL_MS = 15_000
-/**
- * How long to wait for the fleet to become healthy before failing the deployment (the
- * Lambda's own timeout is 10 minutes - this deadline must stay below it so the failure
- * response still gets sent).
- */
-const READINESS_TIMEOUT_MS = 9 * 60_000
-
-type CloudFormationCustomResourceEvent = {
+type FleetReadinessEvent = {
 	RequestType: 'Create' | 'Update' | 'Delete'
-	ResponseURL: string
-	StackId: string
-	RequestId: string
-	LogicalResourceId: string
-	PhysicalResourceId?: string
 	ResourceProperties: {
 		TargetGroupArns?: string[]
 		MinHealthyTargets?: number | string
@@ -32,101 +18,92 @@ type CloudFormationCustomResourceEvent = {
  * cdk/StreamingStack.ts's FleetCutoverReadinessCR): blocks the NLB listeners' update
  * until every target group of the new fleet generation reports at least
  * MinHealthyTargets healthy targets - the same TCP health check the NLB itself uses -
- * so the cutover only flips traffic to instances that are genuinely ready to ingest,
- * and fails (rolling the update back) instead of cutting over into a fleet that never
- * becomes healthy.
+ * so the cutover only flips traffic to instances that are genuinely ready to ingest.
+ *
+ * Driven by the CDK custom-resource provider framework: `onEvent` runs once per
+ * lifecycle event and validates the properties; `isComplete` is polled (once a minute
+ * by the framework's waiter) until it reports complete or the framework's total
+ * timeout is reached. The framework sends CloudFormation the SUCCESS/FAILED responses
+ * itself - including FAILED on a thrown error or timeout - so the update can never
+ * hang waiting for a response.
  */
-export const handler = async (
-	event: CloudFormationCustomResourceEvent,
-): Promise<void> => {
-	if (event.RequestType === 'Delete') {
-		await respond(event, 'SUCCESS')
-		return
-	}
 
+/** The provider framework's onEvent handler: validates the resource properties (a
+ * malformed template fails the deployment immediately) and starts the wait. */
+export const onEvent = async (
+	event: FleetReadinessEvent,
+): Promise<Record<string, never>> => {
+	if (event.RequestType === 'Delete') {
+		// Nothing to verify when the gate's own resources are being removed.
+		return {}
+	}
 	const targetGroupArns = event.ResourceProperties.TargetGroupArns ?? []
 	const minHealthyTargets = Number(
 		event.ResourceProperties.MinHealthyTargets ?? 0,
 	)
 	if (targetGroupArns.length === 0 || minHealthyTargets <= 0) {
-		await respond(
-			event,
-			'FAILED',
+		throw new Error(
 			'ResourceProperties must include TargetGroupArns and a positive MinHealthyTargets',
 		)
-		return
 	}
-
-	const deadline = Date.now() + READINESS_TIMEOUT_MS
-	const unhealthy = new Set<string>()
-	for (;;) {
-		unhealthy.clear()
-		await Promise.all(
-			targetGroupArns.map(async (targetGroupArn) => {
-				const { TargetHealthDescriptions } = await elbv2.send(
-					new DescribeTargetHealthCommand({ TargetGroupArn: targetGroupArn }),
-				)
-				const healthyCount =
-					TargetHealthDescriptions?.filter(
-						(description) => description.TargetHealth?.State === 'healthy',
-					).length ?? 0
-				if (healthyCount < minHealthyTargets) {
-					unhealthy.add(targetGroupArn)
-				}
-			}),
-		)
-		if (unhealthy.size === 0) {
-			console.log(
-				`All ${targetGroupArns.length} target groups report at least ${minHealthyTargets} healthy targets`,
-			)
-			await respond(event, 'SUCCESS')
-			return
-		}
-		if (Date.now() > deadline) {
-			await respond(
-				event,
-				'FAILED',
-				`Timed out waiting for fleet readiness: ${unhealthy.size} of ${targetGroupArns.length} target groups still have fewer than ${minHealthyTargets} healthy targets (${Array.from(unhealthy).join(', ')}). The old fleet keeps serving; fix the new one and retry the deployment.`,
-			)
-			return
-		}
-		console.log(
-			`Waiting for fleet readiness: ${unhealthy.size} of ${targetGroupArns.length} target groups still below ${minHealthyTargets} healthy targets`,
-		)
-		await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
-	}
+	return {}
 }
 
-/**
- * Responds to CloudFormation's pre-signed URL. Implemented with fetch (Node >= 18)
- * rather than a cfn-response helper: no extra dependency, and the protocol is just an
- * HTTPS PUT of the response JSON.
- */
-const respond = async (
-	event: CloudFormationCustomResourceEvent,
-	status: 'SUCCESS' | 'FAILED',
-	reason?: string,
-): Promise<void> => {
-	const body = JSON.stringify({
-		Status: status,
-		Reason:
-			reason ??
-			`${status} - see the FleetCutoverReadiness Lambda's CloudWatch Logs`,
-		PhysicalResourceId: event.PhysicalResourceId ?? event.LogicalResourceId,
-		StackId: event.StackId,
-		RequestId: event.RequestId,
-		LogicalResourceId: event.LogicalResourceId,
-		Data: {},
-	})
-	const res = await fetch(event.ResponseURL, {
-		method: 'PUT',
-		// The pre-signed URL's signature does not cover a content-type - sending one
-		// would break it, so the body is sent without the header.
-		body,
-	})
-	if (!res.ok) {
-		throw new Error(
-			`Failed to respond to CloudFormation (${res.status}): ${await res.text()}`,
+/** The provider framework's isComplete handler, polled by the waiter state machine
+ * until it reports complete (or the total timeout fails the deployment). */
+export const isComplete = async (
+	event: FleetReadinessEvent,
+): Promise<{
+	IsComplete: boolean
+	Data?: { HealthyTargetGroups: number }
+}> => {
+	if (event.RequestType === 'Delete') {
+		return { IsComplete: true }
+	}
+	const targetGroupArns = event.ResourceProperties.TargetGroupArns ?? []
+	const minHealthyTargets = Number(
+		event.ResourceProperties.MinHealthyTargets ?? 0,
+	)
+
+	const unhealthy: string[] = []
+	for (const targetGroupArn of targetGroupArns) {
+		try {
+			const { TargetHealthDescriptions } = await elbv2.send(
+				new DescribeTargetHealthCommand({ TargetGroupArn: targetGroupArn }),
+			)
+			const healthyCount =
+				TargetHealthDescriptions?.filter(
+					(description) => description.TargetHealth?.State === 'healthy',
+				).length ?? 0
+			if (healthyCount < minHealthyTargets) {
+				unhealthy.push(targetGroupArn)
+			}
+		} catch (err) {
+			// A transient ELB error (throttling, a permissions blip) counts as "not
+			// ready yet" and is retried on the next poll interval rather than failing
+			// the deployment - the framework's total timeout bounds the overall wait.
+			console.log(
+				`Target group ${targetGroupArn} not ready (health check error, will retry):`,
+				err,
+			)
+			unhealthy.push(targetGroupArn)
+		}
+	}
+
+	if (unhealthy.length === 0) {
+		console.log(
+			`All ${targetGroupArns.length} target groups report at least ${minHealthyTargets} healthy targets`,
 		)
+		return {
+			IsComplete: true,
+			Data: { HealthyTargetGroups: targetGroupArns.length },
+		}
+	}
+	console.log(
+		`Waiting for fleet readiness: ${unhealthy.length} of ${targetGroupArns.length} target groups still below ${minHealthyTargets} healthy targets (${unhealthy.join(', ')})`,
+	)
+	return {
+		IsComplete: false,
+		Data: { HealthyTargetGroups: targetGroupArns.length - unhealthy.length },
 	}
 }

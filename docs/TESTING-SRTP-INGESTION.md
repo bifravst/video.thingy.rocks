@@ -140,9 +140,10 @@ started" (not "Kinesis ingestion started") in application logs.
 - **`gst-inspect-1.0 srtpdec` / `srtpenc` / `rtph264depay` / `rtpjitterbuffer` /
   `udpsrc` fails on the EC2 instance** - these ship in the
   `gstreamer1-plugins-base`/`good`/`bad-free` packages already installed by
-  `cdk/user-data.sh`, which also runs this check (non-fatal) during bootstrap;
-  check `/var/log/cloud-init-output.log` for the warning if ingestion doesn't
-  start.
+  `cdk/user-data.sh`, which also runs this check (fatally - a missing element
+  aborts bootstrap, so the instance never opens its health port and the target
+  group stays unhealthy) during bootstrap; check
+  `/var/log/cloud-init-output.log` for the warning if ingestion doesn't start.
 
 - **"No SRTP key configured for port; refusing to start ingestion"** - the SSM
   parameter `/{stackName}/srtp/port/{port}/key` is missing, malformed JSON, the

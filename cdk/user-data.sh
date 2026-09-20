@@ -103,43 +103,50 @@ systemctl daemon-reload
 # Enable service to start on boot
 systemctl enable video-streaming.service
 
-# Start the application service immediately so the app is always running
-systemctl start video-streaming.service
-
-# Build kvssink plugin (non-fatal: if this fails, app still runs with gst-launch-1.0; Kinesis ingestion will fail until kvssink is available)
+# Build the kvssink plugin and verify the GStreamer elements the ingest pipelines need
+# BEFORE starting the application service (which opens the TCP:9999 health port).
+# FATAL on purpose: the NLB target groups' health checks (and, on a fleet cutover, the
+# FleetCutoverReadiness gate) treat "health port open" as "this instance can ingest".
+# Starting the service before these prerequisites would make the instance look healthy
+# while no Kinesis pipeline can run - and a cutover could move traffic to a fleet that
+# drops ingestion. With `set -e`, a failed build or missing element aborts user data:
+# the service never starts, the health port stays closed, the target group stays
+# unhealthy, and the ASG replaces the instance / the readiness gate blocks the switch.
 # Log full build output so failures can be diagnosed (e.g. build/ empty or only CMake files)
 KINESIS_SDK_DIR=/opt/amazon-kinesis-video-streams-producer-sdk-cpp
 KINESIS_SDK_TAG=v3.5.0
 KINESIS_BUILD_LOG=/var/log/kinesis-sdk-build.log
 yum install -y perl
-if ! (
-  rm -rf "$KINESIS_SDK_DIR"
-  git clone --depth 1 --branch "$KINESIS_SDK_TAG" https://github.com/awslabs/amazon-kinesis-video-streams-producer-sdk-cpp.git "$KINESIS_SDK_DIR"
-  [ -f "$KINESIS_SDK_DIR/CMakeLists.txt" ] || { echo "Clone failed: CMakeLists.txt missing"; exit 1; }
-  mkdir -p "$KINESIS_SDK_DIR/build"
-  cd "$KINESIS_SDK_DIR/build"
-  # Limit make to 2 jobs to avoid OOM during log4cplus/SDK build (compiler can use ~1–2 GB per job)
-  { cmake .. -DBUILD_GSTREAMER_PLUGIN=ON -DBUILD_DEPENDENCIES=ON 2>&1
-    make -j2 2>&1
-  } | tee "$KINESIS_BUILD_LOG"
-  echo "--- build dir contents after make ---" >> "$KINESIS_BUILD_LOG"
-  ls -la "$KINESIS_SDK_DIR/build" >> "$KINESIS_BUILD_LOG" 2>&1
-  export GST_PLUGIN_PATH="$KINESIS_SDK_DIR/build"
-  export LD_LIBRARY_PATH="$KINESIS_SDK_DIR/build"
-  gst-inspect-1.0 kvssink
-); then
-  echo "WARNING: kvssink build failed or skipped; Kinesis ingestion will not work until the plugin is available. Check $KINESIS_BUILD_LOG and /var/log/cloud-init-output.log."
-fi
+rm -rf "$KINESIS_SDK_DIR"
+git clone --depth 1 --branch "$KINESIS_SDK_TAG" https://github.com/awslabs/amazon-kinesis-video-streams-producer-sdk-cpp.git "$KINESIS_SDK_DIR"
+[ -f "$KINESIS_SDK_DIR/CMakeLists.txt" ] || { echo "Clone failed: CMakeLists.txt missing"; exit 1; }
+mkdir -p "$KINESIS_SDK_DIR/build"
+cd "$KINESIS_SDK_DIR/build"
+# Limit make to 2 jobs to avoid OOM during log4cplus/SDK build (compiler can use ~1–2 GB per job)
+{ cmake .. -DBUILD_GSTREAMER_PLUGIN=ON -DBUILD_DEPENDENCIES=ON 2>&1
+  make -j2 2>&1
+} | tee "$KINESIS_BUILD_LOG"
+echo "--- build dir contents after make ---" >> "$KINESIS_BUILD_LOG"
+ls -la "$KINESIS_SDK_DIR/build" >> "$KINESIS_BUILD_LOG" 2>&1
+cd /
+# Verify the built plugin loads - the same environment the service uses
+export GST_PLUGIN_PATH="$KINESIS_SDK_DIR/build"
+export LD_LIBRARY_PATH="$KINESIS_SDK_DIR/build"
+gst-inspect-1.0 kvssink
 
-# Verify the GStreamer elements the SRTP ingestion path needs are present. These ship in the
-# gstreamer1-plugins-base/good/bad-free packages already installed above; this check is
-# non-fatal (SRTP ingestion just won't work until they're available) so it never blocks the
-# unencrypted MPEG-TS path from starting.
-for element in udpsrc srtpdec rtpjitterbuffer rtph264depay; do
+# Verify the GStreamer elements both ingest pipelines need are present. These ship in
+# the gstreamer1-plugins-base/good/bad-free packages installed above; a missing one
+# aborts user data (see the rationale above: a healthy instance must be able to ingest).
+for element in udpsrc filesrc srtpdec rtpjitterbuffer rtph264depay h264parse tsdemux; do
   if ! gst-inspect-1.0 "$element" > /dev/null 2>&1; then
-    echo "WARNING: GStreamer element '$element' not found; SRTP ingestion will not work until it is available."
+    echo "FATAL: GStreamer element '$element' not found; this instance cannot ingest."
+    exit 1
   fi
 done
+
+# All ingest prerequisites are verified: start the application service, which opens
+# the health port and thereby marks this instance ingest-ready for the target groups.
+systemctl start video-streaming.service
 
 # Configure CloudWatch Logs agent
 cat > /opt/aws/amazon-cloudwatch-agent/etc/cloudwatch-config.json << 'EOF'

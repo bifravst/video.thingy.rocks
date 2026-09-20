@@ -25,6 +25,7 @@ import * as s3 from 'aws-cdk-lib/aws-s3'
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment'
 import * as sns from 'aws-cdk-lib/aws-sns'
 import * as sns_subscriptions from 'aws-cdk-lib/aws-sns-subscriptions'
+import * as custom_resources from 'aws-cdk-lib/custom-resources'
 import type { Construct } from 'constructs'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -320,56 +321,165 @@ export class StreamingStack extends Stack {
 			1,
 		)
 
-		// Fleet generation: scopes the Auto Scaling Group and its NLB target groups, so a
-		// breaking rollout can be deployed as a *full-fleet cutover* instead of the rolling
-		// update configured below. A rolling update replaces instances one batch at a time
-		// while the whole fleet keeps serving the same NLB target groups - fine for
-		// compatible changes, but this update renames every Kinesis Video Stream and moves
-		// the DynamoDB lock key from the raw port (5000-5009) to the stream slot (1-10):
-		// during a rolling overlap, old instances would write to the old
-		// {stackName}-video-5000 stream under lock row 5000 while new instances write to
-		// video-streaming-2026-09-video-1 under lock row 1 - the two schemes do not fence
-		// each other, so a device's traffic would be split between (or duplicated into)
-		// both streams for the duration of the rollout. Bumping the generation instead
-		// creates a replacement ASG and replacement target groups behind the same
-		// listeners: the listeners are only re-pointed at the new target groups once the
-		// replacement fleet is *ingesting-ready* (see the FleetCutoverReadiness custom
-		// resource below), and the old fleet - the sole traffic receiver until that flip -
-		// is then drained (target-group deregistration delay) and removed. At no point do
-		// old and new code both receive traffic. The default ('gen2') deliberately differs
-		// from the currently deployed (unsuffixed) resource names, so deploying this
-		// update performs exactly this cutover; bump it via
-		// `--context fleetGeneration=gen3` for any future change that is again unsafe to
-		// roll out with old and new instances serving side by side. Within an unchanged
-		// generation, normal rolling updates apply again.
-		const fleetGeneration =
+		// Fleet generations: scopes the Auto Scaling Groups and their NLB target groups,
+		// so a breaking rollout can be deployed as a *full-fleet cutover* with the old
+		// fleet retained through the switch, instead of the rolling update configured
+		// below. A rolling update replaces instances one batch at a time while the whole
+		// fleet keeps serving the same NLB target groups - fine for compatible changes,
+		// but this update renames every Kinesis Video Stream and moves the DynamoDB lock
+		// key from the raw port (5000-5009) to the stream slot (1-10): during a rolling
+		// overlap, old instances would write to the old {stackName}-video-5000 stream
+		// under lock row 5000 while new instances write to
+		// video-streaming-2026-09-video-1 under lock row 1 - the two schemes do not
+		// fence each other, so a device's traffic would be split between (or duplicated
+		// into) both streams for the duration of the rollout.
+		//
+		// Cutover procedure (two deploys, keeping the old fleet alive through the
+		// verified listener switch - old and new code never both receive traffic, and
+		// existing UDP flows pinned to old targets by stickiness keep being served until
+		// they idle out):
+		//
+		//   1. Cutover deploy: `-c fleetGeneration=<new> -c retainFleetGeneration=<old>`
+		//      creates the new fleet alongside the retained old one. The readiness gate
+		//      below blocks the stable listeners' re-pointing until the new fleet is
+		//      *ingesting-ready* (instances only pass the target-group health check after
+		//      user data has verified the GStreamer elements and built kvssink - see
+		//      cdk/user-data.sh). The retained fleet keeps its (now listener-less) target
+		//      groups and registered instances, so old flows continue to drain through
+		//      the switch instead of being cut off mid-check.
+		//   2. Cleanup deploy: `-c fleetGeneration=<new>` only, once the retained fleet's
+		//      remaining flows have drained past the NLB UDP flow idle timeout - deletes
+		//      the retained fleet.
+		//
+		// For THIS update the old fleet is the currently deployed, unsuffixed resources:
+		// deploy with `-c fleetGeneration=gen2 -c retainFleetGeneration=` (empty value =
+		// the legacy unsuffixed IDs) to retain it. The retained legacy ASG picks up this
+		// branch's launch template (rolling in-place refresh), so its instances run the
+		// same new code as the serving fleet - no old/new scheme split during the
+		// overlap. Within an unchanged generation, ordinary stack updates are normal
+		// rolling updates again.
+		const servingGeneration =
 			(this.node.tryGetContext('fleetGeneration') as string | undefined) ??
 			'gen2'
-		/** Minimum number of instances the fleet keeps - also the number of healthy
+		const retainedGeneration = this.node.tryGetContext(
+			'retainFleetGeneration',
+		) as string | undefined
+		if (
+			retainedGeneration !== undefined &&
+			retainedGeneration === servingGeneration
+		) {
+			throw new Error(
+				`Invalid configuration: retainFleetGeneration (${retainedGeneration}) must differ from fleetGeneration (${servingGeneration})`,
+			)
+		}
+		/** Minimum number of instances each fleet keeps - also the number of healthy
 		 * targets each target group must report before the NLB listeners cut over to it
-		 * (see FleetCutoverReadiness below). */
+		 * (see the FleetCutoverReadiness gate below). */
 		const ASG_MIN_CAPACITY = 2
+		/** How long a newly launched instance may take to pass the target groups' health
+		 * check: cdk/user-data.sh only starts the service (thereby opening the health
+		 * port) after the kvssink build and GStreamer verification, so bootstrap takes
+		 * tens of minutes on a fresh instance. Also bounds the readiness gate's wait. */
+		const ASG_HEALTH_CHECK_GRACE = Duration.minutes(60)
 
-		// Create Auto Scaling Group with Launch Template
-		this.autoScalingGroup = new autoscaling.AutoScalingGroup(
-			this,
-			`UDPListenerASG-${fleetGeneration}`,
-			{
-				vpc: this.vpc,
-				vpcSubnets: { subnets: [primarySubnet] },
-				launchTemplate,
-				minCapacity: ASG_MIN_CAPACITY,
-				maxCapacity: 10,
-				updatePolicy: autoscaling.UpdatePolicy.rollingUpdate({
-					maxBatchSize: 1,
-					minInstancesInService: 1,
-					pauseTime: Duration.minutes(5),
-				}),
-			},
-		)
+		/**
+		 * Builds one ingest fleet (an ASG and its 20 NLB target groups, with the fleet's
+		 * instances registered in them) for a generation. An empty generation produces
+		 * the *legacy, unsuffixed* construct IDs (`UDPListenerASG`, `TargetGroup5000`,
+		 * ...) so the currently deployed fleet can be retained - updated in place, never
+		 * replaced - through a cutover; a non-empty generation scopes all of a fleet's
+		 * resources, so bumping it creates a replacement fleet. All fleets share the
+		 * launch template.
+		 */
+		const createIngestFleet = (
+			generation: string,
+		): {
+			asg: autoscaling.AutoScalingGroup
+			unencryptedTargetGroups: elbv2.NetworkTargetGroup[]
+			srtpTargetGroups: elbv2.NetworkTargetGroup[]
+		} => {
+			const suffix = generation === '' ? '' : `-${generation}`
+			const asg = new autoscaling.AutoScalingGroup(
+				this,
+				`UDPListenerASG${suffix}`,
+				{
+					vpc: this.vpc,
+					vpcSubnets: { subnets: [primarySubnet] },
+					launchTemplate,
+					minCapacity: ASG_MIN_CAPACITY,
+					maxCapacity: 10,
+					updatePolicy: autoscaling.UpdatePolicy.rollingUpdate({
+						maxBatchSize: 1,
+						minInstancesInService: 1,
+						pauseTime: Duration.minutes(5),
+					}),
+				},
+			)
+			// Use ELB health checks (the NLB target groups') so the ASG only considers an
+			// instance healthy once its health port answers - which cdk/user-data.sh only
+			// opens after the instance can actually ingest. The grace period must cover
+			// the full bootstrap, including the kvssink build.
+			const cfnAsg = asg.node.defaultChild as autoscaling.CfnAutoScalingGroup
+			cfnAsg.healthCheckType = 'ELB'
+			cfnAsg.healthCheckGracePeriod = ASG_HEALTH_CHECK_GRACE.toSeconds()
 
-		const cfnAsg = this.autoScalingGroup.node
-			.defaultChild as autoscaling.CfnAutoScalingGroup
+			const createTargetGroup = (
+				id: string,
+				port: number,
+			): elbv2.NetworkTargetGroup => {
+				const targetGroup = new elbv2.NetworkTargetGroup(this, id, {
+					vpc: this.vpc,
+					port,
+					protocol: elbv2.Protocol.UDP,
+					targetType: elbv2.TargetType.INSTANCE,
+					ipAddressType: elbv2.TargetGroupIpAddressType.IPV6,
+					healthCheck: {
+						protocol: elbv2.Protocol.TCP,
+						port: '9999',
+						healthyThresholdCount: 2,
+						unhealthyThresholdCount: 2,
+						interval: Duration.seconds(10),
+						timeout: Duration.seconds(10),
+					},
+					deregistrationDelay: Duration.seconds(30),
+					preserveClientIp: true,
+				})
+				// Enable stickiness for single active instance pattern
+				targetGroup.setAttribute('stickiness.enabled', 'true')
+				targetGroup.setAttribute('stickiness.type', 'source_ip')
+				return targetGroup
+			}
+			const unencryptedTargetGroups: elbv2.NetworkTargetGroup[] = []
+			for (let port = 5000; port <= 5009; port++) {
+				unencryptedTargetGroups.push(
+					createTargetGroup(`TargetGroup${port}${suffix}`, port),
+				)
+			}
+			const srtpTargetGroups: elbv2.NetworkTargetGroup[] = []
+			for (let port = 6000; port <= 6009; port++) {
+				srtpTargetGroups.push(
+					createTargetGroup(`SrtpTargetGroup${port}${suffix}`, port),
+				)
+			}
+			// Register the fleet's instances in all of its target groups
+			for (const targetGroup of [
+				...unencryptedTargetGroups,
+				...srtpTargetGroups,
+			]) {
+				asg.attachToNetworkTargetGroup(targetGroup)
+			}
+			return { asg, unencryptedTargetGroups, srtpTargetGroups }
+		}
+
+		// The serving fleet receives all listener traffic; the (optional) retained fleet
+		// stays alive through a cutover without any listeners pointing at it (created for
+		// its side effects: its ASG keeps its instances registered in its target groups
+		// so draining flows are served until the cleanup deploy removes it).
+		const servingFleet = createIngestFleet(servingGeneration)
+		this.autoScalingGroup = servingFleet.asg
+		if (retainedGeneration !== undefined) {
+			createIngestFleet(retainedGeneration)
+		}
 
 		const eip = new ec2.CfnEIP(this, 'NLB-EIP', {
 			domain: 'vpc',
@@ -401,46 +511,15 @@ export class StreamingStack extends Stack {
 			},
 		]
 
-		// Create target groups for UDP ports 5000-5009
-		const targetGroups: elbv2.NetworkTargetGroup[] = []
-		for (let port = 5000; port <= 5009; port++) {
-			const targetGroup = new elbv2.NetworkTargetGroup(
-				this,
-				`TargetGroup${port}-${fleetGeneration}`,
-				{
-					vpc: this.vpc,
-					port,
-					protocol: elbv2.Protocol.UDP,
-					targetType: elbv2.TargetType.INSTANCE,
-					ipAddressType: elbv2.TargetGroupIpAddressType.IPV6,
-					healthCheck: {
-						protocol: elbv2.Protocol.TCP,
-						port: '9999',
-						healthyThresholdCount: 2,
-						unhealthyThresholdCount: 2,
-						interval: Duration.seconds(10),
-						timeout: Duration.seconds(10),
-					},
-					deregistrationDelay: Duration.seconds(30),
-					preserveClientIp: true,
-				},
-			)
-
-			// Enable stickiness for single active instance pattern
-			targetGroup.setAttribute('stickiness.enabled', 'true')
-			targetGroup.setAttribute('stickiness.type', 'source_ip')
-
-			targetGroups.push(targetGroup)
-		}
-
-		// Create UDP listeners for ports 5000-5009
+		// Create UDP listeners for ports 5000-5009, forwarding to the *serving* fleet's
+		// target groups (the listener IDs are stable across generations - a cutover
+		// updates the listeners' default actions, never replaces them).
 		const nlbListeners: elbv2.NetworkListener[] = []
-		for (let i = 0; i < targetGroups.length; i++) {
+		for (const [
+			i,
+			targetGroup,
+		] of servingFleet.unencryptedTargetGroups.entries()) {
 			const port = 5000 + i
-			const targetGroup = targetGroups[i]
-			if (!targetGroup) {
-				throw new Error(`Target group for port ${port} is undefined`)
-			}
 			nlbListeners.push(
 				this.networkLoadBalancer.addListener(`UDPListener${port}`, {
 					port,
@@ -450,44 +529,9 @@ export class StreamingStack extends Stack {
 			)
 		}
 
-		// Create target groups + UDP listeners for SRTP ports 6000-6009 (same fleet, same
-		// stickiness/health-check pattern as the unencrypted 5000-5009 target groups above)
-		const srtpTargetGroups: elbv2.NetworkTargetGroup[] = []
-		for (let port = 6000; port <= 6009; port++) {
-			const targetGroup = new elbv2.NetworkTargetGroup(
-				this,
-				`SrtpTargetGroup${port}-${fleetGeneration}`,
-				{
-					vpc: this.vpc,
-					port,
-					protocol: elbv2.Protocol.UDP,
-					targetType: elbv2.TargetType.INSTANCE,
-					ipAddressType: elbv2.TargetGroupIpAddressType.IPV6,
-					healthCheck: {
-						protocol: elbv2.Protocol.TCP,
-						port: '9999',
-						healthyThresholdCount: 2,
-						unhealthyThresholdCount: 2,
-						interval: Duration.seconds(10),
-						timeout: Duration.seconds(10),
-					},
-					deregistrationDelay: Duration.seconds(30),
-					preserveClientIp: true,
-				},
-			)
-
-			targetGroup.setAttribute('stickiness.enabled', 'true')
-			targetGroup.setAttribute('stickiness.type', 'source_ip')
-
-			srtpTargetGroups.push(targetGroup)
-		}
-
-		for (let i = 0; i < srtpTargetGroups.length; i++) {
+		// Same for the SRTP ports 6000-6009
+		for (const [i, targetGroup] of servingFleet.srtpTargetGroups.entries()) {
 			const port = 6000 + i
-			const targetGroup = srtpTargetGroups[i]
-			if (!targetGroup) {
-				throw new Error(`SRTP target group for port ${port} is undefined`)
-			}
 			nlbListeners.push(
 				this.networkLoadBalancer.addListener(`SrtpUDPListener${port}`, {
 					port,
@@ -497,68 +541,105 @@ export class StreamingStack extends Stack {
 			)
 		}
 
-		// Attach all target groups to the Auto Scaling Group
-		// This enables automatic registration/deregistration of instances
-		for (const targetGroup of [...targetGroups, ...srtpTargetGroups]) {
-			this.autoScalingGroup.attachToNetworkTargetGroup(targetGroup)
-		}
-
 		// Deployment-time readiness gate for the fleet cutover: the ASG resource alone
 		// reaching CREATE_COMPLETE proves nothing about the *instances* - they may still
 		// be bootstrapping, so re-pointing the stable listeners at the new target groups
 		// at that point can leave every listener with zero healthy targets (a full ingest
-		// outage). This custom resource instead blocks the listener update until every
-		// target group of this generation reports at least ASG_MIN_CAPACITY healthy
-		// targets - the same TCP:9999 health check the NLB itself uses - so the cutover
-		// flips traffic only to a fleet that is genuinely ready to ingest. If the new
-		// fleet never becomes healthy, the resource fails and CloudFormation rolls the
-		// update back (the old fleet, still sole receiver, is untouched) rather than
-		// cutting over into an outage. The resource is scoped by the fleet generation so
-		// each cutover runs a fresh check; within an unchanged generation its properties
-		// are stable, so ordinary stack updates do not re-run it.
-		const fleetCutoverReadinessChecker = new lambdanode.NodejsFunction(
+		// outage). This gate blocks the listener update until every target group of the
+		// serving generation reports at least ASG_MIN_CAPACITY healthy targets - the
+		// same TCP:9999 health check the NLB itself uses, which instances only pass once
+		// their user data has verified the GStreamer elements and built kvssink (see
+		// cdk/user-data.sh) - so the cutover flips traffic only to a fleet that is
+		// genuinely ready to ingest.
+		//
+		// The CDK custom-resource provider framework drives the wait: isComplete is
+		// polled once a minute for up to ASG_HEALTH_CHECK_GRACE (an hour, covering the
+		// long instance bootstrap including the kvssink build). Transient
+		// DescribeTargetHealth errors are treated as "not ready yet" and retried on the
+		// next interval, and if a handler throws or the fleet never becomes ready, the
+		// framework itself sends CloudFormation a bounded FAILED response (never a
+		// hung update) and the deployment rolls back - with the retained old fleet still
+		// sole receiver until the verified flip. The gate is scoped by the serving
+		// generation so each cutover runs a fresh check; within an unchanged generation
+		// its properties are stable, so ordinary stack updates do not re-run it.
+		const fleetReadinessEntry = join(
+			__dirname,
+			'..',
+			'lambda',
+			'fleet-cutover-readiness',
+			'index.ts',
+		)
+		const fleetReadinessOnEvent = new lambdanode.NodejsFunction(
 			this,
-			`FleetCutoverReadiness-${fleetGeneration}`,
+			`FleetReadinessOnEvent-${servingGeneration}`,
 			{
-				entry: join(
-					__dirname,
-					'..',
-					'lambda',
-					'fleet-cutover-readiness',
-					'index.ts',
-				),
+				entry: fleetReadinessEntry,
 				runtime: lambda.Runtime.NODEJS_24_X,
-				handler: 'handler',
-				timeout: Duration.minutes(10),
+				handler: 'onEvent',
+				timeout: Duration.minutes(1),
 				bundling: {
 					format: lambdanode.OutputFormat.ESM,
 				},
 			},
 		)
-		fleetCutoverReadinessChecker.addToRolePolicy(
-			new iam.PolicyStatement({
-				effect: iam.Effect.ALLOW,
-				actions: ['elasticloadbalancing:DescribeTargetHealth'],
-				resources: [
-					...targetGroups.map((targetGroup) => targetGroup.targetGroupArn),
-					...srtpTargetGroups.map((targetGroup) => targetGroup.targetGroupArn),
-				],
-			}),
+		const fleetReadinessIsComplete = new lambdanode.NodejsFunction(
+			this,
+			`FleetReadinessIsComplete-${servingGeneration}`,
+			{
+				entry: fleetReadinessEntry,
+				runtime: lambda.Runtime.NODEJS_24_X,
+				handler: 'isComplete',
+				timeout: Duration.minutes(1),
+				bundling: {
+					format: lambdanode.OutputFormat.ESM,
+				},
+			},
+		)
+		for (const readinessFunction of [
+			fleetReadinessOnEvent,
+			fleetReadinessIsComplete,
+		]) {
+			readinessFunction.addToRolePolicy(
+				new iam.PolicyStatement({
+					effect: iam.Effect.ALLOW,
+					actions: ['elasticloadbalancing:DescribeTargetHealth'],
+					resources: [
+						...servingFleet.unencryptedTargetGroups.map(
+							(targetGroup) => targetGroup.targetGroupArn,
+						),
+						...servingFleet.srtpTargetGroups.map(
+							(targetGroup) => targetGroup.targetGroupArn,
+						),
+					],
+				}),
+			)
+		}
+		const fleetCutoverReadinessProvider = new custom_resources.Provider(
+			this,
+			`FleetCutoverReadinessProvider-${servingGeneration}`,
+			{
+				onEventHandler: fleetReadinessOnEvent,
+				isCompleteHandler: fleetReadinessIsComplete,
+				queryInterval: Duration.minutes(1),
+				totalTimeout: ASG_HEALTH_CHECK_GRACE,
+			},
 		)
 		// (A raw CfnResource with a Custom:: type - the L2 CustomResource's type
-		// declarations are truncated in this aws-cdk-lib version, and the properties here
-		// are simple: ServiceToken is what CloudFormation's custom-resource framework
-		// reads, everything else passes through to the Lambda's event.)
+		// declarations are truncated in this aws-cdk-lib version; ServiceToken is what
+		// CloudFormation's custom-resource framework reads, everything else passes
+		// through to the provider's onEvent/isComplete handlers.)
 		const fleetCutoverReadiness = new CfnResource(
 			this,
-			`FleetCutoverReadinessCR-${fleetGeneration}`,
+			`FleetCutoverReadinessCR-${servingGeneration}`,
 			{
 				type: 'Custom::FleetCutoverReadiness',
 				properties: {
-					ServiceToken: fleetCutoverReadinessChecker.functionArn,
+					ServiceToken: fleetCutoverReadinessProvider.serviceToken,
 					TargetGroupArns: [
-						...targetGroups.map((targetGroup) => targetGroup.targetGroupArn),
-						...srtpTargetGroups.map(
+						...servingFleet.unencryptedTargetGroups.map(
+							(targetGroup) => targetGroup.targetGroupArn,
+						),
+						...servingFleet.srtpTargetGroups.map(
 							(targetGroup) => targetGroup.targetGroupArn,
 						),
 					],
@@ -566,21 +647,16 @@ export class StreamingStack extends Stack {
 				},
 			},
 		)
-		// The check runs once the replacement ASG exists (it registers the instances into
-		// the target groups it depends on), and the listeners depend on the check - so the
-		// cutover order is: new fleet up and healthy -> listeners flip -> old fleet
-		// drained and removed. Within an unchanged generation this dependency chain is a
-		// no-op (the ASG and the check already exist).
+		// The gate runs once the serving ASG exists (it registers the instances into the
+		// target groups it depends on), and the listeners depend on the gate - so the
+		// cutover order is: new fleet up and ingest-ready -> listeners flip -> the
+		// retained old fleet (still serving its draining flows, untouched by this
+		// update) is removed on the next deploy. Within an unchanged generation this
+		// dependency chain is a no-op.
 		fleetCutoverReadiness.node.addDependency(this.autoScalingGroup)
 		for (const listener of nlbListeners) {
 			listener.node.addDependency(fleetCutoverReadiness)
 		}
-
-		// Use ELB health check so ASG only considers instances ready when they pass NLB
-		// target group health checks. Prevents terminating old instances before new ones
-		// can receive traffic.
-		cfnAsg.healthCheckType = 'ELB'
-		cfnAsg.healthCheckGracePeriod = Duration.minutes(5).toSeconds()
 
 		// Lambda: set streams to inactive when marked active but no frame in 5 minutes
 		const streamCleanupLambda = new lambdanode.NodejsFunction(
