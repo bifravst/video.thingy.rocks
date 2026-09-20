@@ -77,6 +77,10 @@ const SRTP_REPLAY_BATCH_PAUSE_MS = 10
  * release/retry it. Generous (matches stop()'s own exit-wait budget) since a slow-but-normal
  * startup shouldn't be mistaken for a hang. */
 const FIFO_OPEN_TIMEOUT_MS = 15_000
+/** Bounds how long shutdown()'s sweep waits for a still-running GStreamer child to exit
+ * after SIGTERM before escalating to SIGKILL - matches stop()'s own exit-wait budget, so
+ * shutdown cannot hang indefinitely on a child that refuses to die. */
+const CHILD_EXIT_TIMEOUT_MS = 15_000
 
 type ReorderState = {
 	nextSeq: number
@@ -1496,12 +1500,49 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	 * checks before `closed` was set - and would otherwise outlive the process, since
 	 * process.exit() does not signal children - is swept from spawnedGst so no orphaned
 	 * kvssink producer keeps writing to Kinesis with no owner.
+	 *
+	 * The sweep *waits* for each swept child to actually exit, with a bounded timeout and
+	 * forced termination: kill() only signals the process (asynchronously), so returning
+	 * while a child is still draining would let index.ts release its Kinesis lock and
+	 * process.exit(0) underneath it - the still-running producer would keep writing to
+	 * the stream while another instance acquires it, exactly the competing-producer
+	 * problem the lock exists to prevent. The exit/error handlers registered at spawn
+	 * remove each child from spawnedGst as soon as it is gone, so the snapshot below only
+	 * ever contains genuinely still-running children.
 	 */
 	async shutdown(): Promise<void> {
 		this.closed = true
 		await this.stopAll()
-		for (const gst of this.spawnedGst) {
+		const stillRunning = Array.from(this.spawnedGst)
+		if (stillRunning.length > 0) {
+			this.logger.warn(
+				'Waiting for still-running GStreamer children to exit on shutdown',
+				{ children: stillRunning.length },
+			)
+		}
+		for (const gst of stillRunning) {
 			gst.kill('SIGTERM')
 		}
+		await Promise.all(
+			stillRunning.map(async (gst) => {
+				await new Promise<void>((resolve) => {
+					const timeout = setTimeout(() => {
+						this.logger.warn(
+							'GStreamer child did not exit after SIGTERM; sending SIGKILL',
+							{ pid: gst.pid },
+						)
+						gst.kill('SIGKILL')
+						// SIGKILL cannot be caught or ignored, but reaping the child is
+						// still asynchronous - give the exit event a brief moment to
+						// arrive before giving up on it entirely.
+						setTimeout(resolve, 1_000)
+					}, CHILD_EXIT_TIMEOUT_MS)
+					gst.once('exit', () => {
+						clearTimeout(timeout)
+						resolve()
+					})
+				})
+			}),
+		)
 	}
 }
