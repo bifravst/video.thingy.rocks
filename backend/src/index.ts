@@ -297,10 +297,12 @@ const persistSrtpRocForHandoff = async (
 			break
 		}
 		if (result === 'lostLock') {
-			// Another instance owns the row: retrying cannot succeed, and the (equally
-			// conditional) release below will no-op. Not a persistence gap - the new
-			// owner tracks and persists its own state.
-			break
+			// Another instance owns the row: nothing this instance can still persist
+			// (every retry fails the same condition, and the equally conditional release
+			// below will no-op), and the new owner tracks and persists its own state -
+			// this is normal ownership loss, not a persistence gap, so it must not fall
+			// through to the loud "next owner may seed a stale ROC" alarm below.
+			return
 		}
 		if (attempt < FINAL_ROC_PERSIST_ATTEMPTS) {
 			await new Promise((resolve) =>
@@ -934,6 +936,17 @@ const createPacketHandler = (
 	}
 
 	const enqueuePacket = (port: number, data: Buffer, timestamp: Date): void => {
+		// Plausibility of this datagram for SRTP ports (see looksPlausibleRtp), computed
+		// once and gating everything below. For a port whose lock is not held, an
+		// implausible datagram is ignored *entirely*: not just for stream-activity
+		// tracking, but also for the bounded per-port queue - enqueueing it would let a
+		// flood of arbitrary UDP traffic consume the queue's byte cap and evict valid
+		// packets, even though this path is documented as ignoring such traffic. Once
+		// the lock is held, traffic is treated normally regardless - GStreamer/srtpdec's
+		// own validation is the authority at that point, not this pre-lock noise filter.
+		const isPlausibleRtp = looksPlausibleRtp(port, data)
+		if (!isPlausibleRtp && !kinesisLockHeldForPorts.has(port)) return
+
 		// Snapshot first/resume status *before* onPacketReceived below flips a missing or
 		// inactive stream to 'active' - once that runs, getStreamState(port) reports 'active'
 		// regardless of what it was a moment ago, so deriving these later (inside
@@ -948,20 +961,10 @@ const createPacketHandler = (
 		// Deferring this into processPacket (as before) meant a backed-up queue (slow
 		// DynamoDB, credential retries, the paced SRTP startup replay) could delay it long
 		// enough for the inactivity timeout to fire a spurious onStreamStop while packets were
-		// still arriving, just not yet processed.
-		//
-		// Skipped for a not-yet-locked port whose datagram doesn't look like plausible RTP
-		// (looksPlausibleRtp): marking the stream active here happens *before*
-		// processPacket's own plausibility check further down (which only gates entry into
-		// the buffering block) - without this, a single implausible datagram could consume
-		// the only isFirstPacket/isResume transition and mark the stream active without ever
-		// arming a pre-start buffer, leaving later genuinely-valid packets stuck (both
-		// transition flags now false, no buffer entry) until an inactivity cycle. Once the
-		// lock is already held, traffic is treated normally regardless - GStreamer/srtpdec's
-		// own validation is the authority at that point, not this pre-lock noise filter.
-		if (kinesisLockHeldForPorts.has(port) || looksPlausibleRtp(port, data)) {
-			streamStateManager.onPacketReceived(port, timestamp)
-		}
+		// still arriving, just not yet processed. (Implausible datagrams on an unlocked SRTP
+		// port never reach this point - they were dropped above, before they could consume
+		// the only isFirstPacket/isResume transition or queue capacity.)
+		streamStateManager.onPacketReceived(port, timestamp)
 
 		let state = queueStateByPort.get(port)
 		if (!state) {
@@ -1125,14 +1128,26 @@ const createPacketHandler = (
 			// (particularly the DynamoDB calls) was still in flight - kinesisLockHeldForPorts
 			// still reported this port as locally held at that moment, so that packet's own
 			// processPacket run couldn't enter the buffering path, and writePacket() was a
-			// no-op since stop() had already removed the pipeline. Re-arm an empty buffer now
-			// so a later packet can still retry lock acquisition, even though it won't carry a
-			// genuine isFirstPacket/isResume marker (that was already consumed by the dropped one).
+			// no-op since stop() had already removed the pipeline... except that writePacket's
+			// *hold* captured the datagram instead (see KinesisIngestionPipeline's
+			// srtpHoldByPort). Merge that hold into the re-armed buffer, ahead of everything
+			// buffered from here on: the held datagrams are the oldest pending data, and
+			// leaving them in the hold would make the next start replay the newer buffered
+			// chunks first and seed the older held packets into the new pipeline's
+			// pendingQueue - newer sequence numbers overtake the older held keyframe/SPS/PPS,
+			// which the jitter buffer/anti-replay window then discards. Same ordering the
+			// failed-start path already preserves via takeHeldDatagrams. The re-armed packet
+			// path retries lock acquisition even though the buffer won't carry a genuine
+			// isFirstPacket/isResume marker (that was already consumed by the dropped one).
 			if (
 				streamStateManager.getStreamState(port)?.status === 'active' &&
 				!preStartBufferByPort.has(port)
 			) {
-				preStartBufferByPort.set(port, { chunks: [], totalBytes: 0 })
+				const held = kinesisIngestionPipeline?.takeHeldDatagrams(port) ?? []
+				preStartBufferByPort.set(port, {
+					chunks: held,
+					totalBytes: held.reduce((sum, chunk) => sum + chunk.length, 0),
+				})
 			}
 		},
 	}
@@ -1224,6 +1239,19 @@ if (kinesisIngestionPipeline) {
 				// started. Revalidate both immediately before restarting.
 				if (streamStateManager.getStreamState(port)?.status !== 'active') return
 				if (!kinesisLockHeldForPorts.has(port)) return
+				// ...and the delay can straddle the 30-second start backoff armed by a
+				// failed start (releaseLockBackoffAndRearm): this exit path calls the
+				// restart directly, so without this check an exit during startup - whose
+				// failure just armed the backoff - would keep spawning and replaying on
+				// the restart cadence instead of waiting it out. Persistent GStreamer
+				// failures then retry no faster than the backoff allows; the re-armed
+				// packet path retries automatically once it expires.
+				if (Date.now() < (nextStartAttemptAllowedAtByPort.get(port) ?? 0)) {
+					console.warn(
+						`[Main] Skipping GStreamer restart for port ${port}: start backoff is still active`,
+					)
+					return
+				}
 				lastPipelineRestartByPort.set(port, Date.now())
 				void startPipelineOrReleaseLock(port).catch((err) => {
 					console.error(

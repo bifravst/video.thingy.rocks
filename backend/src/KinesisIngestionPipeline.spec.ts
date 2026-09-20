@@ -498,6 +498,9 @@ void describe('KinesisIngestionPipeline', () => {
 		const makeLifecycle = (opts?: {
 			pendingQueueMaxBytes?: number
 			childScript?: string
+			/** Awaited inside the injected credential resolution - lets a test hold a
+			 * start in its pre-spawn window and then release it. */
+			envGate?: Promise<void>
 		}) => {
 			const spawnedCalls: {
 				command: string
@@ -539,7 +542,10 @@ void describe('KinesisIngestionPipeline', () => {
 				},
 				{
 					spawn: fakeSpawn,
-					gstEnv: async () => ({ GST_ENV_STUB: 'yes' }),
+					gstEnv: async () => {
+						if (opts?.envGate !== undefined) await opts.envGate
+						return { GST_ENV_STUB: 'yes' }
+					},
 				},
 			)
 			return { pipeline, spawnedCalls, children }
@@ -690,6 +696,69 @@ void describe('KinesisIngestionPipeline', () => {
 				await pipeline.start(port, [])
 				await new Promise((r) => setTimeout(r, 100))
 				assert.strictEqual(receiver.received.length, 3)
+			} finally {
+				await pipeline.shutdown()
+				receiver.close()
+			}
+		})
+
+		void it('aborts a pending start that a stop() invalidates during credential resolution', async () => {
+			let releaseEnv!: () => void
+			const envGate = new Promise<void>((resolve) => {
+				releaseEnv = resolve
+			})
+			const { pipeline, spawnedCalls } = makeLifecycle({ envGate })
+			const startPromise = pipeline.start(port, [datagram(1)])
+			// Let the start reach (and stall in) the injected credential resolution - it
+			// has not spawned anything yet.
+			await new Promise((r) => setTimeout(r, 20))
+
+			// A stop() while nothing is registered used to be a silent no-op: the pending
+			// start would have registered a producer *after* the teardown returned.
+			await pipeline.stop(port)
+			releaseEnv()
+			await startPromise
+
+			assert.strictEqual(pipeline.isActive(port), false)
+			// The invalidated start never spawned a child - there is nothing to clean up.
+			assert.strictEqual(spawnedCalls.length, 0)
+		})
+
+		void it('restores unsent held datagrams to the hold when the pipeline dies during startup', async () => {
+			const receiver = await makeReceiver()
+			// Both children never print the readiness line: each start waits out the
+			// SRTP_STARTUP_GRACE_MS (~300ms) before its readiness resolves.
+			const { pipeline, children } = makeLifecycle({
+				childScript: 'setInterval(() => {}, 1000)',
+			})
+			try {
+				// First pipeline survives its grace period and starts ingesting.
+				await pipeline.start(port, [datagram(1)])
+				await waitUntil(() => receiver.received.length === 1)
+
+				// It crashes: the port is left without a pipeline.
+				children[0]!.kill('SIGKILL')
+				await waitUntil(() => !pipeline.isActive(port))
+
+				// Datagrams arriving in the no-pipeline window are held, and the next
+				// start seeds them into its pendingQueue at registration.
+				pipeline.writePacket(port, datagram(2))
+				pipeline.writePacket(port, datagram(3))
+
+				// The replacement pipeline dies *during* its readiness window - the
+				// unsent remainder of its seeded queue must go back to the hold instead
+				// of being dropped (the failed-start path comes looking for it via
+				// takeHeldDatagrams).
+				const startPromise = pipeline.start(port, [])
+				await waitUntil(() => pipeline.isActive(port))
+				children[1]!.kill('SIGKILL')
+				await startPromise
+
+				assert.strictEqual(pipeline.isActive(port), false)
+				assert.deepStrictEqual(pipeline.takeHeldDatagrams(port), [
+					datagram(2),
+					datagram(3),
+				])
 			} finally {
 				await pipeline.shutdown()
 				receiver.close()

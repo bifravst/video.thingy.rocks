@@ -1,5 +1,6 @@
 import {
 	CfnOutput,
+	CfnResource,
 	Duration,
 	Fn,
 	RemovalPolicy,
@@ -332,17 +333,22 @@ export class StreamingStack extends Stack {
 		// both streams for the duration of the rollout. Bumping the generation instead
 		// creates a replacement ASG and replacement target groups behind the same
 		// listeners: the listeners are only re-pointed at the new target groups once the
-		// replacement fleet's ASG exists (see the listener dependency below), and the old
-		// fleet - the sole traffic receiver until that flip - is then drained (target-group
-		// deregistration delay) and removed. At no point do old and new code both receive
-		// traffic. The default ('gen2') deliberately differs from the currently deployed
-		// (unsuffixed) resource names, so deploying this update performs exactly this
-		// cutover; bump it via `--context fleetGeneration=gen3` for any future change that
-		// is again unsafe to roll out with old and new instances serving side by side.
-		// Within an unchanged generation, normal rolling updates apply again.
+		// replacement fleet is *ingesting-ready* (see the FleetCutoverReadiness custom
+		// resource below), and the old fleet - the sole traffic receiver until that flip -
+		// is then drained (target-group deregistration delay) and removed. At no point do
+		// old and new code both receive traffic. The default ('gen2') deliberately differs
+		// from the currently deployed (unsuffixed) resource names, so deploying this
+		// update performs exactly this cutover; bump it via
+		// `--context fleetGeneration=gen3` for any future change that is again unsafe to
+		// roll out with old and new instances serving side by side. Within an unchanged
+		// generation, normal rolling updates apply again.
 		const fleetGeneration =
 			(this.node.tryGetContext('fleetGeneration') as string | undefined) ??
 			'gen2'
+		/** Minimum number of instances the fleet keeps - also the number of healthy
+		 * targets each target group must report before the NLB listeners cut over to it
+		 * (see FleetCutoverReadiness below). */
+		const ASG_MIN_CAPACITY = 2
 
 		// Create Auto Scaling Group with Launch Template
 		this.autoScalingGroup = new autoscaling.AutoScalingGroup(
@@ -352,7 +358,7 @@ export class StreamingStack extends Stack {
 				vpc: this.vpc,
 				vpcSubnets: { subnets: [primarySubnet] },
 				launchTemplate,
-				minCapacity: 2,
+				minCapacity: ASG_MIN_CAPACITY,
 				maxCapacity: 10,
 				updatePolicy: autoscaling.UpdatePolicy.rollingUpdate({
 					maxBatchSize: 1,
@@ -497,18 +503,77 @@ export class StreamingStack extends Stack {
 			this.autoScalingGroup.attachToNetworkTargetGroup(targetGroup)
 		}
 
-		// The listeners (stable resource names, tied to the NLB's fixed addresses) are only
-		// re-pointed at the fleet generation's target groups after that generation's ASG
-		// exists: on a generation bump this makes the NLB cut over to the replacement fleet
-		// rather than flipping to empty target groups while the new instances are still
-		// launching. There is no dependency cycle: the ASG depends on the target groups
-		// (via its TargetGroupARNs), and the listeners depend on both - nothing depends on
-		// the listeners. Note the new instances still need to pass the target groups' health
-		// checks before receiving traffic, so a generation cutover has a brief warm-up gap
-		// by design - the alternative (old and new serving simultaneously) is exactly the
-		// split-brain ingestion the generation scheme exists to prevent.
+		// Deployment-time readiness gate for the fleet cutover: the ASG resource alone
+		// reaching CREATE_COMPLETE proves nothing about the *instances* - they may still
+		// be bootstrapping, so re-pointing the stable listeners at the new target groups
+		// at that point can leave every listener with zero healthy targets (a full ingest
+		// outage). This custom resource instead blocks the listener update until every
+		// target group of this generation reports at least ASG_MIN_CAPACITY healthy
+		// targets - the same TCP:9999 health check the NLB itself uses - so the cutover
+		// flips traffic only to a fleet that is genuinely ready to ingest. If the new
+		// fleet never becomes healthy, the resource fails and CloudFormation rolls the
+		// update back (the old fleet, still sole receiver, is untouched) rather than
+		// cutting over into an outage. The resource is scoped by the fleet generation so
+		// each cutover runs a fresh check; within an unchanged generation its properties
+		// are stable, so ordinary stack updates do not re-run it.
+		const fleetCutoverReadinessChecker = new lambdanode.NodejsFunction(
+			this,
+			`FleetCutoverReadiness-${fleetGeneration}`,
+			{
+				entry: join(
+					__dirname,
+					'..',
+					'lambda',
+					'fleet-cutover-readiness',
+					'index.ts',
+				),
+				runtime: lambda.Runtime.NODEJS_24_X,
+				handler: 'handler',
+				timeout: Duration.minutes(10),
+				bundling: {
+					format: lambdanode.OutputFormat.ESM,
+				},
+			},
+		)
+		fleetCutoverReadinessChecker.addToRolePolicy(
+			new iam.PolicyStatement({
+				effect: iam.Effect.ALLOW,
+				actions: ['elasticloadbalancing:DescribeTargetHealth'],
+				resources: [
+					...targetGroups.map((targetGroup) => targetGroup.targetGroupArn),
+					...srtpTargetGroups.map((targetGroup) => targetGroup.targetGroupArn),
+				],
+			}),
+		)
+		// (A raw CfnResource with a Custom:: type - the L2 CustomResource's type
+		// declarations are truncated in this aws-cdk-lib version, and the properties here
+		// are simple: ServiceToken is what CloudFormation's custom-resource framework
+		// reads, everything else passes through to the Lambda's event.)
+		const fleetCutoverReadiness = new CfnResource(
+			this,
+			`FleetCutoverReadinessCR-${fleetGeneration}`,
+			{
+				type: 'Custom::FleetCutoverReadiness',
+				properties: {
+					ServiceToken: fleetCutoverReadinessChecker.functionArn,
+					TargetGroupArns: [
+						...targetGroups.map((targetGroup) => targetGroup.targetGroupArn),
+						...srtpTargetGroups.map(
+							(targetGroup) => targetGroup.targetGroupArn,
+						),
+					],
+					MinHealthyTargets: ASG_MIN_CAPACITY,
+				},
+			},
+		)
+		// The check runs once the replacement ASG exists (it registers the instances into
+		// the target groups it depends on), and the listeners depend on the check - so the
+		// cutover order is: new fleet up and healthy -> listeners flip -> old fleet
+		// drained and removed. Within an unchanged generation this dependency chain is a
+		// no-op (the ASG and the check already exist).
+		fleetCutoverReadiness.node.addDependency(this.autoScalingGroup)
 		for (const listener of nlbListeners) {
-			listener.node.addDependency(this.autoScalingGroup)
+			listener.node.addDependency(fleetCutoverReadiness)
 		}
 
 		// Use ELB health check so ASG only considers instances ready when they pass NLB

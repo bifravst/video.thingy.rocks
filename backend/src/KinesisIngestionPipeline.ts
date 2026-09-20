@@ -335,6 +335,20 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	/** True once shutdown() has run; further starts are refused (see shutdown()). */
 	private closed = false
 
+	/**
+	 * Invalidation counter for in-flight starts, bumped by stop() (and effectively by
+	 * shutdown() via `closed`): stop() is a no-op until a pipeline is *registered*, so a
+	 * start() that is still awaiting credential resolution or the FIFO open would
+	 * otherwise happily register its GStreamer child *after* the teardown already
+	 * returned - leaving a producer that no stop() ever saw, which the ownership
+	 * generation guards in index.ts cannot reliably catch either (the generation
+	 * capture there predates the child's appearance, and clearLockHeld can run before
+	 * it). Starts capture the counter at entry and re-check it after every await
+	 * before registering; a start that observes an invalidation cleans up its own child
+	 * and abandons, so nothing registers behind a completed teardown.
+	 */
+	private readonly startGenerationByPort = new Map<number, number>()
+
 	constructor(
 		config: KinesisIngestionPipelineConfig,
 		deps?: KinesisIngestionPipelineDependencies,
@@ -868,11 +882,21 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	): Promise<void> {
 		if (this.activePipelines.has(port)) return
 
+		// Start-invalidation token (see startGenerationByPort): captured before the
+		// first await below, re-checked after each await before anything is registered.
+		const startGeneration = this.startGenerationByPort.get(port) ?? 0
+		const startInvalidated = (): boolean =>
+			this.closed ||
+			(this.startGenerationByPort.get(port) ?? 0) !== startGeneration
+
 		const streamName = this.streamNameForPort(port)
 		const region = this.config.region
 
 		const env = await this.resolveGstEnv(port, streamName)
 		if (env === undefined) return
+		// A stop()/shutdown() during credential resolution invalidated this start:
+		// nothing has been spawned yet, so there is nothing to clean up.
+		if (startInvalidated()) return
 
 		const logConfigPath = this.logConfigPath()
 
@@ -1029,6 +1053,25 @@ export class KinesisIngestionPipeline extends EventEmitter {
 				// best-effort cleanup; nothing more to do if this fails
 			}
 			throw err instanceof Error ? err : new Error(String(err))
+		}
+		// A stop()/shutdown() invalidated this start while it waited for GStreamer to
+		// open the FIFO - nothing is registered yet, but a child was already spawned:
+		// stop it (and its actual exit awaited) ourselves, the same way the failure path
+		// above cleans up, instead of registering a producer behind the completed
+		// teardown.
+		if (startInvalidated()) {
+			this.logger.warn(
+				'Start invalidated while waiting for the FIFO; aborting startup',
+				{ port, streamName, fifoPath },
+			)
+			await this.killAndWait(gst, { port, pid: gst.pid, fifoPath })
+			this.spawnedGst.delete(gst)
+			try {
+				fs.unlinkSync(fifoPath)
+			} catch {
+				// best-effort cleanup; nothing more to do if this fails
+			}
+			return
 		}
 		inputStream.on('error', (err: NodeJS.ErrnoException) => {
 			if (err.code !== 'EPIPE') {
@@ -1237,6 +1280,16 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		const srtpConfig = this.config.srtp
 		if (!srtpConfig) return
 
+		// Start-invalidation token (see startGenerationByPort): captured before the
+		// first await below, re-checked after each await before anything is registered.
+		// (The SRTP path's spawn and registration are one synchronous block, so unlike
+		// the FIFO path there is no post-spawn pre-registration window to guard - the
+		// only await before registering is the credential resolution.)
+		const startGeneration = this.startGenerationByPort.get(port) ?? 0
+		const startInvalidated = (): boolean =>
+			this.closed ||
+			(this.startGenerationByPort.get(port) ?? 0) !== startGeneration
+
 		const streamName = this.streamNameForPort(port)
 		const region = this.config.region
 
@@ -1252,6 +1305,10 @@ export class KinesisIngestionPipeline extends EventEmitter {
 
 		const env = await this.resolveGstEnv(port, streamName)
 		if (env === undefined) return
+		// A stop()/shutdown() during credential resolution invalidated this start:
+		// nothing has been spawned yet, so there is nothing to clean up - abandoning
+		// here is what keeps a stop() from being a silent no-op against this start.
+		if (startInvalidated()) return
 
 		const relayPortOffset =
 			srtpConfig.relayPortOffset ?? DEFAULT_SRTP_RELAY_PORT_OFFSET
@@ -1413,6 +1470,35 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			pipeline.pendingQueueBytes += held.totalBytes
 		}
 
+		// Returns the unsent remainder of this pipeline's pending queue to the hold (see
+		// srtpHoldByPort) on every stale-startup exit below: the queued datagrams were
+		// already *taken out* of the hold (seeded above) and out of writePacket's live
+		// path, so a start that dies mid-readiness/mid-drain must hand them back - the
+		// failed-start path in index.ts and the port's next start both come looking for
+		// them via takeHeldDatagrams, and without this they would be permanently dropped
+		// (exactly the post-crash recovery packets this hold exists to preserve).
+		// Our remainder is older than anything writePacket held after this pipeline's
+		// entry was removed, so it goes first; the byte cap keeps the hold bounded.
+		const restoreUnsentToHold = (): void => {
+			if (pipeline.pendingQueue.length === 0) return
+			const remainder = pipeline.pendingQueue.splice(
+				0,
+				pipeline.pendingQueue.length,
+			)
+			pipeline.pendingQueueBytes = 0
+			const existing = this.srtpHoldByPort.get(port)?.chunks ?? []
+			const chunks = [...remainder, ...existing]
+			let totalBytes = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
+			const maxHoldBytes =
+				this.config.srtp?.pendingQueueMaxBytes ??
+				DEFAULT_SRTP_PENDING_QUEUE_MAX_BYTES
+			while (totalBytes > maxHoldBytes && chunks.length > 1) {
+				const dropped = chunks.shift()
+				if (dropped !== undefined) totalBytes -= dropped.length
+			}
+			this.srtpHoldByPort.set(port, { chunks, totalBytes })
+		}
+
 		// Unlike the FIFO path (whose fs.open() blocks until filesrc opens for read), there is
 		// no OS-level handshake for udpsrc binding a port - wait for GStreamer's own readiness
 		// signal (or the fallback timeout) before sending anything. Live packets queue in
@@ -1424,7 +1510,10 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		// (now-stale) pipeline must not replay, flip ready, log "started", or touch the relay
 		// socket again. Compared by reference, not just isActive(port), so a *newer* pipeline
 		// that already took over this port isn't mistaken for this one.
-		if (this.activePipelines.get(port) !== pipeline) return
+		if (this.activePipelines.get(port) !== pipeline) {
+			restoreUnsentToHold()
+			return
+		}
 
 		// Await each send and pause briefly every batch - the pre-start buffer can hold
 		// thousands of packets (10MB / ~1300 bytes each), and firing them all at once with no
@@ -1432,12 +1521,18 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		// datagrams (including the first keyframe/SPS/PPS) before GStreamer can consume them.
 		for (const [index, datagram] of initialDatagrams.entries()) {
 			await this.sendSrtpDatagram(port, pipeline, datagram, 'initial')
-			if (this.activePipelines.get(port) !== pipeline) return
+			if (this.activePipelines.get(port) !== pipeline) {
+				restoreUnsentToHold()
+				return
+			}
 			if ((index + 1) % SRTP_REPLAY_BATCH_SIZE === 0) {
 				await new Promise((resolve) =>
 					setTimeout(resolve, SRTP_REPLAY_BATCH_PAUSE_MS),
 				)
-				if (this.activePipelines.get(port) !== pipeline) return
+				if (this.activePipelines.get(port) !== pipeline) {
+					restoreUnsentToHold()
+					return
+				}
 			}
 		}
 
@@ -1456,7 +1551,10 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		// staleness checks below.
 		let drainedFromQueue = 0
 		while (pipeline.pendingQueue.length > 0) {
-			if (this.activePipelines.get(port) !== pipeline) return
+			if (this.activePipelines.get(port) !== pipeline) {
+				restoreUnsentToHold()
+				return
+			}
 			const datagram = pipeline.pendingQueue.shift()
 			if (datagram === undefined) break
 			pipeline.pendingQueueBytes -= datagram.length
@@ -1466,7 +1564,10 @@ export class KinesisIngestionPipeline extends EventEmitter {
 				await new Promise((resolve) =>
 					setTimeout(resolve, SRTP_REPLAY_BATCH_PAUSE_MS),
 				)
-				if (this.activePipelines.get(port) !== pipeline) return
+				if (this.activePipelines.get(port) !== pipeline) {
+					restoreUnsentToHold()
+					return
+				}
 			}
 		}
 
@@ -1720,6 +1821,16 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		// into whatever starts next. Before the pipeline lookup: the hold exists exactly
 		// when no pipeline is active, which is also when the lookup below returns early.
 		this.srtpHoldByPort.delete(port)
+
+		// Invalidate any start still in flight for this port (see startGenerationByPort):
+		// the lookup below only stops a *registered* pipeline - a start that has spawned
+		// but not yet registered (still resolving credentials, or waiting for the FIFO) is
+		// invisible to it and would register a fresh producer after this teardown
+		// returned. The start re-checks its token after each await and aborts.
+		this.startGenerationByPort.set(
+			port,
+			(this.startGenerationByPort.get(port) ?? 0) + 1,
+		)
 
 		const pipeline = this.activePipelines.get(port)
 		if (!pipeline) return
