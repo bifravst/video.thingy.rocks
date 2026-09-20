@@ -52,6 +52,25 @@ export type KinesisIngestionPipelineConfig = {
 	}
 }
 
+/**
+ * Injectable process dependencies, so the SRTP lifecycle (spawn argv/caps construction,
+ * readiness gating, ordered replay, pending-queue bounds, stop/shutdown cleanup) can be
+ * exercised by the spec without a real gst-launch-1.0 or AWS credentials. Both are
+ * optional and default to the real things; production code never passes them.
+ */
+export type KinesisIngestionPipelineDependencies = {
+	/** Replaces the gst-launch-1.0 / sh -c spawn in both transports. */
+	spawn?: typeof spawn
+	/**
+	 * Replaces AWS credential resolution for kvssink's env (see resolveGstEnv) - must
+	 * return the env for the child, or undefined to simulate a failed resolution.
+	 */
+	gstEnv?: (
+		port: number,
+		streamName: string,
+	) => Promise<NodeJS.ProcessEnv | undefined>
+}
+
 /** Must match cdk/StreamingStack.ts's KINESIS_STREAM_NAME_PREFIX (duplicated, not shared,
  * since backend/ and cdk/ are deployed separately). */
 const KINESIS_STREAM_NAME_PREFIX = 'video-streaming-2026-09-video'
@@ -298,7 +317,10 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	/** True once shutdown() has run; further starts are refused (see shutdown()). */
 	private closed = false
 
-	constructor(config: KinesisIngestionPipelineConfig) {
+	constructor(
+		config: KinesisIngestionPipelineConfig,
+		deps?: KinesisIngestionPipelineDependencies,
+	) {
 		super()
 		// Fail fast on a config that would silently map ports to nonexistent Kinesis
 		// VideoStreams: streamSlotForPort derives the slot from the port's offset within its
@@ -334,7 +356,21 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		}
 		this.config = config
 		this.logger = new Logger('KinesisIngestionPipeline')
+		// Test-injectable process dependencies (see KinesisIngestionPipelineDependencies):
+		// defaults are the real implementations, so production behavior is unchanged.
+		this.spawnProcess = deps?.spawn ?? spawn
+		this.gstEnvResolver = deps?.gstEnv
 	}
+
+	/** Spawn to use for GStreamer children (injectable for tests). */
+	private readonly spawnProcess: typeof spawn
+	/** Optional replacement for resolveGstEnv's credential resolution (tests). */
+	private readonly gstEnvResolver:
+		| ((
+				port: number,
+				streamName: string,
+		  ) => Promise<NodeJS.ProcessEnv | undefined>)
+		| undefined
 
 	isSrtpPort(port: number): boolean {
 		const srtp = this.config.srtp
@@ -600,6 +636,11 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		port: number,
 		streamName: string,
 	): Promise<NodeJS.ProcessEnv | undefined> {
+		// Test injection point (see KinesisIngestionPipelineDependencies) - skips the real
+		// AWS credential chain, which must not run in unit tests.
+		if (this.gstEnvResolver !== undefined) {
+			return this.gstEnvResolver(port, streamName)
+		}
 		const credentialProvider = fromNodeProviderChain({
 			timeout: 10_000,
 			maxRetries: 5,
@@ -794,7 +835,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			)
 			return
 		}
-		const gst = spawn('sh', ['-c', shellCmd], {
+		const gst = this.spawnProcess('sh', ['-c', shellCmd], {
 			stdio: ['ignore', 'pipe', 'pipe'],
 			env,
 		})
@@ -1157,7 +1198,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			return
 		}
 
-		const gst = spawn('gst-launch-1.0', argv, {
+		const gst = this.spawnProcess('gst-launch-1.0', argv, {
 			stdio: ['ignore', 'pipe', 'pipe'],
 			env,
 		})

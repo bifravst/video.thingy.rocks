@@ -1,4 +1,8 @@
-import { GetParametersCommand, SSMClient } from '@aws-sdk/client-ssm'
+import {
+	GetParametersCommand,
+	type GetParametersCommandOutput,
+	SSMClient,
+} from '@aws-sdk/client-ssm'
 import { createHash } from 'node:crypto'
 import { Logger } from './Logger.ts'
 
@@ -36,6 +40,19 @@ export type SrtpKeyStoreConfig = {
 	region?: string
 	/** SSM parameter name prefix, e.g. "/{stackName}/srtp/port". Full name is "{prefix}/{port}/key". */
 	parameterPrefix: string
+	/**
+	 * SSM client to fetch parameters with - injectable for tests (see the loadPorts spec);
+	 * production callers omit it and get a real SSMClient for the configured region.
+	 */
+	ssmClient?: SsmParameterFetcher
+}
+
+/**
+ * The minimal SSM surface loadPorts needs. A real SSMClient satisfies this structurally;
+ * the spec passes a stub recording GetParametersCommand inputs instead.
+ */
+export type SsmParameterFetcher = {
+	send: (command: GetParametersCommand) => Promise<GetParametersCommandOutput>
 }
 
 type StoredSrtpKey = {
@@ -87,14 +104,16 @@ export const isStoredSrtpKey = (value: unknown): value is StoredSrtpKey => {
  * process start; there is no rotation/live-reload, matching the "static key" requirement.
  */
 export class SrtpKeyStore {
-	private readonly client: SSMClient
+	private readonly client: SsmParameterFetcher
 	private readonly config: SrtpKeyStoreConfig
 	private readonly logger: Logger
 	private readonly keysByPort: Map<number, SrtpPortKey> = new Map()
 
 	constructor(config: SrtpKeyStoreConfig) {
 		this.config = config
-		this.client = new SSMClient({ region: config.region ?? 'eu-central-1' })
+		this.client =
+			config.ssmClient ??
+			new SSMClient({ region: config.region ?? 'eu-central-1' })
 		this.logger = new Logger('SrtpKeyStore')
 	}
 

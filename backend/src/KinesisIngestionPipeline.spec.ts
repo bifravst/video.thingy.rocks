@@ -1,4 +1,6 @@
 import assert from 'node:assert'
+import { spawn } from 'node:child_process'
+import dgram from 'node:dgram'
 import { describe, it } from 'node:test'
 import {
 	advanceSrtpRoc,
@@ -446,6 +448,224 @@ void describe('KinesisIngestionPipeline', () => {
 				highestSeq: 40000,
 				roc: 0,
 			})
+		})
+	})
+
+	void describe('SRTP pipeline lifecycle (injected child process)', () => {
+		const port = 6000
+		// port + DEFAULT_SRTP_RELAY_PORT_OFFSET (10000) - must stay in sync manually.
+		const relayPort = 16000
+		const keyHex = 'ab'.repeat(30)
+		const keyStore = {
+			getKeyForPort: (p: number) =>
+				p === port
+					? {
+							keyHex,
+							ssrc: 42,
+							cipher: 'aes-128-icm',
+							auth: 'hmac-sha1-80',
+							keyFingerprint: 'fp',
+						}
+					: undefined,
+		} as unknown as SrtpKeyStore
+
+		/** A minimal valid SRTP datagram for the configured SSRC (RTP v2). */
+		const datagram = (seq: number, size = 12): Buffer => {
+			const buf = Buffer.alloc(size)
+			buf[0] = 0x80 // RTP version 2
+			buf.writeUInt16BE(seq, 2)
+			buf.writeUInt32BE(42, 8)
+			return buf
+		}
+
+		const waitUntil = async (
+			predicate: () => boolean,
+			timeoutMs = 3_000,
+		): Promise<void> => {
+			const deadline = Date.now() + timeoutMs
+			while (!predicate() && Date.now() < deadline) {
+				await new Promise((r) => setTimeout(r, 10))
+			}
+			assert.ok(predicate(), 'condition not met within timeout')
+		}
+
+		/**
+		 * Builds a pipeline whose "GStreamer" children are real Node processes (spawned via
+		 * the injectable spawn dependency), so exit/kill/stdio behave like the real thing.
+		 * The default child script prints GStreamer's readiness line; pass a custom script
+		 * (e.g. one that never prints it) to exercise the readiness-grace fallback.
+		 */
+		const makeLifecycle = (opts?: {
+			pendingQueueMaxBytes?: number
+			childScript?: string
+		}) => {
+			const spawnedCalls: {
+				command: string
+				argv: string[]
+				env: NodeJS.ProcessEnv
+			}[] = []
+			const children: ReturnType<typeof spawn>[] = []
+			const fakeSpawn = ((
+				command: string,
+				args: readonly string[],
+				options: { env?: NodeJS.ProcessEnv },
+			): ReturnType<typeof spawn> => {
+				spawnedCalls.push({
+					command,
+					argv: [...args],
+					env: options.env ?? {},
+				})
+				const child = spawn(
+					process.execPath,
+					[
+						'-e',
+						opts?.childScript ??
+							"console.log('Setting pipeline to PLAYING ...'); setInterval(() => {}, 1000);",
+					],
+					{ stdio: ['ignore', 'pipe', 'pipe'] },
+				)
+				children.push(child)
+				return child
+			}) as unknown as typeof spawn
+			const pipeline = new KinesisIngestionPipeline(
+				{
+					region: 'eu-central-1',
+					portRange: { start: 5000, end: 5009 },
+					srtp: {
+						portRange: { start: 6000, end: 6009 },
+						keyStore,
+						pendingQueueMaxBytes: opts?.pendingQueueMaxBytes,
+					},
+				},
+				{
+					spawn: fakeSpawn,
+					gstEnv: async () => ({ GST_ENV_STUB: 'yes' }),
+				},
+			)
+			return { pipeline, spawnedCalls, children }
+		}
+
+		/** Binds a receiver on the relay port - plays the role of GStreamer's udpsrc. */
+		const makeReceiver = async (): Promise<{
+			received: Buffer[]
+			close: () => void
+		}> => {
+			const received: Buffer[] = []
+			const socket = dgram.createSocket('udp4')
+			await new Promise<void>((resolve) =>
+				socket.bind(relayPort, '127.0.0.1', resolve),
+			)
+			socket.on('message', (msg: Buffer) => received.push(msg))
+			return { received, close: () => socket.close() }
+		}
+
+		void it('spawns with the expected argv/caps, replays initial datagrams in order, and relays live traffic', async () => {
+			const receiver = await makeReceiver()
+			const { pipeline, spawnedCalls, children } = makeLifecycle()
+			try {
+				// A seeded ROC must reach srtpdec's caps unmodified (see srtpdecSeedRoc).
+				pipeline.seedSrtpRoc(port, { roc: 2, highestSeq: 500 })
+				const initial = [datagram(100), datagram(101), datagram(102)]
+				await pipeline.start(port, initial)
+
+				assert.strictEqual(pipeline.isActive(port), true)
+				assert.strictEqual(spawnedCalls.length, 1)
+				const call = spawnedCalls[0]!
+				assert.strictEqual(call.command, 'gst-launch-1.0')
+				assert.ok(call.argv.includes('udpsrc'))
+				assert.ok(call.argv.includes(`port=${relayPort}`))
+				const caps = call.argv.find((token) => token.startsWith('caps='))
+				assert.ok(caps !== undefined)
+				assert.ok(caps.includes('ssrc=(uint)42'))
+				assert.ok(caps.includes(`srtp-key=(buffer)${keyHex}`))
+				assert.ok(caps.includes('srtp-cipher=(string)aes-128-icm'))
+				assert.ok(caps.includes('srtp-auth=(string)hmac-sha1-80'))
+				assert.ok(caps.includes('roc=(uint)2'))
+				// The env resolved for kvssink (injected here) is passed to the child.
+				assert.strictEqual(call.env.GST_ENV_STUB, 'yes')
+
+				// The buffered datagrams are replayed in order, as individual datagrams.
+				await waitUntil(() => receiver.received.length === 3)
+				assert.deepStrictEqual(receiver.received, initial)
+
+				// Live datagrams relay after readiness, in order.
+				pipeline.writePacket(port, datagram(103))
+				pipeline.writePacket(port, datagram(104))
+				await waitUntil(() => receiver.received.length === 5)
+				assert.deepStrictEqual(receiver.received.slice(3), [
+					datagram(103),
+					datagram(104),
+				])
+
+				// stop() terminates the child (its actual exit is awaited) and clears the port.
+				await pipeline.stop(port)
+				assert.strictEqual(pipeline.isActive(port), false)
+				assert.ok(
+					children[0]!.signalCode === 'SIGTERM' ||
+						children[0]!.exitCode !== null,
+				)
+				// Live traffic after stop is not relayed anywhere.
+				const receivedAtStop = receiver.received.length
+				pipeline.writePacket(port, datagram(105))
+				await new Promise((r) => setTimeout(r, 50))
+				assert.strictEqual(receiver.received.length, receivedAtStop)
+			} finally {
+				await pipeline.shutdown()
+				receiver.close()
+			}
+		})
+
+		void it('queues live datagrams that arrive before readiness, in order, dropping the oldest past pendingQueueMaxBytes', async () => {
+			const receiver = await makeReceiver()
+			// The child never prints the readiness line, so start() waits out the
+			// SRTP_STARTUP_GRACE_MS (~300ms) fallback - a long not-ready window to queue in.
+			const { pipeline } = makeLifecycle({
+				childScript: 'setInterval(() => {}, 1000)',
+				pendingQueueMaxBytes: 2_500,
+			})
+			try {
+				const initial = [datagram(10), datagram(11)]
+				const startPromise = pipeline.start(port, initial)
+				// Wait for the pipeline to register (spawn happens after the injected env
+				// resolution), then queue live datagrams while the startup replay is still
+				// in flight.
+				await waitUntil(() => pipeline.isActive(port))
+				// Each queued datagram is 1100 bytes; four exceed the 2500-byte cap, so the
+				// two oldest are dropped and the two newest retained, in order.
+				pipeline.writePacket(port, datagram(50, 1100))
+				pipeline.writePacket(port, datagram(51, 1100))
+				pipeline.writePacket(port, datagram(52, 1100))
+				pipeline.writePacket(port, datagram(53, 1100))
+				await startPromise
+
+				// Initial replay first, then the retained live datagrams, in order.
+				await waitUntil(() => receiver.received.length === 4)
+				assert.deepStrictEqual(receiver.received, [
+					datagram(10),
+					datagram(11),
+					datagram(52, 1100),
+					datagram(53, 1100),
+				])
+			} finally {
+				await pipeline.shutdown()
+				receiver.close()
+			}
+		})
+
+		void it('shutdown() refuses further starts and waits for still-running children to exit', async () => {
+			const { pipeline, spawnedCalls, children } = makeLifecycle()
+			await pipeline.start(port, [])
+			assert.strictEqual(pipeline.isActive(port), true)
+			await pipeline.shutdown()
+			assert.strictEqual(pipeline.isActive(port), false)
+			// The real child actually exited - killAndWait waits for the exit event.
+			assert.ok(
+				children[0]!.exitCode !== null || children[0]!.signalCode !== null,
+			)
+			// Further starts are refused without spawning again.
+			await pipeline.start(port, [])
+			assert.strictEqual(spawnedCalls.length, 1)
+			assert.strictEqual(pipeline.isActive(port), false)
 		})
 	})
 })

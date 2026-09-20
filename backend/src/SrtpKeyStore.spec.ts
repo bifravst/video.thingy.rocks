@@ -1,9 +1,14 @@
+import {
+	type GetParametersCommand,
+	type GetParametersCommandOutput,
+} from '@aws-sdk/client-ssm'
 import assert from 'node:assert'
 import { describe, it } from 'node:test'
 import {
 	isStoredSrtpKey,
 	isValidSrtpKeyHex,
 	keyFingerprint,
+	SrtpKeyStore,
 } from './SrtpKeyStore.ts'
 
 void describe('SrtpKeyStore', () => {
@@ -121,6 +126,142 @@ void describe('SrtpKeyStore', () => {
 				}),
 				false,
 			)
+		})
+	})
+
+	void describe('loadPorts', () => {
+		const PREFIX = '/test/srtp/port'
+		const nameFor = (port: number): string => `${PREFIX}/${port}/key`
+		/** The port is the 5th path segment: "/test/srtp/port/{port}/key". */
+		const portFromName = (name: string): number => Number(name.split('/')[4])
+		const validKeyHex = 'ab'.repeat(30) // 60 hex chars
+
+		/** Builds a store around a stub SSM client that records every command. */
+		const makeKeyStore = (
+			respond: (command: GetParametersCommand) => GetParametersCommandOutput,
+		): { keyStore: SrtpKeyStore; commands: GetParametersCommand[] } => {
+			const commands: GetParametersCommand[] = []
+			const keyStore = new SrtpKeyStore({
+				parameterPrefix: PREFIX,
+				ssmClient: {
+					send: async (command: GetParametersCommand) => {
+						commands.push(command)
+						return respond(command)
+					},
+				},
+			})
+			return { keyStore, commands }
+		}
+
+		/** Responds with SecureString parameters for the requested ports. */
+		const secureResponder =
+			(
+				valueFor: (port: number) => string,
+			): ((command: GetParametersCommand) => GetParametersCommandOutput) =>
+			(command) => ({
+				$metadata: {},
+				Parameters: (command.input.Names ?? []).map((name) => ({
+					Name: name,
+					Value: valueFor(portFromName(name)),
+					Type: 'SecureString' as const,
+				})),
+			})
+
+		void it('fetches parameters in 10-name chunks with WithDecryption and populates keys for all ports', async () => {
+			const ports = Array.from({ length: 12 }, (_, i) => 6000 + i)
+			const { keyStore, commands } = makeKeyStore(
+				secureResponder((port) =>
+					JSON.stringify({ key: validKeyHex, ssrc: port }),
+				),
+			)
+			await keyStore.loadPorts(ports)
+
+			// 12 ports > SSM's 10-name GetParameters limit -> two chunks.
+			assert.strictEqual(commands.length, 2)
+			assert.deepStrictEqual(
+				commands[0]!.input.Names,
+				ports.slice(0, 10).map(nameFor),
+			)
+			assert.deepStrictEqual(
+				commands[1]!.input.Names,
+				ports.slice(10).map(nameFor),
+			)
+			// Keys are SecureString secrets, so decryption must be requested.
+			assert.strictEqual(commands[0]!.input.WithDecryption, true)
+
+			for (const port of ports) {
+				const key = keyStore.getKeyForPort(port)
+				assert.ok(key !== undefined, `no key loaded for port ${port}`)
+				assert.strictEqual(key.keyHex, validKeyHex)
+				assert.strictEqual(key.ssrc, port)
+				// Defaults for the only suite supported end-to-end.
+				assert.strictEqual(key.cipher, 'aes-128-icm')
+				assert.strictEqual(key.auth, 'hmac-sha1-80')
+				assert.strictEqual(key.keyFingerprint, keyFingerprint(validKeyHex))
+			}
+		})
+
+		void it('rejects parameters that are not SecureString and does not load them', async () => {
+			const { keyStore } = makeKeyStore((command) => ({
+				$metadata: {},
+				Parameters: (command.input.Names ?? []).map((name) => ({
+					Name: name,
+					Value: JSON.stringify({
+						key: validKeyHex,
+						ssrc: portFromName(name),
+					}),
+					// Port 6000 was provisioned without encryption at rest.
+					Type: portFromName(name) === 6000 ? 'String' : 'SecureString',
+				})),
+			}))
+			await keyStore.loadPorts([6000, 6001])
+			assert.strictEqual(keyStore.hasKeyForPort(6000), false)
+			assert.strictEqual(keyStore.hasKeyForPort(6001), true)
+		})
+
+		void it('skips missing parameters (InvalidParameters) without loading them', async () => {
+			const { keyStore } = makeKeyStore((command) => ({
+				$metadata: {},
+				Parameters: (command.input.Names ?? [])
+					.filter((name) => portFromName(name) !== 6000)
+					.map((name) => ({
+						Name: name,
+						Value: JSON.stringify({ key: validKeyHex, ssrc: 1 }),
+						Type: 'SecureString' as const,
+					})),
+				InvalidParameters: (command.input.Names ?? []).filter(
+					(name) => portFromName(name) === 6000,
+				),
+			}))
+			await keyStore.loadPorts([6000, 6001])
+			assert.strictEqual(keyStore.hasKeyForPort(6000), false)
+			assert.strictEqual(keyStore.hasKeyForPort(6001), true)
+		})
+
+		void it('skips malformed or invalid key data and loads the valid ones', async () => {
+			const valueByPort = new Map<number, string>([
+				[6000, 'not json'],
+				[6001, JSON.stringify({ key: validKeyHex, ssrc: 'not-a-number' })],
+				// Wrong length and not hex.
+				[6002, JSON.stringify({ key: 'zz'.repeat(10), ssrc: 1 })],
+				[6003, JSON.stringify({ key: validKeyHex, ssrc: 7 })],
+			])
+			const { keyStore } = makeKeyStore(
+				secureResponder((port) => valueByPort.get(port)!),
+			)
+			await keyStore.loadPorts([6000, 6001, 6002, 6003])
+			assert.strictEqual(keyStore.hasKeyForPort(6000), false)
+			assert.strictEqual(keyStore.hasKeyForPort(6001), false)
+			assert.strictEqual(keyStore.hasKeyForPort(6002), false)
+			const key = keyStore.getKeyForPort(6003)
+			assert.ok(key !== undefined)
+			assert.strictEqual(key.ssrc, 7)
+		})
+
+		void it('does not call SSM for an empty port list', async () => {
+			const { keyStore, commands } = makeKeyStore(secureResponder(() => ''))
+			await keyStore.loadPorts([])
+			assert.strictEqual(commands.length, 0)
 		})
 	})
 })
