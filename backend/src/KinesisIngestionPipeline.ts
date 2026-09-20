@@ -311,6 +311,18 @@ export class KinesisIngestionPipeline extends EventEmitter {
 					`Invalid config: srtp.portRange (${config.srtp.portRange.start}-${config.srtp.portRange.end}, ${srtpPorts} ports) must cover exactly as many ports as portRange (${config.portRange.start}-${config.portRange.end}, ${mainPorts} ports): unencrypted port start+N and SRTP port start+N must stay paired (see streamSlotForPort/streamNameForPort)`,
 				)
 			}
+			// Overlapping ranges would leave isSrtpPort() claiming ports the main
+			// (unencrypted) listener is bound to - routing their packets to the SRTP
+			// handler/pipeline - while the SRTP listener cannot bind them at all
+			// (EADDRINUSE). The ranges must be fully disjoint.
+			const overlaps =
+				config.srtp.portRange.start <= config.portRange.end &&
+				config.portRange.start <= config.srtp.portRange.end
+			if (overlaps) {
+				throw new Error(
+					`Invalid config: srtp.portRange (${config.srtp.portRange.start}-${config.srtp.portRange.end}) must not overlap portRange (${config.portRange.start}-${config.portRange.end}): overlapping ports would be received by the unencrypted listener but routed to the SRTP pipeline, and the SRTP listener could never bind them`,
+				)
+			}
 		}
 		this.config = config
 		this.logger = new Logger('KinesisIngestionPipeline')

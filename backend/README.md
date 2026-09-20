@@ -45,6 +45,20 @@ What a client/device needs to send:
   The backend decrypts using a static SSRC configured per port, so a device that
   picks a new SSRC on every (re)connect will not decrypt correctly - always
   reuse the same SSRC on a given port.
+- **Session continuity**: a port's (key, SSRC) pair is the device's session
+  identity, and the backend persists the RTP rollover-counter (ROC) state under
+  it across restarts. This means a device **must never restart its RTP sequence
+  numbering** (sequence counter at 0 after a reboot, re-session, or factory
+  reset) while keeping the same key and SSRC - the backend would seed the fresh
+  session with the previous session's ROC, and `srtpdec` would reject its
+  packets until the sender wraps around to that ROC again (effectively forever).
+  If a device cannot guarantee monotonic sequence numbers across its restarts
+  (e.g. the bundled test sender, which restarts at a fixed sequence offset),
+  reprovision it with a **new key or SSRC** (see
+  `../scripts/provision-srtp-key.sh`) whenever it restarts its sequence, or ask
+  the operator to clear the port's persisted ROC state in DynamoDB
+  (`srtpRoc`/`srtpHighestSeq`/`srtpRocSsrc`/`srtpRocKeyFingerprint` on the
+  stream slot's `StreamMetadata` item).
 - **Encryption**: a static, pre-shared 30-byte SRTP master key + salt (60 hex
   characters), using **aes-128-icm** for encryption and **hmac-sha1-80** for
   authentication - the only suite this service supports. Keys are exchanged

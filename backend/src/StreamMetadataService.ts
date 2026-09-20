@@ -286,12 +286,16 @@ export class StreamMetadataService {
 	 * not the same cryptographic *session* - a device that reboots and restarts its own RTP
 	 * sequence/ROC at zero while keeping the same provisioned key and SSRC looks identical to
 	 * a resumed session from here, so a high persisted ROC would incorrectly seed the fresh
-	 * one and srtpdec would reject it indefinitely. Resolving this needs either a
-	 * protocol-level session identifier the device sends (there isn't one in this static-key
-	 * design) or a heuristic risky enough (e.g. "assume reset if the first live sequence
-	 * looks too low") to introduce its own false positives; deliberately not attempted here.
-	 * If this happens, the fix today is operational: clear srtpRoc/srtpHighestSeq/
-	 * srtpRocSsrc/srtpRocKeyFingerprint for the affected slot's DynamoDB item.
+	 * one and srtpdec would reject it indefinitely. This is covered by an explicit
+	 * session-continuity contract with the device (see backend/README.md, "Session
+	 * continuity"): a device must never restart its RTP sequence numbering while keeping the
+	 * same key and SSRC - it must be reprovisioned with a new key or SSRC when it does.
+	 * Resolving it without that contract would need either a protocol-level session
+	 * identifier the device sends (there isn't one in this static-key design) or a heuristic
+	 * risky enough (e.g. "assume reset if the first live sequence looks too low") to introduce
+	 * its own false positives; deliberately not attempted here. If it happens anyway, the fix
+	 * today is operational: clear srtpRoc/srtpHighestSeq/srtpRocSsrc/srtpRocKeyFingerprint
+	 * for the affected slot's DynamoDB item.
 	 */
 	async getSrtpRocState(
 		port: number,

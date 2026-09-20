@@ -42,7 +42,14 @@ other - never send both transports for the same numbered stream at once.
 
 **Key management is per-port**: each SRTP port (6000-6009) has its own key and a
 fixed, provisioned SSRC. The device must use a stable SSRC on a given port -
-`srtpdec`'s static-key mode pins the SSRC in the pipeline's caps.
+`srtpdec`'s static-key mode pins the SSRC in the pipeline's caps. **Session
+continuity**: a device must never restart its RTP sequence numbering while
+keeping the same key and SSRC (the backend persists rollover-counter state under
+that identity and would seed the fresh session with the previous session's ROC -
+see backend/README.md, "Session continuity"). When re-running the test sender
+below after it has exited, pass a fresh SSRC, or clear the slot's persisted ROC
+fields (`srtpRoc`/`srtpHighestSeq`/`srtpRocSsrc`/`srtpRocKeyFingerprint`) from
+the `StreamMetadata` DynamoDB item first.
 
 ## 1. Unit tests
 

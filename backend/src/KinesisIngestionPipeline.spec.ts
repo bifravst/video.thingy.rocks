@@ -268,6 +268,42 @@ void describe('KinesisIngestionPipeline', () => {
 				/portRange must be non-empty/,
 			)
 		})
+
+		void it('throws when the SRTP range overlaps the main range', () => {
+			// Overlapping ports would be received by the unencrypted listener but
+			// classified as SRTP by isSrtpPort() - routing them to the wrong handler and
+			// pipeline - while the SRTP listener could never bind them (EADDRINUSE).
+			// Both a fully-inside overlap and a partial overlap must be rejected.
+			for (const srtpRange of [
+				{ start: 5000, end: 5009 }, // identical
+				{ start: 5005, end: 5014 }, // straddling the end (same length)
+				{ start: 4995, end: 5004 }, // straddling the start (same length)
+				{ start: 5000, end: 5002 }, // fully inside (rejected by the length check first)
+			]) {
+				assert.throws(
+					() =>
+						new KinesisIngestionPipeline({
+							region: 'eu-central-1',
+							portRange: { start: 5000, end: 5009 },
+							srtp: { portRange: srtpRange, keyStore },
+						}),
+					/must not overlap|must cover exactly as many ports/,
+				)
+			}
+		})
+
+		void it('accepts adjacent but disjoint ranges', () => {
+			new KinesisIngestionPipeline({
+				region: 'eu-central-1',
+				portRange: { start: 5000, end: 5009 },
+				srtp: { portRange: { start: 4990, end: 4999 }, keyStore },
+			})
+			new KinesisIngestionPipeline({
+				region: 'eu-central-1',
+				portRange: { start: 5000, end: 5009 },
+				srtp: { portRange: { start: 5010, end: 5019 }, keyStore },
+			})
+		})
 	})
 
 	void describe('getConfiguredSrtpSsrc', () => {
