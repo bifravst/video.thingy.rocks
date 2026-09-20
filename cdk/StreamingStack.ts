@@ -319,10 +319,35 @@ export class StreamingStack extends Stack {
 			1,
 		)
 
+		// Fleet generation: scopes the Auto Scaling Group and its NLB target groups, so a
+		// breaking rollout can be deployed as a *full-fleet cutover* instead of the rolling
+		// update configured below. A rolling update replaces instances one batch at a time
+		// while the whole fleet keeps serving the same NLB target groups - fine for
+		// compatible changes, but this update renames every Kinesis Video Stream and moves
+		// the DynamoDB lock key from the raw port (5000-5009) to the stream slot (1-10):
+		// during a rolling overlap, old instances would write to the old
+		// {stackName}-video-5000 stream under lock row 5000 while new instances write to
+		// video-streaming-2026-09-video-1 under lock row 1 - the two schemes do not fence
+		// each other, so a device's traffic would be split between (or duplicated into)
+		// both streams for the duration of the rollout. Bumping the generation instead
+		// creates a replacement ASG and replacement target groups behind the same
+		// listeners: the listeners are only re-pointed at the new target groups once the
+		// replacement fleet's ASG exists (see the listener dependency below), and the old
+		// fleet - the sole traffic receiver until that flip - is then drained (target-group
+		// deregistration delay) and removed. At no point do old and new code both receive
+		// traffic. The default ('gen2') deliberately differs from the currently deployed
+		// (unsuffixed) resource names, so deploying this update performs exactly this
+		// cutover; bump it via `--context fleetGeneration=gen3` for any future change that
+		// is again unsafe to roll out with old and new instances serving side by side.
+		// Within an unchanged generation, normal rolling updates apply again.
+		const fleetGeneration =
+			(this.node.tryGetContext('fleetGeneration') as string | undefined) ??
+			'gen2'
+
 		// Create Auto Scaling Group with Launch Template
 		this.autoScalingGroup = new autoscaling.AutoScalingGroup(
 			this,
-			'UDPListenerASG',
+			`UDPListenerASG-${fleetGeneration}`,
 			{
 				vpc: this.vpc,
 				vpcSubnets: { subnets: [primarySubnet] },
@@ -375,7 +400,7 @@ export class StreamingStack extends Stack {
 		for (let port = 5000; port <= 5009; port++) {
 			const targetGroup = new elbv2.NetworkTargetGroup(
 				this,
-				`TargetGroup${port}`,
+				`TargetGroup${port}-${fleetGeneration}`,
 				{
 					vpc: this.vpc,
 					port,
@@ -403,17 +428,20 @@ export class StreamingStack extends Stack {
 		}
 
 		// Create UDP listeners for ports 5000-5009
+		const nlbListeners: elbv2.NetworkListener[] = []
 		for (let i = 0; i < targetGroups.length; i++) {
 			const port = 5000 + i
 			const targetGroup = targetGroups[i]
 			if (!targetGroup) {
 				throw new Error(`Target group for port ${port} is undefined`)
 			}
-			this.networkLoadBalancer.addListener(`UDPListener${port}`, {
-				port,
-				protocol: elbv2.Protocol.UDP,
-				defaultAction: elbv2.NetworkListenerAction.forward([targetGroup]),
-			})
+			nlbListeners.push(
+				this.networkLoadBalancer.addListener(`UDPListener${port}`, {
+					port,
+					protocol: elbv2.Protocol.UDP,
+					defaultAction: elbv2.NetworkListenerAction.forward([targetGroup]),
+				}),
+			)
 		}
 
 		// Create target groups + UDP listeners for SRTP ports 6000-6009 (same fleet, same
@@ -422,7 +450,7 @@ export class StreamingStack extends Stack {
 		for (let port = 6000; port <= 6009; port++) {
 			const targetGroup = new elbv2.NetworkTargetGroup(
 				this,
-				`SrtpTargetGroup${port}`,
+				`SrtpTargetGroup${port}-${fleetGeneration}`,
 				{
 					vpc: this.vpc,
 					port,
@@ -454,17 +482,33 @@ export class StreamingStack extends Stack {
 			if (!targetGroup) {
 				throw new Error(`SRTP target group for port ${port} is undefined`)
 			}
-			this.networkLoadBalancer.addListener(`SrtpUDPListener${port}`, {
-				port,
-				protocol: elbv2.Protocol.UDP,
-				defaultAction: elbv2.NetworkListenerAction.forward([targetGroup]),
-			})
+			nlbListeners.push(
+				this.networkLoadBalancer.addListener(`SrtpUDPListener${port}`, {
+					port,
+					protocol: elbv2.Protocol.UDP,
+					defaultAction: elbv2.NetworkListenerAction.forward([targetGroup]),
+				}),
+			)
 		}
 
 		// Attach all target groups to the Auto Scaling Group
 		// This enables automatic registration/deregistration of instances
 		for (const targetGroup of [...targetGroups, ...srtpTargetGroups]) {
 			this.autoScalingGroup.attachToNetworkTargetGroup(targetGroup)
+		}
+
+		// The listeners (stable resource names, tied to the NLB's fixed addresses) are only
+		// re-pointed at the fleet generation's target groups after that generation's ASG
+		// exists: on a generation bump this makes the NLB cut over to the replacement fleet
+		// rather than flipping to empty target groups while the new instances are still
+		// launching. There is no dependency cycle: the ASG depends on the target groups
+		// (via its TargetGroupARNs), and the listeners depend on both - nothing depends on
+		// the listeners. Note the new instances still need to pass the target groups' health
+		// checks before receiving traffic, so a generation cutover has a brief warm-up gap
+		// by design - the alternative (old and new serving simultaneously) is exactly the
+		// split-brain ingestion the generation scheme exists to prevent.
+		for (const listener of nlbListeners) {
+			listener.node.addDependency(this.autoScalingGroup)
 		}
 
 		// Use ELB health check so ASG only considers instances ready when they pass NLB

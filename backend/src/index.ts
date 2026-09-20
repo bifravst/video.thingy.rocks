@@ -171,11 +171,13 @@ const clearLockHeld = (port: number): void => {
 }
 
 /**
- * Stops the local pipeline and clears our in-process lock bookkeeping for a port, without
- * touching DynamoDB - used when a conditional write (updateSrtpRoc) reports we're no longer
- * the slot's owner there, so there is nothing left for us to release; continuing to run
- * (and write to) a pipeline we've lost the lock for is exactly the competing-producer
- * problem the lock exists to prevent.
+ * Stops the local pipeline and clears our in-process lock bookkeeping for a port - used
+ * when a conditional write (updateSrtpRoc 'lostLock', updateLastPacketTime's
+ * ConditionalCheckFailedException) proves we're no longer the slot's owner in DynamoDB,
+ * so there is nothing left for us to release; continuing to run (and write to) a pipeline
+ * we've lost the lock for is exactly the competing-producer problem the lock exists to
+ * prevent. A *transient* failure ('writeError') leaves ownership unknown - pass
+ * `maybeStillOwnsRow` so a conditional release is attempted (see below).
  *
  * Stops the pipeline *before* clearing local ownership, not after - clearing first would let
  * the paired transport's cheap pairedPortHoldsLock check pass and start racing this port's
@@ -183,19 +185,42 @@ const clearLockHeld = (port: number): void => {
  * by construction, so there's nothing stopping a genuine two-producer window). Also applies
  * the standard start backoff and re-arms an empty pre-start buffer afterward if the stream
  * is still active, so a later packet can retry lock acquisition - without the backoff, a
- * *transient* write failure (updateSrtpRoc/updateLastPacketTime return false for both a
- * genuinely lost conditional lock and an ordinary DynamoDB error - see their own doc
- * comments) would otherwise repeat this buffer/start/relinquish cycle (and the GStreamer
- * spawn/kill churn that goes with it) at roughly one attempt per 10MB for as long as the
- * outage lasts; without the re-arm at all, the stream would be stranded until a full
- * inactivity/resume cycle happens on its own.
+ * *transient* write failure would otherwise repeat this buffer/start/relinquish cycle (and
+ * the GStreamer spawn/kill churn that goes with it) at roughly one attempt per 10MB for as
+ * long as the outage lasts; without the re-arm at all, the stream would be stranded until
+ * a full inactivity/resume cycle happens on its own.
  */
-const relinquishPort = async (port: number): Promise<void> => {
+const relinquishPort = async (
+	port: number,
+	// Set when this instance may *still* own the DynamoDB row for this port's slot - i.e.
+	// a *transient* failure made it give up the local producer, not a conditional write
+	// that proved another owner: a conditional release is then attempted, so another
+	// instance can take the slot over immediately instead of waiting out the
+	// KINESIS_LOCK_STALE_MS threshold with nobody ingesting. Omitted when another owner
+	// was proven - there is nothing to release (releaseKinesisLock is conditional on the
+	// current owner, so it no-ops harmlessly if the row was lost after all).
+	maybeStillOwnsRow?: { slot: number },
+): Promise<void> => {
 	console.warn(
 		`[Main] Lost Kinesis lock for port ${port}; stopping local pipeline`,
 	)
 	if (kinesisIngestionPipeline) {
 		await kinesisIngestionPipeline.stop(port)
+	}
+	if (maybeStillOwnsRow !== undefined) {
+		try {
+			// Released *before* clearing local ownership (kinesisLockHeldForPorts), same
+			// ordering as every other handoff.
+			await streamMetadataService.releaseKinesisLock(
+				maybeStillOwnsRow.slot,
+				instanceId,
+			)
+		} catch (err) {
+			console.error(
+				`[Main] Error conditionally releasing Kinesis lock for port ${port}:`,
+				err,
+			)
+		}
 	}
 	clearLockHeld(port)
 	nextStartAttemptAllowedAtByPort.set(port, Date.now() + START_RETRY_BACKOFF_MS)
@@ -217,12 +242,13 @@ const FINAL_ROC_PERSIST_RETRY_DELAY_MS = 1_000
 /**
  * Persists the freshest SRTP rollover-tracking state for a slot one last time before this
  * instance hands the slot over (onStreamStop) or exits (shutdown), with bounded retries.
- * updateSrtpRoc returns false both for a lost conditional lock (retrying is pointless, but
- * the release below is equally conditional and will no-op) and for an ordinary DynamoDB
- * failure - so the write is retried a few times before giving up. If it still fails, the
- * handoff does NOT silently proceed as if persistence had succeeded: the next owner's
- * strongly consistent read may return a ROC that is stale by up to one rollover, and the
- * error logged here names the operational escape hatch for exactly that failure mode.
+ * updateSrtpRoc returns 'writeError' for an ordinary DynamoDB failure (retrying can help)
+ * and 'lostLock' when another instance owns the row (retrying is pointless, but the release
+ * below is equally conditional and will no-op) - so the write is retried a few times before
+ * giving up. If it still fails, the handoff does NOT silently proceed as if persistence
+ * had succeeded: the next owner's strongly consistent read may return a ROC that is stale
+ * by up to one rollover, and the error logged here names the operational escape hatch for
+ * exactly that failure mode.
  *
  * Callers must hold the slot's mutex (withSlotLock) for the *entire* handoff - this
  * persistence AND the releaseKinesisLock that follows it in the same critical section
@@ -257,7 +283,7 @@ const persistSrtpRocForHandoff = async (
 		// Fence: re-read the freshest in-memory state immediately before every
 		// attempt, not once before the loop - see the doc comment above.
 		const rocState = kinesisIngestionPipeline.getSrtpRocState(port)
-		const persisted = await streamMetadataService.updateSrtpRoc(
+		const result = await streamMetadataService.updateSrtpRoc(
 			slot,
 			instanceId,
 			rocState.roc,
@@ -266,8 +292,14 @@ const persistSrtpRocForHandoff = async (
 			keyFingerprint,
 			true,
 		)
-		if (persisted) {
+		if (result === 'ok') {
 			persistedOk = true
+			break
+		}
+		if (result === 'lostLock') {
+			// Another instance owns the row: retrying cannot succeed, and the (equally
+			// conditional) release below will no-op. Not a persistence gap - the new
+			// owner tracks and persists its own state.
 			break
 		}
 		if (attempt < FINAL_ROC_PERSIST_ATTEMPTS) {
@@ -347,19 +379,31 @@ type PacketHandlerRangeConfig = {
  * mutex again here would deadlock the promise chain. When it is false (the pipelineExited
  * restart and streamStart resume paths), the handoff takes the mutex itself, matching
  * onStreamStop's structure.
+ *
+ * `persistRoc` is false only for the failed-persisted-ROC-read path in
+ * startPipelineOrReleaseLock - see that call site for why a forced {0,0} write must be
+ * avoided there.
  */
 const releaseLockBackoffAndRearm = async (
 	port: number,
 	slot: number,
 	initialData: Buffer | Buffer[] | undefined,
 	holdsSlotMutex = false,
+	// False only for the failed-persisted-ROC-read path in startPipelineOrReleaseLock: on
+	// a fresh process nothing has been seeded or tracked yet, so a forced persistence
+	// would write {roc: 0, highestSeq: 0} over the valid nonzero state that the failed
+	// read was supposed to protect - the very outcome that path exists to avoid. Final ROC
+	// persistence stays enabled everywhere state was successfully loaded or observed.
+	persistRoc = true,
 ): Promise<void> => {
 	const handoff = async (): Promise<void> => {
 		try {
 			// See above: persist the freshest SRTP ROC state while this instance still
 			// owns the slot, then release it - one critical section, same as onStreamStop.
 			// A no-op for unencrypted ports (persistSrtpRocForHandoff's own guards).
-			await persistSrtpRocForHandoff(port, slot)
+			if (persistRoc) {
+				await persistSrtpRocForHandoff(port, slot)
+			}
 			await streamMetadataService.releaseKinesisLock(slot, instanceId)
 		} finally {
 			clearLockHeld(port)
@@ -385,6 +429,16 @@ const releaseLockBackoffAndRearm = async (
 			: Array.isArray(initialData)
 				? initialData
 				: [initialData]
+	// Merge any datagrams held while no pipeline was active during the failed attempt (see
+	// takeHeldDatagrams): they are older than everything the re-armed buffer accumulates
+	// from here on, and leaving them in the hold would make the next start replay two
+	// competing sources (initialData first, the hold seeded into the new pipeline's
+	// pendingQueue second), letting newer sequence numbers overtake the older held
+	// keyframe/SPS/PPS - the jitter buffer or SRTP anti-replay window then discards
+	// exactly the packets recovery needs.
+	if (kinesisIngestionPipeline) {
+		chunks.push(...kinesisIngestionPipeline.takeHeldDatagrams(port))
+	}
 	const totalBytes = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
 	preStartBufferByPort.set(port, { chunks, totalBytes })
 }
@@ -435,6 +489,7 @@ const startPipelineOrReleaseLock = async (
 	// rather than guessing - spawning without confirmation is exactly the
 	// competing-producer problem the lock exists to prevent.
 	let stillOwner: boolean
+	let ownershipUnknown = false
 	try {
 		stillOwner = await streamMetadataService.tryAcquireKinesisLock(
 			slot,
@@ -446,12 +501,17 @@ const startPipelineOrReleaseLock = async (
 			err,
 		)
 		stillOwner = false
+		ownershipUnknown = true
 	}
 	if (!stillOwner) {
 		console.error(
 			`[Main] No longer the owner of the Kinesis lock for port ${port}; abandoning pipeline start`,
 		)
-		await relinquishPort(port)
+		// On a transient confirmation error the row's ownership is unknown - this
+		// instance may still own it, so attempt a conditional release (see
+		// relinquishPort) rather than leaving the row parked under this instance until
+		// the staleness threshold expires.
+		await relinquishPort(port, ownershipUnknown ? { slot } : undefined)
 		return
 	}
 	if (isStale()) return // ownership changed while awaiting DynamoDB; abandon
@@ -477,7 +537,10 @@ const startPipelineOrReleaseLock = async (
 				// A DynamoDB read failure is not the same as a genuinely fresh/never-persisted
 				// session (see getSrtpRocState) - seeding with a fabricated zero here could
 				// silently break decryption if the sender has already wrapped. Treat this like
-				// a failed start rather than guessing.
+				// a failed start rather than guessing. The release below also skips the final
+				// ROC persistence: on a fresh process nothing has been seeded or tracked yet,
+				// so the forced write would use {roc: 0, highestSeq: 0} and overwrite the valid
+				// nonzero state this failed read was meant to protect.
 				console.error(
 					`[Main] Failed to read persisted SRTP ROC state for port ${port}; releasing lock`,
 				)
@@ -486,6 +549,7 @@ const startPipelineOrReleaseLock = async (
 					slot,
 					initialData,
 					holdsSlotMutex,
+					false,
 				)
 				return
 			}
@@ -781,7 +845,7 @@ const createPacketHandler = (
 						kinesisIngestionPipeline.getConfiguredSrtpKeyFingerprint(port)
 					const rolloverCrossed =
 						rocBefore !== undefined && rocBefore.roc !== rocState.roc
-					const stillOwner = await streamMetadataService.updateSrtpRoc(
+					const result = await streamMetadataService.updateSrtpRoc(
 						slot,
 						instanceId,
 						rocState.roc,
@@ -790,8 +854,16 @@ const createPacketHandler = (
 						keyFingerprint,
 						rolloverCrossed,
 					)
-					if (!stillOwner) {
+					if (result === 'lostLock') {
+						// Another instance owns the row - there is nothing left to release.
 						await relinquishPort(port)
+					} else if (result === 'writeError') {
+						// The write failed without proving ownership loss: this producer
+						// must still stop, but the row may still be ours - attempt a
+						// conditional release so another instance can take over instead
+						// of waiting out the 5-minute staleness threshold with nobody
+						// ingesting.
+						await relinquishPort(port, { slot })
 					}
 				}
 			})

@@ -9,6 +9,14 @@ import {
 /** Stale lock threshold: if no packet received in this many ms, another instance may acquire. */
 export const KINESIS_LOCK_STALE_MS = 5 * 60 * 1000 // 5 minutes
 
+/**
+ * Outcome of updateSrtpRoc: 'ok' the state was written (or the throttle short-circuited);
+ * 'lostLock' the conditional write proved another instance owns the lock row; 'writeError'
+ * any other failure, which leaves the row's ownership unknown (this instance may still own
+ * it). See updateSrtpRoc's doc comment for how callers must react differently.
+ */
+export type SrtpRocUpdateResult = 'ok' | 'lostLock' | 'writeError'
+
 export type StreamMetadata = {
 	/**
 	 * Canonical stream-slot number (see KinesisIngestionPipeline.streamSlotForPort), NOT a
@@ -352,10 +360,15 @@ export class StreamMetadataService {
 	 * potentially gets reassigned). Only succeeds if `instanceId` currently holds the Kinesis
 	 * lock for this slot - without that check, a process whose heartbeat condition already
 	 * failed (or that already released the slot) could overwrite the current owner's state
-	 * with stale data and break a later restart. Returns false (without throwing) if the
-	 * caller no longer owns the slot, or if the write otherwise fails - callers must treat
-	 * that as having lost the lock and stop writing/relinquish their local pipeline, not just
-	 * log and continue.
+	 * with stale data and break a later restart.
+	 *
+	 * The result distinguishes *why* the write did not happen, because callers must react
+	 * differently: 'lostLock' (ConditionalCheckFailedException) proves another instance owns
+	 * the row - the caller must stop writing and relinquish its local pipeline, with nothing
+	 * left to release. 'writeError' (any other failure - e.g. a transient DynamoDB outage)
+	 * leaves the row's ownership *unknown*: the caller must still stop its producer, but it
+	 * may still own the row, and must attempt a conditional release so another instance can
+	 * take over instead of waiting out the 5-minute staleness threshold.
 	 */
 	async updateSrtpRoc(
 		port: number,
@@ -365,10 +378,12 @@ export class StreamMetadataService {
 		ssrc: number,
 		keyFingerprint: string | undefined,
 		force = false,
-	): Promise<boolean> {
+	): Promise<SrtpRocUpdateResult> {
 		const now = Date.now()
 		const lastUpdate = this.lastSrtpRocUpdateTimes.get(port) ?? 0
-		if (!force && now - lastUpdate < this.srtpRocUpdateThrottleMs) return true
+		if (!force && now - lastUpdate < this.srtpRocUpdateThrottleMs) {
+			return 'ok'
+		}
 		this.lastSrtpRocUpdateTimes.set(port, now)
 
 		try {
@@ -389,20 +404,20 @@ export class StreamMetadataService {
 					ConditionExpression: 'kinesisOwnerInstanceId = :instanceId',
 				}),
 			)
-			return true
+			return 'ok'
 		} catch (error: unknown) {
 			if (
 				error instanceof Error &&
 				error.name === 'ConditionalCheckFailedException'
 			) {
-				return false
+				return 'lostLock'
 			}
 			console.error(
 				`[StreamMetadataService] Error updating SRTP ROC for port ${port}:`,
 				error,
 			)
 			this.lastSrtpRocUpdateTimes.delete(port)
-			return false
+			return 'writeError'
 		}
 	}
 

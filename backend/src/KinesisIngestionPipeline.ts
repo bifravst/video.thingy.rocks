@@ -794,12 +794,20 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	 * does not wake it), and repeated failed starts exhaust the small (default 4) worker
 	 * pool, stalling every fs operation in the process. Instead: probe with
 	 * O_WRONLY|O_NONBLOCK, which the kernel completes immediately - with ENXIO while no
-	 * reader exists, successfully once one does - and only perform the real blocking-mode
-	 * open (which completes immediately once a reader is confirmed) for the returned fd.
-	 * `shouldAbort` is polled between probes so the caller's timeout / child-exit guards
-	 * cancel the wait; a reader vanishing in the microseconds between probe and open can
-	 * still park one worker (bounded by those same guards), but only in that vanishing
-	 * race, not on every failed start.
+	 * reader exists, successfully once one does - and open the real (blocking-mode) writer
+	 * only once a reader is confirmed. `shouldAbort` is polled between probes so the
+	 * caller's timeout / child-exit guards cancel the wait.
+	 *
+	 * The probe descriptor stays open *until the blocking writer has opened*, and is only
+	 * then closed: filesrc unblocks the moment the probe opens, and if the probe were
+	 * closed before the real writer takes over, the FIFO would briefly have no writer at
+	 * all - filesrc reads EOF, GStreamer exits, and the now-readerless blocking open can
+	 * park a threadpool worker indefinitely (fs.open cannot be cancelled). With the probe
+	 * held open across the handoff there is always a writer, so filesrc never sees a
+	 * spurious EOF. The only way the blocking open can still park a worker is GStreamer
+	 * organically exiting in the microseconds between the probe succeeding and the open
+	 * completing - bounded by the caller's guards, and vanishingly rare by comparison
+	 * with parking a worker on every failed start.
 	 */
 	private async openFifoWriterFd(
 		fifoPath: string,
@@ -830,12 +838,14 @@ export class KinesisIngestionPipeline extends EventEmitter {
 				},
 			)
 			if (probed !== undefined) {
-				// Reader confirmed: discard the nonblocking probe fd and open in blocking
-				// mode for the write stream (blocking write semantics are what the
-				// reorder-buffered stream and the initial-data write rely on).
-				fs.close(probed, () => {})
+				// Reader confirmed: open the real (blocking-mode) writer for the write
+				// stream (blocking write semantics are what the reorder-buffered stream
+				// and the initial-data write rely on) - and close the probe only after
+				// that succeeds, so the write end is never momentarily writerless (see
+				// the doc comment above).
 				return await new Promise<number>((resolve, reject) => {
 					fs.open(fifoPath, 'w', (err, fd) => {
+						fs.close(probed, () => {})
 						if (err !== null) reject(err)
 						else resolve(fd)
 					})
@@ -1545,6 +1555,22 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			}
 			this.drainFifo(port, stdin)
 		}
+	}
+
+	/**
+	 * Returns (and clears) the datagrams held for this port while no pipeline was active
+	 * (see writePacket's hold). index.ts's failed-start re-arm merges them into the
+	 * re-armed pre-start buffer: the hold predates everything buffered from that point on,
+	 * so merging keeps the next start's replay a single oldest-first sequence instead of
+	 * two competing sources (the replayed initialData vs. the hold seeded into the new
+	 * pipeline's pendingQueue), where newer sequence numbers would overtake the older
+	 * held keyframe/SPS/PPS and have it discarded by the jitter buffer or anti-replay
+	 * window.
+	 */
+	takeHeldDatagrams(port: number): Buffer[] {
+		const held = this.srtpHoldByPort.get(port)
+		this.srtpHoldByPort.delete(port)
+		return held?.chunks ?? []
 	}
 
 	/**
