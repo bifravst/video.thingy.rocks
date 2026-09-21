@@ -9,6 +9,46 @@ This service receives UDP video streams from Cat1bisCam devices on ports
 5000-5009, buffers the data, tracks stream state, and integrates with AWS
 services (DynamoDB, S3) for metadata and storage.
 
+## Sending video (device integration)
+
+A device sends to **one** port and uses **one** transport. Each port has its own
+Kinesis Video Stream, `{stackName}-video-{port}`, so the choice of transport is
+local to the device and needs no coordination with anything else.
+
+### SRTP (encrypted, preferred)
+
+Ports **6000-6009** on the load balancer's address.
+
+- **Transport**: SRTP ([RFC 3711](https://www.rfc-editor.org/rfc/rfc3711)) over
+  UDP, **one SRTP packet per datagram**. Never coalesce or fragment packets:
+  authentication is per packet, so the framing is load-bearing.
+- **Payload**: H.264 packetized as RTP
+  ([RFC 6184](https://www.rfc-editor.org/rfc/rfc6184)), payload type 96, clock
+  rate 90000.
+- **Cipher suite**: `aes-128-icm` with `hmac-sha1-80`, the only suite accepted.
+- **Key**: a 30-byte master key and salt, provisioned out of band per port by an
+  operator (`scripts/provision-srtp-key.sh`). Devices never negotiate one: there
+  is no DTLS or WebRTC handshake on this path.
+- **SSRC**: fixed per port, provisioned alongside the key. A device that picks a
+  new SSRC per session will not be decrypted, because the receiver is pinned to
+  the provisioned one.
+- **Sequence numbering**: no constraint. A device may restart its RTP sequence
+  numbering whenever it likes - on reboot, re-session or factory reset - and may
+  have wrapped any number of times while ingestion was down. The receiver
+  establishes the rollover counter by authentication rather than assuming it, so
+  the only cost of a restart is the wait for the device's next keyframe. Keep
+  that interval short if fast recovery matters.
+- **Keyframes**: send SPS/PPS regularly (for example `config-interval=1` in
+  GStreamer), so a receiver that joins mid-stream can start decoding.
+
+`scripts/stream-testsrc-to-srtp.sh` is a runnable example of the sender side.
+
+### Unencrypted MPEG-TS
+
+Ports **5000-5009**, MPEG-TS over UDP. This is the original path and is
+unchanged. It offers no confidentiality, integrity or authenticity: anything
+that reaches the port is ingested, so prefer SRTP for anything real.
+
 ## Components Implemented
 
 ### UDPListener

@@ -73,7 +73,12 @@ Or stream from a webcam:
 
 The backend receives UDP on that port, starts the GStreamer pipeline for that
 port, and kvssink sends H.264 to the Kinesis stream named
-`{KINESIS_STREAM_PREFIX}-{port}` (e.g. `video-streaming-video-5000`).
+`{KINESIS_STREAM_PREFIX}-{port}` (e.g. `video-streaming-2026-05-video-5000`).
+
+Encrypted ingestion is available on ports 6000-6009, with its own streams and
+its own keys - see [TESTING-SRTP-INGESTION.md](./TESTING-SRTP-INGESTION.md). The
+two transports are independent: a port on one has no bearing on the paired port
+on the other.
 
 ## 3. Verify in AWS
 
