@@ -37,10 +37,13 @@ from gi.repository import GLib, Gst  # noqa: E402
 
 PROTOCOL_VERSION = 1
 SUPERVISOR_TICK_MS = 50
-#: Sequence numbers above this in the previous packet and below LOW_SEQ in the next
-#: indicate the 16-bit RTP sequence space wrapped, i.e. the rollover counter advanced.
-HIGH_SEQ = 0xC000
-LOW_SEQ = 0x4000
+#: Half the 16-bit RTP sequence number space: a jump of more than this is read as the
+#: short way round in the other direction, per RFC 3711 appendix A.
+SEQ_MIDPOINT = 1 << 15
+#: The rollover counter is a uint32, so this is both the highest candidate worth
+#: trying and the modulus the counter wraps at.
+ROC_MODULO = 1 << 32
+ROC_MAX = ROC_MODULO - 1
 #: Anything this long and hexadecimal in argv would be key material.
 KEY_SHAPED = re.compile(r"^[0-9a-fA-F]{40,}$")
 #: GST_DEBUG at this level or above makes GStreamer log element caps, which would
@@ -56,36 +59,99 @@ def candidates(hint: int, max_offset: int) -> "object":
     is a sender that restarted its SRTP session - which used to be an unrecoverable
     state requiring an operator to reprovision a key or edit the database by hand.
 
-    After that the two directions are interleaved, and interleaving is the point: a
-    search that only counted upwards from the hint could never reach a hint that was
-    *too high*, which happens whenever a stale value outlives a shorter session, or a
-    sender restarts and then wraps. Such a search would be stuck forever.
+    After that the search walks outwards from the hint in *both* directions, and
+    downwards is not optional: a hint one above the actual counter is what a stale
+    value left by a longer previous session looks like, and an upwards-only search
+    can never reach it.
+
+    `max_offset` is the width of a band, not the end of the search. Each band moves
+    another `max_offset` away from the hint and from zero, and the bands keep coming
+    until the whole uint32 counter space has been offered - so no reachable value is
+    permanently excluded by a fixed offset cycle. Every band re-offers the hint and
+    zero first, because they stay the two most likely answers no matter how far the
+    search has wandered, and because the reason a band was exhausted is usually
+    traffic that never held the key at all.
 
     The sequence repeats rather than ending, so a stream that only becomes
     decryptable later - a sender that starts long after the search began - is still
     picked up. Nothing is retried while no datagrams are arriving, so repeating costs
     nothing when the port is idle.
     """
+    hint = min(max(hint, 0), ROC_MAX)
+    width = max(int(max_offset), 1)
+    band = 0
     while True:
+        first = band * width + 1
+        if first > ROC_MAX:
+            # Every candidate in the counter space has been offered; start over rather
+            # than ending, for the same reason each band repeats the hint.
+            band = 0
+            continue
         seen: set[int] = set()
-        for value in _candidate_cycle(hint, max_offset):
+        for value in _candidate_band(hint, first, first + width - 1):
             if value in seen:
                 continue
             seen.add(value)
             yield value
+        band += 1
 
 
-def _candidate_cycle(hint: int, max_offset: int) -> "object":
+def _candidate_band(hint: int, first: int, last: int) -> "object":
+    """One band of candidates: the hint, zero, then `first`..`last` either side."""
     yield hint
     yield 0
-    for k in range(1, max_offset + 1):
+    for k in range(first, last + 1):
         # One step further than the hint: that many rollovers happened while
         # ingestion was down.
-        yield hint + k
+        if hint + k <= ROC_MAX:
+            yield hint + k
+        # One step below the hint: the persisted value outlived the session it was
+        # written for, so the stream is *behind* it. This is the branch that makes a
+        # hint which is too high recoverable at all.
+        if hint - k >= 0:
+            yield hint - k
         # One step further from zero: the sender restarted its session and has
-        # wrapped that many times since. This is the branch that makes a hint which
-        # is too high recoverable at all.
-        yield k
+        # wrapped that many times since.
+        if k <= ROC_MAX:
+            yield k
+
+
+def rollover_of(roc: int, highest_seq: int, seq: int) -> int:
+    """The rollover counter a sequence number belongs to.
+
+    RFC 3711 appendix A: a sequence number more than half the sequence space away
+    from the highest one seen is the short way round in the other direction, so it
+    belongs to the neighbouring rollover rather than this one. This is the same
+    decision libsrtp makes about the same packet, which is the point - the counter
+    tracked here has to agree with the one the authenticator is using.
+    """
+    if highest_seq < SEQ_MIDPOINT:
+        if seq - highest_seq > SEQ_MIDPOINT:
+            return (roc - 1) % ROC_MODULO
+        return roc
+    if highest_seq - SEQ_MIDPOINT > seq:
+        return (roc + 1) % ROC_MODULO
+    return roc
+
+
+def advance_index(roc: int, highest_seq: int, seq: int) -> tuple[int, int]:
+    """Folds one authenticated sequence number into the highest packet index seen.
+
+    Returns the rollover counter and highest sequence number after `seq`. A packet
+    below the highest index changes neither, which is what makes this safe under
+    reordering; comparing consecutive *arrivals* is not. An authenticated arrival
+    order of 65534, 0, 65535, 1 counts two rollovers that way, because the late
+    pre-wrap packet moves the comparison point back up and makes the next post-wrap
+    packet look like another wrap.
+    """
+    rollover = rollover_of(roc, highest_seq, seq)
+    if rollover == roc:
+        return roc, max(highest_seq, seq)
+    if rollover == (roc + 1) % ROC_MODULO:
+        return rollover, seq
+    # Below this rollover: a late packet from before the last wrap, which the highest
+    # index has already passed.
+    return roc, highest_seq
 
 
 def emit(**fields: object) -> None:
@@ -173,11 +239,15 @@ class Counters:
         self.inputs = 0
         self.authenticated = 0
         self.access_units = 0
-        self.last_seq: int | None = None
+        #: Highest authenticated sequence number, i.e. the s_l of RFC 3711 appendix A.
+        #: With roc it forms the highest authenticated packet index, which is what a
+        #: wrap has to be judged against - not the previous arrival.
+        self.highest_seq: int | None = None
         self.last_auth_ms = 0
         #: Rollover counter of the authenticated stream, tracked from authenticated
         #: packets only - never from the plaintext headers of traffic that failed to
-        #: authenticate, which anyone able to reach the port can forge.
+        #: authenticate, which anyone able to reach the port can forge. Seeded from the
+        #: candidate libsrtp was given, then advanced by authenticated packets.
         self.roc = 0
         self.roc_changed = False
 
@@ -295,14 +365,13 @@ class SrtpPipeline:
             c.authenticated += 1
             c.last_auth_ms = now_ms()
             if seq is not None:
-                if (
-                    c.last_seq is not None
-                    and c.last_seq >= HIGH_SEQ
-                    and seq < LOW_SEQ
-                ):
-                    c.roc += 1
-                    c.roc_changed = True
-                c.last_seq = seq
+                if c.highest_seq is None:
+                    c.highest_seq = seq
+                else:
+                    roc, c.highest_seq = advance_index(c.roc, c.highest_seq, seq)
+                    if roc != c.roc:
+                        c.roc = roc
+                        c.roc_changed = True
         return Gst.PadProbeReturn.OK
 
     def _on_access_unit(
@@ -320,6 +389,13 @@ class SrtpPipeline:
             return None
         self.key_requests += 1
         emit(t="searching", candidate=self.candidate, trial=self.key_requests - 1)
+        # libsrtp is about to start counting from this candidate, so the tracker has to
+        # start from it too: the caps below say roc=candidate, and a request means there
+        # is no rollover or replay state left from any earlier attempt.
+        with self.counters.lock:
+            self.counters.roc = self.candidate
+            self.counters.highest_seq = None
+            self.counters.roc_changed = False
         # Built as a caps string in process. The key is in this string and nowhere
         # else: not in argv, not in the environment, not in any emitted line.
         return Gst.Caps.from_string(
@@ -450,7 +526,7 @@ class SrtpPipeline:
             authenticated = self.counters.authenticated
             roc = self.counters.roc
             roc_changed = self.counters.roc_changed
-            last_seq = self.counters.last_seq
+            highest_seq = self.counters.highest_seq
             last_auth_ms = self.counters.last_auth_ms
             self.counters.roc_changed = False
 
@@ -460,23 +536,23 @@ class SrtpPipeline:
 
         if authenticated > 0 and not self.confirmed:
             self.confirmed = True
-            # The candidate is only ever reported once libsrtp authenticated with it,
-            # which is what makes the value safe to persist.
-            with self.counters.lock:
-                self.counters.roc = self.candidate
-                roc = self.candidate
+            # The counter is only ever reported once libsrtp authenticated traffic
+            # under the candidate it was seeded from, which is what makes the value
+            # safe to persist. It is read rather than assumed: a stream that wrapped
+            # between the first authenticated packet and this tick is already past the
+            # candidate.
             emit(
                 t="auth",
                 status="ok",
                 first=True,
                 roc=roc,
-                seq=last_seq,
+                seq=highest_seq,
                 candidate=self.candidate,
                 trials=self.key_requests,
                 authenticated=authenticated,
             )
         elif self.confirmed and roc_changed:
-            emit(t="auth", status="ok", first=False, roc=roc, seq=last_seq)
+            emit(t="auth", status="ok", first=False, roc=roc, seq=highest_seq)
         elif (
             self.confirmed
             and last_auth_ms > 0

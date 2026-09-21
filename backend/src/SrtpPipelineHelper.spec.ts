@@ -275,6 +275,31 @@ void describe('srtp_pipeline.py', { skip }, () => {
 			}
 		})
 
+		// The other direction of the same regression: a hint *one* above the actual
+		// counter is what a value left over from a longer previous session looks like,
+		// and it is not reachable by counting up from zero either. The band is narrowed
+		// to two so a search that only walks up from the hint and up from zero runs out
+		// of reachable candidates quickly and never offers four.
+		void it('recovers when the hint is just above the counter', async () => {
+			const helper = await startHelper({
+				rocHint: 5,
+				extraArgs: ['--search-max-offset', '2'],
+			})
+			try {
+				const timer = setInterval(() => sendBurst(helper, 4, 3000, 10), 60)
+				try {
+					const confirmed = await helper.waitFor(
+						(m) => confirmation(m) !== undefined,
+					)
+					assert.strictEqual(rocOf(confirmed), 4)
+				} finally {
+					clearInterval(timer)
+				}
+			} finally {
+				await helper.stop()
+			}
+		})
+
 		void it('reports a rollover while running', async () => {
 			const helper = await startHelper({ rocHint: 0 })
 			try {
@@ -286,6 +311,41 @@ void describe('srtp_pipeline.py', { skip }, () => {
 					(m) => m.t === 'auth' && m.status === 'ok' && !m.first,
 				)
 				assert.strictEqual(rocOf(rollover), 1)
+			} finally {
+				await helper.stop()
+			}
+		})
+
+		// Reordering across the wrap must not inflate the counter: the persisted hint
+		// would then be above the stream, and the next start would pay for a search.
+		void it('counts one rollover when packets arrive reordered across the wrap', async () => {
+			const helper = await startHelper({ rocHint: 0 })
+			try {
+				sendBurst(helper, 0, 65_530, 5)
+				await helper.waitFor((m) => confirmation(m) !== undefined)
+
+				// 65534, 0, 65535, 1: the last pre-wrap packet arrives behind the first
+				// post-wrap one, which is ordinary on any network.
+				helper.send(packetAt(1, 0))
+				helper.send(packetAt(0, 65_535))
+				helper.send(packetAt(1, 1))
+
+				const rollover = await helper.waitFor(
+					(m) => m.t === 'auth' && m.status === 'ok' && !m.first,
+				)
+				assert.strictEqual(rocOf(rollover), 1)
+
+				// Every one of the eight packets held the key, the late one included -
+				// without that this would pass even if the reorder never reached the
+				// counter.
+				const stats = await helper.waitFor(
+					(m) => m.t === 'stats' && m.authenticated === 8,
+				)
+				assert.strictEqual(stats.t === 'stats' ? stats.roc : -1, 1)
+				assert.ok(
+					!helper.messages.some((m) => rocOf(m) > 1),
+					`a reorder was counted as a second rollover: ${JSON.stringify(helper.messages)}`,
+				)
 			} finally {
 				await helper.stop()
 			}
