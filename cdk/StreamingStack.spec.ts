@@ -245,6 +245,65 @@ void describe('StreamingStack', () => {
 				)
 			}
 		})
+
+		/**
+		 * The restart composite has to describe one failure, not two transports mixed.
+		 *
+		 * Its traffic leg is the load-balancer-wide ProcessedBytes_UDP, which counts
+		 * both transports because CloudWatch publishes no narrower version of it. The
+		 * ingestion side therefore has to cover both too, or SRTP traffic ends up
+		 * deciding whether an unencrypted-ingestion failure restarts the fleet.
+		 */
+		void it('covers both transports on each leg of the restart composite', () => {
+			const synthesised = template()
+			const composites = synthesised.findResources(
+				'AWS::CloudWatch::CompositeAlarm',
+			)
+			const composite = Object.values(composites).find(
+				(alarm) =>
+					alarm.Properties?.AlarmName ===
+					`${STACK_NAME}-UDP-Traffic-No-KVS-Ingestion`,
+			)
+			const rule = JSON.stringify(composite?.Properties?.AlarmRule)
+
+			const alarms = synthesised.findResources('AWS::CloudWatch::Alarm')
+			const legFor = (transportPort: number): string => {
+				const [logicalId, alarm] =
+					Object.entries(alarms).find(
+						([, candidate]) =>
+							JSON.stringify(candidate.Properties?.Metrics ?? null).includes(
+								`${STACK_NAME}-video-${String(transportPort)}`,
+							) &&
+							candidate.Properties?.TreatMissingData === 'breaching' &&
+							candidate.Properties?.AlarmActions === undefined,
+					) ?? []
+				assert.ok(
+					logicalId !== undefined && alarm !== undefined,
+					`no composite-only zero-ingestion alarm for port ${String(transportPort)}`,
+				)
+				return logicalId
+			}
+
+			for (const port of [5000, 6000]) {
+				assert.ok(
+					rule.includes(legFor(port)),
+					`the composite must include the ${String(port)} transport: ${rule}`,
+				)
+			}
+		})
+
+		// Missing data on the restart leg means "nothing was ingested", which is the
+		// condition being tested - unlike on the notify-only alarm, where it is normal.
+		void it('treats absent SRTP data as no ingestion on the restart leg', () => {
+			const alarms = template().findResources('AWS::CloudWatch::Alarm')
+			const leg = Object.values(alarms).find(
+				(alarm) =>
+					alarm.Properties?.AlarmName ===
+					`${STACK_NAME}-KVS-PutMedia-Incoming-Zero-SRTP-Restart-Leg`,
+			)
+			assert.strictEqual(leg?.Properties?.TreatMissingData, 'breaching')
+			assert.strictEqual(leg?.Properties?.AlarmActions, undefined)
+		})
 	})
 
 	void describe('the fleet cutover machinery is absent', () => {

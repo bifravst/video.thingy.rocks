@@ -625,6 +625,13 @@ export class StreamingStack extends Stack {
 			})
 		}
 
+		/**
+		 * Zero ingestion on the unencrypted streams: one leg of the restart composite.
+		 *
+		 * It covers one transport only because a metric-math alarm cannot carry twenty
+		 * metrics, not because the composite is meant to watch one transport - see the
+		 * composite below, where the transports are recombined.
+		 */
 		const kvsNoIngestionAlarm = new cloudwatch.Alarm(
 			this,
 			'KVSNoPutMediaIngestionAlarm',
@@ -647,10 +654,7 @@ export class StreamingStack extends Stack {
 		 * No SRTP ingestion is the *normal* state until devices are provisioned, so
 		 * this must not be wired to the restart topic the way the composite alarm
 		 * below is: that would reboot the fleet forever over a fleet doing nothing
-		 * wrong. Missing data is likewise not a breach, for the same reason. It is also
-		 * not combined with the load-balancer UDP byte metric, which counts both
-		 * transports - unencrypted traffic would satisfy the "there is traffic" leg and
-		 * make the composite fire whenever no SRTP device happened to be sending.
+		 * wrong. Missing data is likewise not a breach, for the same reason.
 		 */
 		const srtpNoIngestionAlarm = new cloudwatch.Alarm(
 			this,
@@ -671,6 +675,41 @@ export class StreamingStack extends Stack {
 			new cloudwatch_actions.SnsAction(alarmTopic),
 		)
 
+		/**
+		 * And the SRTP streams once more, with missing data treated as a breach.
+		 *
+		 * The same metric as the alarm above, with the opposite missing-data policy,
+		 * because the two answer different questions. For an operator, no SRTP data at
+		 * all is normal and must not notify; for "did anything reach Kinesis", no data
+		 * is precisely the condition. Carries no action of its own: it exists to be the
+		 * SRTP leg of the composite below.
+		 */
+		const srtpNoIngestionRestartLeg = new cloudwatch.Alarm(
+			this,
+			'KVSNoPutMediaIngestionRestartLegSrtp',
+			{
+				alarmName: `${Stack.of(this).stackName}-KVS-PutMedia-Incoming-Zero-SRTP-Restart-Leg`,
+				alarmDescription:
+					'Sum of PutMedia.IncomingBytes across the SRTP Kinesis Video Streams is 0, counting no data as 0',
+				metric: kvsIncomingSumFor(srtpPorts),
+				threshold: 0,
+				evaluationPeriods: 5,
+				comparisonOperator:
+					cloudwatch.ComparisonOperator.LESS_THAN_OR_EQUAL_TO_THRESHOLD,
+				treatMissingData: cloudwatch.TreatMissingData.BREACHING,
+			},
+		)
+
+		/**
+		 * The restart composite, whose legs have to cover the same transports.
+		 *
+		 * ProcessedBytes_UDP is published per load balancer only - there is no
+		 * per-listener or per-target-group variant - so the traffic leg unavoidably
+		 * counts 5000-5009 and 6000-6009 together, and both ingestion legs are required
+		 * so that the other side covers exactly the same ports. With the unencrypted
+		 * streams alone on that side, SRTP traffic would decide whether an
+		 * unencrypted-ingestion failure restarts the fleet.
+		 */
 		const udpTrafficNoIngestionAlarm = new cloudwatch.CompositeAlarm(
 			this,
 			'UDPTrafficNoKinesisIngestionAlarm',
@@ -678,6 +717,7 @@ export class StreamingStack extends Stack {
 				alarmRule: cloudwatch.AlarmRule.allOf(
 					cloudwatch.AlarmRule.not(nlbUdpBytesAlarm),
 					kvsNoIngestionAlarm,
+					srtpNoIngestionRestartLeg,
 				),
 				alarmDescription:
 					'NLB UDP processed bytes > 1 MB/s but PutMedia incoming data across all Kinesis Video Streams is 0',
