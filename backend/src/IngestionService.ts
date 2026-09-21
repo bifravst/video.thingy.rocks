@@ -199,8 +199,14 @@ export class IngestionService {
 		try {
 			await this.options.healthServer.start()
 		} catch (err) {
-			// Nothing is serving traffic yet, so leave nothing bound behind either.
-			await primary.listener.stop()
+			// Nothing is serving traffic yet, so leave nothing bound behind either. The
+			// health port's failure is the one worth reporting, so a listener that also
+			// fails to stop must not replace it.
+			try {
+				await primary.listener.stop()
+			} catch {
+				// Nothing more to do.
+			}
 			throw err
 		}
 		this.logger.info('Serving', {
