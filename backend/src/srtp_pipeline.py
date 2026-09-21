@@ -48,6 +48,46 @@ KEY_SHAPED = re.compile(r"^[0-9a-fA-F]{40,}$")
 MAX_SAFE_GST_DEBUG = 3
 
 
+def candidates(hint: int, max_offset: int) -> "object":
+    """Yields rollover-counter candidates to try, in order of likelihood.
+
+    The hint comes first, because the common case is that nothing wrapped while
+    ingestion was down. Zero comes second, because the next most likely explanation
+    is a sender that restarted its SRTP session - which used to be an unrecoverable
+    state requiring an operator to reprovision a key or edit the database by hand.
+
+    After that the two directions are interleaved, and interleaving is the point: a
+    search that only counted upwards from the hint could never reach a hint that was
+    *too high*, which happens whenever a stale value outlives a shorter session, or a
+    sender restarts and then wraps. Such a search would be stuck forever.
+
+    The sequence repeats rather than ending, so a stream that only becomes
+    decryptable later - a sender that starts long after the search began - is still
+    picked up. Nothing is retried while no datagrams are arriving, so repeating costs
+    nothing when the port is idle.
+    """
+    while True:
+        seen: set[int] = set()
+        for value in _candidate_cycle(hint, max_offset):
+            if value in seen:
+                continue
+            seen.add(value)
+            yield value
+
+
+def _candidate_cycle(hint: int, max_offset: int) -> "object":
+    yield hint
+    yield 0
+    for k in range(1, max_offset + 1):
+        # One step further than the hint: that many rollovers happened while
+        # ingestion was down.
+        yield hint + k
+        # One step further from zero: the sender restarted its session and has
+        # wrapped that many times since. This is the branch that makes a hint which
+        # is too high recoverable at all.
+        yield k
+
+
 def emit(**fields: object) -> None:
     """Writes one protocol line. Never includes key material."""
     print(json.dumps(fields), flush=True)
@@ -71,6 +111,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--kvs-storage-size", type=int, default=128)
     parser.add_argument("--stats-interval-ms", type=int, default=5000)
     parser.add_argument("--auth-loss-ms", type=int, default=3000)
+    parser.add_argument("--search-max-offset", type=int, default=512)
+    parser.add_argument("--trial-drops", type=int, default=4)
+    parser.add_argument("--trial-timeout-ms", type=int, default=1500)
     #: Test only. Replaces kvssink, so the helper can run where kvssink is not built.
     parser.add_argument("--fake-sink", action="store_true")
     return parser.parse_args(argv)
@@ -147,7 +190,13 @@ class SrtpPipeline:
         self.auth = str(init.get("auth") or "hmac-sha1-80")
         self.ssrc = int(init.get("ssrc") or args.ssrc)
         hint = init.get("rocHint")
-        self.candidate = int(hint) if isinstance(hint, (int, float)) else 0
+        self.hint = int(hint) if isinstance(hint, (int, float)) else 0
+        self.candidates = candidates(self.hint, args.search_max_offset)
+        self.candidate = next(self.candidates)
+        self.trial_index = 0
+        self.trial_started_ms = 0
+        self.trial_inputs0 = 0
+        self.trial_drops0 = 0
         self.counters = Counters()
         self.confirmed = False
         self.loop = GLib.MainLoop()
@@ -373,6 +422,7 @@ class SrtpPipeline:
         if self.pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
             fatal("state-change", self._drain_bus_error() or "could not reach PLAYING")
 
+        self._begin_trial()
         emit(t="ready", v=PROTOCOL_VERSION, relayPort=relay_port, pid=os.getpid())
 
     def _drain_bus_error(self) -> str | None:
@@ -403,6 +453,10 @@ class SrtpPipeline:
             last_seq = self.counters.last_seq
             last_auth_ms = self.counters.last_auth_ms
             self.counters.roc_changed = False
+
+        if authenticated == 0 and not self.confirmed:
+            self._advance_search_if_tried()
+            return True
 
         if authenticated > 0 and not self.confirmed:
             self.confirmed = True
@@ -436,6 +490,45 @@ class SrtpPipeline:
             self._stop(5)
             return False
         return True
+
+    def _begin_trial(self) -> None:
+        """Snapshots the counters this trial will be judged against."""
+        with self.counters.lock:
+            self.trial_inputs0 = self.counters.inputs
+        self.trial_drops0 = self._drop_count()
+        self.trial_started_ms = now_ms()
+
+    def _advance_search_if_tried(self) -> None:
+        """Steps to the next candidate, but only on evidence it was actually tried.
+
+        Stepping on a timer alone would burn through the candidate list whenever a
+        port is simply idle, so the trial ends only when datagrams were rejected
+        under this candidate, or when datagrams arrived and the trial timed out.
+        """
+        with self.counters.lock:
+            inputs = self.counters.inputs
+        tried_inputs = inputs - self.trial_inputs0
+        tried_drops = self._drop_count() - self.trial_drops0
+        timed_out = now_ms() - self.trial_started_ms > self.args.trial_timeout_ms
+
+        if tried_drops < self.args.trial_drops and not (tried_inputs > 0 and timed_out):
+            return
+
+        emit(
+            t="auth",
+            status="fail",
+            candidate=self.candidate,
+            inputs=tried_inputs,
+            drops=tried_drops,
+        )
+        self.trial_index += 1
+        self.candidate = next(self.candidates)
+        if self.dec is not None:
+            # Resetting the stream is what lets the next candidate be applied without
+            # rebuilding anything: the next datagram re-requests the key, and no
+            # replay-window or rollover state from the failed attempt survives.
+            self.dec.emit("remove-key", self.ssrc)
+        self._begin_trial()
 
     def _drop_count(self) -> int:
         if self.dec is None:
