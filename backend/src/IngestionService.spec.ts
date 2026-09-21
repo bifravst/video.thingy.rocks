@@ -9,6 +9,7 @@ import {
 	type ActivitySource,
 	type ExitingProducer,
 	type HealthPort,
+	type IngestionTransport,
 	type PacketSource,
 } from './IngestionService.ts'
 import type { OwnedWriteResult } from './StreamMetadataService.ts'
@@ -145,6 +146,7 @@ const build = (
 		producer?: ExitingProducer | null
 		health?: HealthPort
 		listener?: ListenerFake
+		extraTransports?: IngestionTransport[]
 	} = {},
 ) => {
 	const listener = overrides.listener ?? new ListenerFake()
@@ -161,8 +163,10 @@ const build = (
 		instanceId: 'i-test',
 		locks,
 		activity,
-		producer,
-		listener,
+		transports: [
+			{ name: 'unencrypted', portRange: PORTS, listener, producer },
+			...(overrides.extraTransports ?? []),
+		],
 		healthServer,
 	})
 	return { service, listener, activity, locks, producer, healthServer }
@@ -309,5 +313,103 @@ void describe('IngestionService', () => {
 			await service.shutdown()
 			assert.deepStrictEqual(locks.order, [])
 		})
+	})
+})
+
+void describe('IngestionService with an additive transport', () => {
+	const srtpPorts = { start: 6000, end: 6009 }
+
+	const buildWithSrtp = (
+		srtpListener: ListenerFake,
+		srtpProducer: ProducerFake | null = new ProducerFake(),
+	) => {
+		const built = build({
+			extraTransports: [
+				{
+					name: 'srtp',
+					portRange: srtpPorts,
+					listener: srtpListener,
+					producer: srtpProducer,
+					provisionalTimeoutMs: 20_000,
+					provisionalCooldownMs: 60_000,
+				},
+			],
+		})
+		return { ...built, srtpProducer }
+	}
+
+	void it('serves both port ranges from their own listeners', async () => {
+		const srtpListener = new ListenerFake()
+		const { service, listener, producer, srtpProducer } =
+			buildWithSrtp(srtpListener)
+
+		listener.deliver(5000, Buffer.alloc(10), new Date())
+		srtpListener.deliver(6000, Buffer.alloc(10), new Date())
+		await settle()
+
+		assert.strictEqual(service.stateFor(5000), 'Running')
+		// The additive transport waits for authentication before it counts as running.
+		assert.strictEqual(service.stateFor(6000), 'Provisional')
+		assert.deepStrictEqual((producer as ProducerFake).startedPorts, [5000])
+		assert.deepStrictEqual(srtpProducer?.startedPorts, [6000])
+	})
+
+	// Each port has its own Kinesis stream and its own lock row, so the paired ports
+	// never contend: both can own their slot at the same time.
+	void it('lets paired ports own their own slots independently', async () => {
+		const srtpListener = new ListenerFake()
+		const { service, listener, locks } = buildWithSrtp(srtpListener)
+
+		listener.deliver(5000, Buffer.alloc(10), new Date())
+		srtpListener.deliver(6000, Buffer.alloc(10), new Date())
+		await settle()
+
+		assert.deepStrictEqual(locks.order, ['acquire:5000', 'acquire:6000'])
+		assert.strictEqual(service.stateFor(5000), 'Running')
+		assert.strictEqual(service.stateFor(6000), 'Provisional')
+	})
+
+	void it('promotes a provisional port when the transport reports authentication', async () => {
+		const srtpListener = new ListenerFake()
+		const { service } = buildWithSrtp(srtpListener)
+		srtpListener.deliver(6000, Buffer.alloc(10), new Date())
+		await settle()
+		service.authenticated(6000)
+		await settle()
+		assert.strictEqual(service.stateFor(6000), 'Running')
+	})
+
+	// The health port says "this backend is up". An additive transport that cannot
+	// bind must not close it and have the fleet replaced over a condition that is
+	// identical on every instance.
+	void it('keeps running when the additive transport cannot bind', async () => {
+		const srtpListener = new ListenerFake()
+		srtpListener.failOnStart = new Error('EADDRINUSE')
+		const { service, listener, healthServer } = buildWithSrtp(srtpListener)
+
+		await service.start()
+
+		assert.strictEqual(listener.started, true)
+		assert.strictEqual((healthServer as HealthFake).started, true)
+		// And the half-bound listener was cleaned up.
+		assert.strictEqual(srtpListener.stopped, true)
+	})
+
+	void it('fails startup when the primary transport cannot bind', async () => {
+		const listener = new ListenerFake()
+		listener.failOnStart = new Error('EADDRINUSE')
+		const { service, healthServer } = build({ listener })
+		await assert.rejects(async () => service.start())
+		assert.strictEqual((healthServer as HealthFake).started, false)
+	})
+
+	void it('shuts every transport down', async () => {
+		const srtpListener = new ListenerFake()
+		const { service, listener, srtpProducer } = buildWithSrtp(srtpListener)
+		await service.shutdown()
+		assert.strictEqual(listener.stopped, true)
+		assert.strictEqual(srtpListener.stopped, true)
+		assert.strictEqual(srtpProducer?.shutdownCalls, 1)
+		assert.strictEqual(service.stateFor(6000), 'Terminated')
 	})
 })

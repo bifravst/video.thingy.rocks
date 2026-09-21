@@ -2,10 +2,17 @@ import { fromNodeProviderChain } from '@aws-sdk/credential-providers'
 
 import { loadConfig } from './config.ts'
 import { HealthServer } from './HealthServer.ts'
-import { IngestionService, KinesisProducerAdapter } from './IngestionService.ts'
+import {
+	IngestionService,
+	KinesisProducerAdapter,
+	type IngestionTransport,
+} from './IngestionService.ts'
 import { resolveInstanceId } from './InstanceId.ts'
 import { KinesisIngestionPipeline } from './KinesisIngestionPipeline.ts'
 import { Logger } from './Logger.ts'
+import { createSrtpAdmissionFilter } from './SrtpAdmission.ts'
+import { SrtpKeyStore } from './SrtpKeyStore.ts'
+import { SrtpProducer } from './SrtpProducer.ts'
 import { StreamMetadataService } from './StreamMetadataService.ts'
 import { StreamStateManager } from './StreamStateManager.ts'
 import { UDPListener } from './UDPListener.ts'
@@ -37,7 +44,19 @@ const ensureAwsCredentials = async (): Promise<void> => {
 	}
 }
 
-const buildService = (instanceId: string): IngestionService => {
+/** Where kvssink writes its own log configuration on the instances. */
+const KVS_LOG_CONFIG_PATH = '/opt/video-streaming/kvs_log_configuration'
+/**
+ * How long an SRTP port may hold its slot without having authenticated anything.
+ *
+ * A pipeline has to exist before anything can be authenticated, so this window is
+ * unavoidable - but it is bounded, and a port that never authenticates gives the slot
+ * back and waits out a longer cooldown before trying again.
+ */
+const SRTP_PROVISIONAL_MS = 20_000
+const SRTP_PROVISIONAL_COOLDOWN_MS = 60_000
+
+const buildService = async (instanceId: string): Promise<IngestionService> => {
 	const config = loadConfig()
 
 	const streamStateManager = new StreamStateManager({
@@ -68,25 +87,106 @@ const buildService = (instanceId: string): IngestionService => {
 			: 'disabled (KINESIS_STREAM_PREFIX not set)',
 	})
 
+	const transports: IngestionTransport[] = [
+		{
+			name: 'unencrypted',
+			portRange: config.portRange,
+			listener: new UDPListener({
+				portRange: config.portRange,
+				bufferSize: config.bufferSize,
+				flushInterval: config.flushInterval,
+				outputDirectory: config.outputDirectory,
+			}),
+			producer: pipeline === null ? null : new KinesisProducerAdapter(pipeline),
+		},
+	]
+
+	// Additive: SRTP needs its own ports, its own streams and its own keys, and
+	// nothing about it can stop the transport above from running.
+	if (config.srtp !== undefined && pipeline !== null) {
+		const srtp = config.srtp
+		const keyStore = new SrtpKeyStore({
+			region: config.awsRegion,
+			parameterPrefix: srtp.keyParameterPrefix,
+		})
+		const ports: number[] = []
+		for (let port = srtp.portRange.start; port <= srtp.portRange.end; port++) {
+			ports.push(port)
+		}
+		// Isolated: an unreachable or throttled parameter store must not stop the
+		// unencrypted path, which does not depend on SRTP keys at all.
+		try {
+			await keyStore.loadPorts(ports)
+			logger.info('SRTP keys loaded', {
+				configured: ports.length,
+				keyed: keyStore.keyedPorts().length,
+			})
+		} catch (err) {
+			logger.error(
+				'Could not load SRTP keys; SRTP ingestion is unavailable until this is resolved. The unencrypted path is unaffected.',
+				err instanceof Error ? err : new Error(String(err)),
+			)
+		}
+
+		// The producer has to exist before the service that owns its ports, and it
+		// needs to reach back into that service to report authentication - so the
+		// reference is filled in once the service exists.
+		const serviceRef: { current?: IngestionService } = {}
+		const producer = new SrtpProducer({
+			keyStore,
+			hints: streamMetadataService,
+			region: config.awsRegion,
+			streamNameForPort: (port) =>
+				`${config.kinesisStreamPrefix}-${String(port)}`,
+			kvsLogConfigPath: KVS_LOG_CONFIG_PATH,
+			onAuthenticated: (port: number) => {
+				serviceRef.current?.authenticated(port)
+			},
+		})
+
+		transports.push({
+			name: 'srtp',
+			portRange: srtp.portRange,
+			listener: new UDPListener({
+				portRange: srtp.portRange,
+				bufferSize: config.bufferSize,
+				flushInterval: config.flushInterval,
+				outputDirectory: config.outputDirectory,
+			}),
+			producer,
+			provisionalTimeoutMs: SRTP_PROVISIONAL_MS,
+			provisionalCooldownMs: SRTP_PROVISIONAL_COOLDOWN_MS,
+			admitFor: (port: number) =>
+				createSrtpAdmissionFilter(
+					{ ssrcForPort: (p) => keyStore.getKeyForPort(p)?.ssrc },
+					port,
+				),
+		})
+
+		serviceRef.current = new IngestionService({
+			config,
+			instanceId,
+			locks: streamMetadataService,
+			activity: streamStateManager,
+			transports,
+			healthServer: new HealthServer(),
+		})
+		return serviceRef.current
+	}
+
 	return new IngestionService({
 		config,
 		instanceId,
 		locks: streamMetadataService,
 		activity: streamStateManager,
-		producer: pipeline === null ? null : new KinesisProducerAdapter(pipeline),
-		listener: new UDPListener({
-			portRange: config.portRange,
-			bufferSize: config.bufferSize,
-			flushInterval: config.flushInterval,
-			outputDirectory: config.outputDirectory,
-		}),
+		transports,
 		healthServer: new HealthServer(),
 	})
 }
 
 const main = async (): Promise<void> => {
 	const instanceId = await resolveInstanceId()
-	const service = buildService(instanceId)
+	const service = await buildService(instanceId)
 
 	let shuttingDown = false
 	const shutdown = (signal: string): void => {

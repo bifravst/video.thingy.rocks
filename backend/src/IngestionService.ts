@@ -47,14 +47,37 @@ export type ExitingProducer = IngestionProducer & {
 	shutdown(): Promise<void>
 }
 
+/**
+ * One ingest transport: its ports, its listener, its producer, and the per-port
+ * settings that differ between transports.
+ *
+ * Transports are independent by construction. They share the lock table, keyed by the
+ * raw port, and nothing else - each port has its own Kinesis stream, so two transports
+ * never contend for one destination and no cross-transport arbitration exists to get
+ * wrong.
+ */
+export type IngestionTransport = {
+	name: string
+	portRange: { start: number; end: number }
+	listener: PacketSource
+	/** Null when this transport cannot produce; its ports then only track state. */
+	producer: ExitingProducer | null
+	/**
+	 * Set when the producer must report authentication before a port counts as
+	 * running. Until then the port relays traffic but refreshes no lease.
+	 */
+	provisionalTimeoutMs?: number
+	provisionalCooldownMs?: number
+	/** Per-port syntactic filter applied while a port is unowned. */
+	admitFor?: (port: number) => (datagram: Buffer) => boolean
+}
+
 export type IngestionServiceOptions = {
 	config: IngestionConfig
 	instanceId: string
 	locks: IngestionLockStore
 	activity: ActivitySource
-	/** Null when Kinesis ingestion is disabled; the service then only tracks state. */
-	producer: ExitingProducer | null
-	listener: PacketSource
+	transports: IngestionTransport[]
 	healthServer: HealthPort
 	logger?: Logger
 }
@@ -76,17 +99,23 @@ export class IngestionService {
 		this.options = options
 		this.logger = options.logger ?? new Logger('IngestionService')
 
-		const { config, producer } = options
-		for (
-			let port = config.portRange.start;
-			port <= config.portRange.end;
-			port++
-		) {
-			this.machines.set(port, this.createMachine(port))
+		for (const transport of options.transports) {
+			this.wireTransport(transport)
 		}
 
-		options.listener.setPacketHandler({
-			onPacket: (port, data, timestamp) => {
+		options.activity.on('streamStop', (port: number) => {
+			this.machines.get(port)?.onInactive()
+		})
+	}
+
+	private wireTransport(transport: IngestionTransport): void {
+		const { portRange, producer } = transport
+		for (let port = portRange.start; port <= portRange.end; port++) {
+			this.machines.set(port, this.createMachine(transport, port))
+		}
+
+		transport.listener.setPacketHandler({
+			onPacket: (port: number, data: Buffer, timestamp: Date) => {
 				this.machines.get(port)?.offer(data, timestamp)
 			},
 			// The machine starts from packets, so a resume needs no separate path - the
@@ -96,11 +125,7 @@ export class IngestionService {
 			onStreamStop: async () => undefined,
 		})
 
-		options.activity.on('streamStop', (port: number) => {
-			this.machines.get(port)?.onInactive()
-		})
-
-		producer?.onExit((port) => {
+		producer?.onExit((port: number) => {
 			const machine = this.machines.get(port)
 			if (machine === undefined) return
 			const epoch = producer.epochForPort(port)
@@ -109,17 +134,27 @@ export class IngestionService {
 		})
 	}
 
-	private createMachine(port: number): PortIngestion {
-		const { config, producer } = this.options
+	/** Lets a transport report that a port's traffic authenticated. */
+	authenticated(port: number): void {
+		this.machines.get(port)?.onAuthenticated()
+	}
+
+	private createMachine(
+		transport: IngestionTransport,
+		port: number,
+	): PortIngestion {
 		return new PortIngestion(
 			{
 				port,
 				instanceId: this.options.instanceId,
-				minBytesBeforeStart: config.kinesisMinBytesBeforeStart,
+				minBytesBeforeStart: this.options.config.kinesisMinBytesBeforeStart,
+				provisionalTimeoutMs: transport.provisionalTimeoutMs,
+				provisionalCooldownMs: transport.provisionalCooldownMs,
+				admit: transport.admitFor?.(port),
 			},
 			{
 				locks: this.options.locks,
-				producer: producer ?? disabledProducer,
+				producer: transport.producer ?? disabledProducer,
 				activity: this.options.activity,
 				logger: this.logger,
 			},
@@ -131,13 +166,47 @@ export class IngestionService {
 		return this.machines.get(port)?.stateName
 	}
 
+	/**
+	 * Binds every transport, then opens the health port.
+	 *
+	 * The first transport is the one the health port represents and its failure is
+	 * fatal; every later transport is additive, so a failure there is logged and the
+	 * service keeps running without it. That asymmetry is deliberate: the health port
+	 * says "this instance's backend is up", and the Auto Scaling group replaces
+	 * instances that fail it - so a condition identical on every instance, like an
+	 * unreachable parameter store, must not be able to close it and churn the fleet.
+	 */
 	async start(): Promise<void> {
-		await this.options.listener.start()
-		// The health port opens only once the listener behind it is bound, so an
-		// instance never reports itself able to ingest before it can.
+		const [primary, ...additive] = this.options.transports
+		if (primary === undefined)
+			throw new Error('no ingest transports configured')
+
+		await primary.listener.start()
+		for (const transport of additive) {
+			try {
+				await transport.listener.start()
+				this.logger.info('Transport started', {
+					transport: transport.name,
+					ports: `${transport.portRange.start}-${transport.portRange.end}`,
+				})
+			} catch (err) {
+				this.logger.error(
+					'Additive transport could not start; continuing without it',
+					err instanceof Error ? err : new Error(String(err)),
+					{ transport: transport.name },
+				)
+				// Leave nothing half bound behind.
+				try {
+					await transport.listener.stop()
+				} catch {
+					// Nothing more to do.
+				}
+			}
+		}
+
 		await this.options.healthServer.start()
 		this.logger.info('Ingestion started', {
-			ports: `${this.options.config.portRange.start}-${this.options.config.portRange.end}`,
+			transports: this.options.transports.map((t) => t.name).join(', '),
 			healthPort: this.options.healthServer.port,
 		})
 	}
@@ -151,12 +220,16 @@ export class IngestionService {
 	 */
 	async shutdown(): Promise<void> {
 		await this.options.healthServer.stop()
-		await this.options.listener.stop()
+		for (const transport of this.options.transports) {
+			await transport.listener.stop()
+		}
 		this.options.activity.stop()
 		await Promise.all(
 			[...this.machines.values()].map(async (m) => m.shutdown()),
 		)
-		await this.options.producer?.shutdown()
+		for (const transport of this.options.transports) {
+			await transport.producer?.shutdown()
+		}
 		this.logger.info('Ingestion stopped')
 	}
 }
