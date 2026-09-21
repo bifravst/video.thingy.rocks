@@ -1,11 +1,25 @@
 import { fromNodeProviderChain } from '@aws-sdk/credential-providers'
+
 import { loadConfig } from './config.ts'
 import { HealthServer } from './HealthServer.ts'
+import { IngestionService, KinesisProducerAdapter } from './IngestionService.ts'
 import { resolveInstanceId } from './InstanceId.ts'
 import { KinesisIngestionPipeline } from './KinesisIngestionPipeline.ts'
+import { Logger } from './Logger.ts'
 import { StreamMetadataService } from './StreamMetadataService.ts'
 import { StreamStateManager } from './StreamStateManager.ts'
-import { UDPListener, type PacketHandler } from './UDPListener.ts'
+import { UDPListener } from './UDPListener.ts'
+
+/**
+ * Entry point for the UDP video ingestion service.
+ *
+ * Receives UDP video on ports 5000-5009, tracks stream state in DynamoDB, and - when
+ * a stream prefix is configured - ingests into Kinesis Video Streams through GStreamer
+ * and kvssink. One port's ingestion lifecycle lives in PortIngestion; the wiring lives
+ * in IngestionService. This file only resolves configuration and handles signals.
+ */
+
+const logger = new Logger('Main')
 
 const ensureAwsCredentials = async (): Promise<void> => {
 	const credentialProvider = fromNodeProviderChain({
@@ -15,342 +29,96 @@ const ensureAwsCredentials = async (): Promise<void> => {
 	try {
 		await credentialProvider()
 	} catch (err) {
-		const msg = err instanceof Error ? err.message : String(err)
-		console.error(
-			'[Main] AWS credentials could not be loaded. The service needs credentials for DynamoDB (and for Kinesis if enabled).',
+		logger.error(
+			'AWS credentials could not be loaded. The service needs credentials for DynamoDB (and for Kinesis if enabled). Locally: set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_REGION (or use AWS_PROFILE). On EC2: ensure the instance has an IAM role and that IMDS is reachable (AWS_EC2_METADATA_DISABLED must be unset or false).',
+			err instanceof Error ? err : new Error(String(err)),
 		)
-		console.error(
-			'[Main] Locally: set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_REGION (or use AWS_PROFILE).',
-		)
-		console.error(
-			'[Main] On EC2: ensure the instance has an IAM role and IMDS is not disabled (AWS_EC2_METADATA_DISABLED must be unset or false).',
-		)
-		console.error('[Main] Error:', msg)
 		throw err
 	}
 }
 
-/**
- * Main entry point for the UDP video ingestion service.
- *
- * This service:
- * - Listens for UDP packets on ports 5000-5009
- * - Tracks stream state (active/inactive)
- * - Updates DynamoDB with stream metadata
- * - Optionally sends UDP/MPEG-TS to Kinesis Video Streams (GStreamer (TS -> H.264) -> kvssink -> Kinesis Video)
- */
+const buildService = (instanceId: string): IngestionService => {
+	const config = loadConfig()
 
-// Throws on invalid configuration rather than starting with a value that would
-// silently disable ingestion (see config.ts).
-const config = loadConfig()
-
-const streamStateManager = new StreamStateManager({
-	inactivityTimeout: config.inactivityTimeout,
-})
-
-const streamMetadataService = new StreamMetadataService({
-	tableName: config.dynamoDBTableName,
-	region: config.awsRegion,
-})
-
-const kinesisIngestionPipeline = config.kinesisIngestionEnabled
-	? new KinesisIngestionPipeline({
-			streamNamePrefix: config.kinesisStreamPrefix,
-			region: config.awsRegion,
-			portRange: config.portRange,
-			logGstreamerOutput: config.kinesisLogGstreamerOutput,
-		})
-	: null
-
-/** Ports for which this instance holds the Kinesis lock (only holder may send to Kinesis). */
-const kinesisLockHeldForPorts = new Set<number>()
-
-/**
- * Per-port buffer of packets before we start GStreamer. We wait until at least
- * kinesisMinBytesBeforeStart (10 MB) to avoid treating port scans as video streams.
- */
-const preStartBufferByPort = new Map<
-	number,
-	{ chunks: Buffer[]; totalBytes: number }
->()
-
-/** Resolved at startup; used by packet handler for lock acquisition and DynamoDB updates. */
-let instanceId = 'local'
-
-/**
- * Packet handling that needs to await anything (DynamoDB, credentials, a pipeline
- * start) lives here rather than in onPacket, which must return synchronously so the
- * UDP socket is never behind an unbounded promise chain. See PacketHandler.onPacket.
- */
-const createPacketHandler = (): PacketHandler => {
-	const handlePacket = async (
-		port: number,
-		data: Buffer,
-		timestamp: Date,
-	): Promise<void> => {
-		const streamState = streamStateManager.getStreamState(port)
-		const isFirstPacket = streamState === undefined
-		const isResume = streamState?.status === 'inactive'
-
-		let packetAlreadyInInitialData = false
-		// Buffer packets until we have enough data, then acquire Kinesis lock and start GStreamer.
-		// This prevents port scans (small random payloads) from being treated as video streams.
-		// Include preStartBufferByPort.has(port) so we keep buffering (and eventually try the lock)
-		// on packets 2..N until we hit the threshold; otherwise we only enter on first packet.
-		if (
-			kinesisIngestionPipeline &&
-			kinesisIngestionPipeline.isPortInRange(port) &&
-			!kinesisLockHeldForPorts.has(port) &&
-			(isFirstPacket || isResume || preStartBufferByPort.has(port))
-		) {
-			let buf = preStartBufferByPort.get(port)
-			if (!buf) {
-				buf = { chunks: [], totalBytes: 0 }
-				preStartBufferByPort.set(port, buf)
-			}
-			buf.chunks.push(data)
-			buf.totalBytes += data.length
-
-			if (buf.totalBytes >= config.kinesisMinBytesBeforeStart) {
-				preStartBufferByPort.delete(port)
-				const initialData = Buffer.concat(buf.chunks)
-				packetAlreadyInInitialData = true
-				try {
-					const acquired = await streamMetadataService.tryAcquireKinesisLock(
-						port,
-						instanceId,
-					)
-					if (acquired) {
-						kinesisLockHeldForPorts.add(port)
-						await kinesisIngestionPipeline.start(port, initialData)
-					}
-				} catch (err) {
-					console.error(
-						`[Main] Error acquiring Kinesis lock / starting ingestion for port ${port}:`,
-						err,
-					)
-				}
-			}
-		}
-
-		streamStateManager.onPacketReceived(port, timestamp)
-
-		// Only refresh the lock lease if we hold the lock. A lost lock means another
-		// instance owns the stream, so this one must stop producing rather than keep
-		// writing alongside it; a transient write error says nothing about ownership and
-		// the lease has not expired yet, so ingestion continues.
-		if (kinesisLockHeldForPorts.has(port)) {
-			const outcome = await streamMetadataService.updateLastPacketTime(
-				port,
-				instanceId,
-			)
-			if (outcome === 'lostLock') {
-				kinesisLockHeldForPorts.delete(port)
-				await kinesisIngestionPipeline?.stop(port)
-				return
-			}
-		}
-
-		// Feed packet to Kinesis only if we hold the lock. Skip if this packet was passed as initialData.
-		if (
-			kinesisIngestionPipeline &&
-			kinesisLockHeldForPorts.has(port) &&
-			!packetAlreadyInInitialData
-		) {
-			kinesisIngestionPipeline.writePacket(port, data)
-		}
-	}
-
-	return {
-		onPacket: (port, data, timestamp) => {
-			void handlePacket(port, data, timestamp).catch((err) => {
-				console.error(`[Main] Error handling packet for port ${port}:`, err)
+	const streamStateManager = new StreamStateManager({
+		inactivityTimeout: config.inactivityTimeout,
+	})
+	const streamMetadataService = new StreamMetadataService({
+		tableName: config.dynamoDBTableName,
+		region: config.awsRegion,
+	})
+	const pipeline = config.kinesisIngestionEnabled
+		? new KinesisIngestionPipeline({
+				streamNamePrefix: config.kinesisStreamPrefix,
+				region: config.awsRegion,
+				portRange: config.portRange,
+				logGstreamerOutput: config.kinesisLogGstreamerOutput,
 			})
-		},
+		: null
 
-		onStreamStart: async (port) => {
-			console.log(`[Main] Stream started on port ${port}`)
-
-			// Resume Kinesis pipeline only if we hold the lock (e.g. stream resume after brief inactivity)
-			if (kinesisIngestionPipeline && kinesisLockHeldForPorts.has(port)) {
-				void kinesisIngestionPipeline.start(port).catch((err) => {
-					console.error(
-						`[Main] Error starting Kinesis ingestion for port ${port}:`,
-						err,
-					)
-				})
-			}
-		},
-
-		onStreamStop: async (port, inactivityDuration) => {
-			console.log(
-				`[Main] Stream stopped on port ${port} after ${inactivityDuration}ms`,
-			)
-
-			preStartBufferByPort.delete(port)
-
-			if (kinesisLockHeldForPorts.has(port)) {
-				await streamMetadataService.releaseKinesisLock(port, instanceId)
-				kinesisLockHeldForPorts.delete(port)
-			}
-
-			if (kinesisIngestionPipeline) {
-				await kinesisIngestionPipeline.stop(port)
-			}
-		},
-	}
-}
-
-const packetHandler = createPacketHandler()
-
-// Set up stream state event handlers
-streamStateManager.on('streamStart', (port: number) => {
-	void packetHandler.onStreamStart(port).catch((err) => {
-		console.error(`[Main] Error handling stream start for port ${port}:`, err)
+	logger.info('Starting UDP video ingestion service', {
+		instanceId,
+		ports: `${config.portRange.start}-${config.portRange.end}`,
+		table: config.dynamoDBTableName,
+		region: config.awsRegion,
+		kinesisIngestion: config.kinesisIngestionEnabled
+			? `enabled (stream prefix ${config.kinesisStreamPrefix}, starts after ${String(
+					config.kinesisMinBytesBeforeStart / 1024 / 1024,
+				)} MB)`
+			: 'disabled (KINESIS_STREAM_PREFIX not set)',
 	})
-})
 
-streamStateManager.on(
-	'streamStop',
-	(port: number, inactivityDuration: number) => {
-		void packetHandler.onStreamStop(port, inactivityDuration).catch((err) => {
-			console.error(`[Main] Error handling stream stop for port ${port}:`, err)
-		})
-	},
-)
-
-// Auto-restart Kinesis pipeline when GStreamer exits unexpectedly (e.g. crash, OOM, Kinesis network issues)
-// Restart is throttled to avoid storms if GStreamer keeps failing
-const pipelineRestartThrottleMs = 10_000 // min delay between restarts per port
-const lastPipelineRestartByPort = new Map<number, number>()
-if (kinesisIngestionPipeline) {
-	kinesisIngestionPipeline.on(
-		'pipelineExited',
-		({
-			port,
-			code,
-			signal,
-		}: {
-			port: number
-			code: number | null
-			signal: string | null
-		}) => {
-			// Only restart if stream is still active (still receiving packets)
-			const state = streamStateManager.getStreamState(port)
-			if (state?.status !== 'active') return
-			if (!kinesisIngestionPipeline?.isPortInRange(port)) return
-
-			const now = Date.now()
-			const lastRestart = lastPipelineRestartByPort.get(port) ?? 0
-			const delay = Math.max(0, pipelineRestartThrottleMs - (now - lastRestart))
-
-			console.warn(
-				`[Main] GStreamer exited unexpectedly for port ${port} (code=${code}, signal=${signal}). Restarting in ${delay}ms...`,
-			)
-			setTimeout(() => {
-				lastPipelineRestartByPort.set(port, Date.now())
-				void kinesisIngestionPipeline?.start(port).catch((err) => {
-					console.error(
-						`[Main] Error restarting Kinesis ingestion for port ${port}:`,
-						err,
-					)
-				})
-			}, delay)
-		},
-	)
-}
-
-// Initialize UDP listener
-const udpListener = new UDPListener({
-	portRange: config.portRange,
-	bufferSize: config.bufferSize,
-	flushInterval: config.flushInterval,
-	outputDirectory: config.outputDirectory,
-})
-
-udpListener.setPacketHandler(packetHandler)
-
-const healthServer = new HealthServer()
-
-// Graceful shutdown handler
-const shutdown = async (): Promise<void> => {
-	console.log('[Main] Shutting down...')
-
-	await healthServer.stop()
-	await udpListener.stop()
-	streamStateManager.stop()
-	preStartBufferByPort.clear()
-	for (const port of kinesisLockHeldForPorts) {
-		await streamMetadataService.releaseKinesisLock(port, instanceId)
-	}
-	kinesisLockHeldForPorts.clear()
-	if (kinesisIngestionPipeline) {
-		await kinesisIngestionPipeline.stopAll()
-	}
-
-	console.log('[Main] Shutdown complete')
-	process.exit(0)
-}
-
-process.on('SIGINT', () => {
-	void shutdown().catch((err) => {
-		console.error('[Main] Error during shutdown:', err)
-		process.exit(1)
+	return new IngestionService({
+		config,
+		instanceId,
+		locks: streamMetadataService,
+		activity: streamStateManager,
+		producer: pipeline === null ? null : new KinesisProducerAdapter(pipeline),
+		listener: new UDPListener({
+			portRange: config.portRange,
+			bufferSize: config.bufferSize,
+			flushInterval: config.flushInterval,
+			outputDirectory: config.outputDirectory,
+		}),
+		healthServer: new HealthServer(),
 	})
-})
-process.on('SIGTERM', () => {
-	void shutdown().catch((err) => {
-		console.error('[Main] Error during shutdown:', err)
-		process.exit(1)
-	})
-})
-
-// Start the service
-const start = async (): Promise<void> => {
-	instanceId = await resolveInstanceId()
-	console.log('[Main] Starting UDP video ingestion service...')
-	console.log(`[Main] Instance ID: ${instanceId}`)
-	console.log(
-		`[Main] Listening on ports ${config.portRange.start}-${config.portRange.end}`,
-	)
-	console.log(`[Main] Output directory: ${config.outputDirectory}`)
-	console.log(`[Main] DynamoDB table: ${config.dynamoDBTableName}`)
-	console.log(`[Main] AWS region: ${config.awsRegion}`)
-	if (config.kinesisIngestionEnabled) {
-		console.log(
-			`[Main] Kinesis ingestion enabled (stream prefix: ${config.kinesisStreamPrefix})`,
-		)
-		console.log(
-			`[Main] GStreamer starts after ${config.kinesisMinBytesBeforeStart / 1024 / 1024} MB received (KINESIS_MIN_BYTES_BEFORE_START)`,
-		)
-	} else {
-		console.log(
-			'[Main] Kinesis ingestion disabled (KINESIS_STREAM_PREFIX not set)',
-		)
-	}
-
-	try {
-		await ensureAwsCredentials()
-		await healthServer.start()
-		await udpListener.start()
-		console.log('[Main] Service started successfully')
-	} catch (error) {
-		console.error('[Main] Failed to start service:', error)
-		process.exit(1)
-	}
 }
 
-// Start if running as main module
+const main = async (): Promise<void> => {
+	const instanceId = await resolveInstanceId()
+	const service = buildService(instanceId)
+
+	let shuttingDown = false
+	const shutdown = (signal: string): void => {
+		if (shuttingDown) return
+		shuttingDown = true
+		logger.info('Shutting down', { signal })
+		service
+			.shutdown()
+			.then(() => {
+				process.exit(0)
+			})
+			.catch((err: unknown) => {
+				logger.error(
+					'Error during shutdown',
+					err instanceof Error ? err : new Error(String(err)),
+				)
+				process.exit(1)
+			})
+	}
+	process.on('SIGINT', () => shutdown('SIGINT'))
+	process.on('SIGTERM', () => shutdown('SIGTERM'))
+
+	await ensureAwsCredentials()
+	await service.start()
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
-	void start().catch((err) => {
-		console.error('[Main] Fatal error:', err)
+	void main().catch((err: unknown) => {
+		logger.error(
+			'Failed to start service',
+			err instanceof Error ? err : new Error(String(err)),
+		)
 		process.exit(1)
 	})
-}
-
-export {
-	kinesisIngestionPipeline,
-	streamMetadataService,
-	streamStateManager,
-	udpListener,
 }

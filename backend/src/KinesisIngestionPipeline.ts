@@ -406,6 +406,11 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		}
 	}
 
+	/** True while a producer is running for this port. */
+	isActive(port: number): boolean {
+		return this.activePipelines.has(port)
+	}
+
 	/**
 	 * Writes a UDP packet into the GStreamer stdin for that port.
 	 * When reorderBufferSize > 0, packets are buffered and emitted in receive order.

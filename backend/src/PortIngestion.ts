@@ -16,8 +16,21 @@ export type IngestionLockStore = {
  * concatenated: SRTP decryption depends on per-datagram framing, so only the transport
  * itself may decide to join them into a byte stream.
  */
+/** Identifies the ownership lifetime a producer was started under. */
+export type ProducerStartContext = { epoch: number }
+
 export type IngestionProducer = {
-	start(port: number, datagrams: Buffer[]): Promise<void>
+	/**
+	 * `context.epoch` identifies this ownership lifetime. A producer that reports its
+	 * own exit must report the epoch it was started with, not whatever is current when
+	 * the exit is noticed - by then the port may be on its next lifetime, and a late
+	 * event would tear that one down.
+	 */
+	start(
+		port: number,
+		datagrams: Buffer[],
+		context: ProducerStartContext,
+	): Promise<void>
 	stop(port: number): Promise<void>
 	writePacket(port: number, data: Buffer): void
 	isActive(port: number): boolean
@@ -482,7 +495,7 @@ export class PortIngestion {
 	private async startProducer(datagrams: Buffer[]): Promise<void> {
 		let failure: Error | undefined
 		try {
-			await this.producer.start(this.port, datagrams)
+			await this.producer.start(this.port, datagrams, { epoch: this.epoch })
 		} catch (err) {
 			failure = err instanceof Error ? err : new Error(String(err))
 		}

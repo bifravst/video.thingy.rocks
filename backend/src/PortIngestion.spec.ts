@@ -80,9 +80,12 @@ class ProducerFake {
 	unsent: Buffer[] = []
 	takeUnsentCount = 0
 
-	async start(port: number, datagrams: Buffer[]) {
+	readonly startEpochs: number[] = []
+
+	async start(port: number, datagrams: Buffer[], context: { epoch: number }) {
 		assert.strictEqual(port, PORT)
 		this.startCalls.push(datagrams)
+		this.startEpochs.push(context.epoch)
 		if (this.startGate !== undefined) await this.startGate
 		if (this.startBehaviour === 'throw') throw new Error('spawn failed')
 		this.active = this.startBehaviour === 'ok'
