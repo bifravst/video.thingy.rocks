@@ -217,6 +217,8 @@ export class PortIngestion {
 	private readonly pending = new Pending()
 	private readonly queue: (() => Promise<void>)[] = []
 	private draining = false
+	/** True while a packet event is queued and has not started running; see offer(). */
+	private packetEventQueued = false
 	/** Bumped on every lock acquisition; identifies one ownership lifetime. */
 	private epoch = 0
 	private lastDroppedLog = 0
@@ -270,9 +272,18 @@ export class PortIngestion {
 		return this.epoch
 	}
 
+	/** Events waiting to run; the specs use it to assert the queue stays bounded. */
+	get queuedEvents(): number {
+		return this.queue.length
+	}
+
 	/**
 	 * Accepts a datagram. Runs synchronously on the socket callback and never awaits:
 	 * the UDP socket cannot be given backpressure, so the work goes on the queue.
+	 *
+	 * Only the datagram is unconditional. The packet event that processes it is
+	 * coalesced, because the event queue is the one thing here that has no cap - see
+	 * the comment below.
 	 */
 	offer(data: Buffer, receivedAt: Date): void {
 		if (this.state.name === 'Terminated') return
@@ -290,7 +301,20 @@ export class PortIngestion {
 		const dropped = this.pending.evictTo(this.maxQueuedBytes)
 		if (dropped > 0) this.noteDropped(dropped)
 
-		void this.enqueue(async () => this.handlePacket())
+		// One queued packet event covers every datagram buffered behind it: the handler
+		// always drains the whole buffer, so a second event would find nothing left to
+		// do. Appending one per datagram instead would grow the queue without bound
+		// whenever an event is blocked on lock acquisition or a producer start - the
+		// memory growth the bounded buffer alone does not prevent.
+		if (this.packetEventQueued) return
+		this.packetEventQueued = true
+		void this.enqueue(async () => {
+			// Cleared as the event starts, not when it ends: a datagram arriving while
+			// the handler runs may land after the buffer was drained, so it has to be
+			// able to queue the next event.
+			this.packetEventQueued = false
+			await this.handlePacket()
+		})
 	}
 
 	/** Inactivity: the activity tracker saw no packets for its timeout. */

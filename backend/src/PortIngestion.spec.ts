@@ -34,6 +34,7 @@ class LockStoreFake {
 	heartbeatOutcomes: OwnedWriteResult[] = []
 	acquireGate?: Promise<void>
 	releaseGate?: Promise<void>
+	heartbeatGate?: Promise<void>
 
 	async tryAcquireKinesisLock(port: number, instanceId: string) {
 		assert.strictEqual(port, PORT)
@@ -61,6 +62,7 @@ class LockStoreFake {
 
 	async updateLastPacketTime(): Promise<OwnedWriteResult> {
 		this.calls.push('heartbeat')
+		if (this.heartbeatGate !== undefined) await this.heartbeatGate
 		const outcome = this.heartbeatOutcomes.shift() ?? 'ok'
 		// The row belongs to another instance from here on, so leaving the owning
 		// states without releasing is correct - see lostSinceAcquire in the I1 check.
@@ -144,6 +146,8 @@ type Harness = {
 	settle: () => Promise<void>
 	/** Waits until the machine reaches a state, for pinning a mid-flight interleaving. */
 	waitForState: (name: string) => Promise<void>
+	/** Waits until the lock store has been asked to do something, for the same reason. */
+	waitForCall: (call: LockCall) => Promise<void>
 }
 
 const harness = (config: Partial<PortIngestionConfig> = {}): Harness => {
@@ -240,6 +244,19 @@ const harness = (config: Partial<PortIngestionConfig> = {}): Harness => {
 				if (Date.now() > deadline) {
 					throw new Error(
 						`timed out waiting for ${name}; still ${machine.stateName}`,
+					)
+				}
+				await new Promise((resolve) => setImmediate(resolve))
+			}
+		},
+		waitForCall: async (call) => {
+			const deadline = Date.now() + 2000
+			while (!locks.calls.includes(call)) {
+				const [firstError] = errors
+				if (firstError !== undefined) throw firstError
+				if (Date.now() > deadline) {
+					throw new Error(
+						`timed out waiting for ${call}; calls so far: ${locks.calls.join(', ')}`,
 					)
 				}
 				await new Promise((resolve) => setImmediate(resolve))
@@ -722,6 +739,49 @@ void describe('PortIngestion', () => {
 			for (let i = 0; i < 30; i++) h2.machine.offer(datagram(40), new Date())
 			await h2.settle()
 			assert.strictEqual(h2.machine.stateName, 'Running')
+		})
+
+		// The buffer is capped, but the event queue is not: one closure per datagram
+		// would accumulate for as long as an event is blocked on a start, and the
+		// datagrams behind it are already in the buffer that the first event drains.
+		void it('queues at most one packet event however many datagrams arrive', async () => {
+			const g = gate()
+			h.producer.startGate = g.promise
+			h.send()
+			await h.waitForState('Starting')
+
+			for (let i = 0; i < 10_000; i++) h.machine.offer(datagram(20), new Date())
+			assert.ok(
+				h.machine.queuedEvents <= 1,
+				`${String(h.machine.queuedEvents)} events queued for 10000 datagrams`,
+			)
+			assert.ok(h.machine.bufferedBytes <= h.machine.queueCapBytes)
+
+			g.open()
+			await h.settle()
+			assert.strictEqual(h.machine.stateName, 'Running')
+		})
+
+		// Coalescing must not swallow a datagram that arrives after the running handler
+		// has already drained the buffer - hence one queued event per *running* one.
+		void it('relays a datagram that arrives mid-handler', async () => {
+			h.send()
+			await h.settle()
+
+			const g = gate()
+			h.locks.heartbeatGate = g.promise
+			h.machine.offer(datagram(5, 1), new Date())
+			// The handler has relayed datagram 1 and is now waiting on the heartbeat,
+			// so datagram 2 lands behind an already-drained buffer.
+			await h.waitForCall('heartbeat')
+			h.machine.offer(datagram(5, 2), new Date())
+			g.open()
+			await h.settle()
+
+			assert.deepStrictEqual(
+				h.producer.written.map((d) => d[0]),
+				[1, 2],
+			)
 		})
 
 		void it('starts on the first packet when the threshold is zero', async () => {
