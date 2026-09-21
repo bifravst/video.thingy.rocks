@@ -56,7 +56,7 @@ const KVS_LOG_CONFIG_PATH = '/opt/video-streaming/kvs_log_configuration'
 const SRTP_PROVISIONAL_MS = 20_000
 const SRTP_PROVISIONAL_COOLDOWN_MS = 60_000
 
-const buildService = async (instanceId: string): Promise<IngestionService> => {
+const buildService = (instanceId: string): IngestionService => {
 	const config = loadConfig()
 
 	const streamStateManager = new StreamStateManager({
@@ -113,20 +113,6 @@ const buildService = async (instanceId: string): Promise<IngestionService> => {
 		for (let port = srtp.portRange.start; port <= srtp.portRange.end; port++) {
 			ports.push(port)
 		}
-		// Isolated: an unreachable or throttled parameter store must not stop the
-		// unencrypted path, which does not depend on SRTP keys at all.
-		try {
-			await keyStore.loadPorts(ports)
-			logger.info('SRTP keys loaded', {
-				configured: ports.length,
-				keyed: keyStore.keyedPorts().length,
-			})
-		} catch (err) {
-			logger.error(
-				'Could not load SRTP keys; SRTP ingestion is unavailable until this is resolved. The unencrypted path is unaffected.',
-				err instanceof Error ? err : new Error(String(err)),
-			)
-		}
 
 		// The producer has to exist before the service that owns its ports, and it
 		// needs to reach back into that service to report authentication - so the
@@ -147,6 +133,19 @@ const buildService = async (instanceId: string): Promise<IngestionService> => {
 		transports.push({
 			name: 'srtp',
 			portRange: srtp.portRange,
+			// Resolved when this transport starts, which is after credentials have been
+			// verified and after the unencrypted listener is already serving: an
+			// unreachable or throttled parameter store can stall for minutes, and the
+			// existing ingest path does not depend on SRTP keys at all. A failure here
+			// leaves SRTP ports unkeyed - they then admit nothing - and is isolated by
+			// IngestionService, so the service keeps running.
+			prepare: async () => {
+				await keyStore.loadPorts(ports)
+				logger.info('SRTP keys loaded', {
+					configured: ports.length,
+					keyed: keyStore.keyedPorts().length,
+				})
+			},
 			listener: new UDPListener({
 				portRange: srtp.portRange,
 				bufferSize: config.bufferSize,
@@ -186,7 +185,7 @@ const buildService = async (instanceId: string): Promise<IngestionService> => {
 
 const main = async (): Promise<void> => {
 	const instanceId = await resolveInstanceId()
-	const service = await buildService(instanceId)
+	const service = buildService(instanceId)
 
 	let shuttingDown = false
 	const shutdown = (signal: string): void => {

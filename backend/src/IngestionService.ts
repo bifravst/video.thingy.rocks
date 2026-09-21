@@ -70,6 +70,12 @@ export type IngestionTransport = {
 	provisionalCooldownMs?: number
 	/** Per-port syntactic filter applied while a port is unowned. */
 	admitFor?: (port: number) => (datagram: Buffer) => boolean
+	/**
+	 * Work this transport needs done before its listener binds - resolving keys, for
+	 * instance. Runs inside the same isolation as the listener, so for an additive
+	 * transport a failure here disables that transport and nothing else.
+	 */
+	prepare?: () => Promise<void>
 }
 
 export type IngestionServiceOptions = {
@@ -181,9 +187,14 @@ export class IngestionService {
 		if (primary === undefined)
 			throw new Error('no ingest transports configured')
 
+		await primary.prepare?.()
 		await primary.listener.start()
 		for (const transport of additive) {
 			try {
+				// After the primary listener is serving, deliberately: an additive
+				// transport's setup can stall for minutes on an unreachable dependency,
+				// and the working path must not wait behind it.
+				await transport.prepare?.()
 				await transport.listener.start()
 				this.logger.info('Transport started', {
 					transport: transport.name,

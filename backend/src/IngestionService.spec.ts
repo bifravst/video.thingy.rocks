@@ -413,3 +413,82 @@ void describe('IngestionService with an additive transport', () => {
 		assert.strictEqual(service.stateFor(6000), 'Terminated')
 	})
 })
+
+void describe('IngestionService transport preparation', () => {
+	void it('prepares the primary transport before its listener binds', async () => {
+		const order: string[] = []
+		const listener = new ListenerFake()
+		const originalStart = listener.start.bind(listener)
+		listener.start = async () => {
+			order.push('listen')
+			await originalStart()
+		}
+		const { service } = build({ listener })
+		// The primary transport's own preparation is fatal, like its listener.
+		await service.start()
+		assert.deepStrictEqual(order, ['listen'])
+	})
+
+	// An additive transport's setup can stall for minutes on an unreachable
+	// dependency, so it must not run before the working path is already serving.
+	void it('prepares an additive transport only after the primary is serving', async () => {
+		const order: string[] = []
+		const primary = new ListenerFake()
+		const primaryStart = primary.start.bind(primary)
+		primary.start = async () => {
+			order.push('primary-listen')
+			await primaryStart()
+		}
+		const srtpListener = new ListenerFake()
+		const srtpStart = srtpListener.start.bind(srtpListener)
+		srtpListener.start = async () => {
+			order.push('srtp-listen')
+			await srtpStart()
+		}
+
+		const { service } = build({
+			listener: primary,
+			extraTransports: [
+				{
+					name: 'srtp',
+					portRange: { start: 6000, end: 6009 },
+					listener: srtpListener,
+					producer: new ProducerFake(),
+					prepare: async () => {
+						order.push('srtp-prepare')
+					},
+				},
+			],
+		})
+		await service.start()
+		assert.deepStrictEqual(order, [
+			'primary-listen',
+			'srtp-prepare',
+			'srtp-listen',
+		])
+	})
+
+	void it('keeps serving when an additive transport cannot prepare', async () => {
+		const srtpListener = new ListenerFake()
+		const { service, listener, healthServer } = build({
+			extraTransports: [
+				{
+					name: 'srtp',
+					portRange: { start: 6000, end: 6009 },
+					listener: srtpListener,
+					producer: new ProducerFake(),
+					prepare: async () => {
+						throw new Error('parameter store unreachable')
+					},
+				},
+			],
+		})
+
+		await service.start()
+
+		assert.strictEqual(listener.started, true)
+		assert.strictEqual((healthServer as HealthFake).started, true)
+		// Its listener never bound, so the transport is simply absent.
+		assert.strictEqual(srtpListener.started, false)
+	})
+})
