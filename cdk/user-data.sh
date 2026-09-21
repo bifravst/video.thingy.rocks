@@ -35,6 +35,17 @@ aws --version
 yum install -y cmake gcc-c++ make git pkg-config m4 autoconf automake libcurl-devel
 yum install -y gstreamer1 gstreamer1-devel gstreamer1-plugins-base gstreamer1-plugins-base-devel gstreamer1-plugins-good gstreamer1-plugins-bad-free
 
+# Python GObject bindings for the SRTP pipeline helper (backend/src/srtp_pipeline.py),
+# which runs the SRTP pipeline as a GStreamer application so the master key is handed
+# to srtpdec in process instead of appearing in a command line.
+#
+# Installed with "|| echo" rather than under `set -e`: this is an additive dependency,
+# and a package name that is wrong or temporarily unavailable must not abort bootstrap
+# and leave the instance without the unencrypted ingest path. The Gst typelib itself
+# comes from gstreamer1-devel / gstreamer1-plugins-base-devel, installed above.
+yum install -y python3-gobject-base || echo "WARNING: python3-gobject-base not installed; SRTP ingestion will not work"
+yum install -y python3-gstreamer1 || echo "NOTE: python3-gstreamer1 not installed; the helper only needs the Gst typelib, so this is usually harmless"
+
 # Create application directory and deploy code so the service always gets installed and started
 mkdir -p /opt/video-streaming
 
@@ -80,6 +91,11 @@ Environment="TABLE_NAME=__TABLE_NAME__"
 Environment="OUTPUT_DIR=/var/video-streams"
 Environment="TRANSCODING_OUTPUT_DIR=/tmp/video-streams/transcoding"
 Environment="KINESIS_STREAM_PREFIX=__KINESIS_STREAM_PREFIX__"
+# SRTP ingestion is enabled by this prefix being set - there is no separate boolean,
+# because two sources of truth for "is this on" is how a path ends up half configured.
+Environment="SRTP_KEY_PARAMETER_PREFIX=__SRTP_KEY_PARAMETER_PREFIX__"
+Environment="SRTP_PORT_RANGE_START=__SRTP_PORT_RANGE_START__"
+Environment="SRTP_PORT_RANGE_END=__SRTP_PORT_RANGE_END__"
 Environment="GST_PLUGIN_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build"
 Environment="LD_LIBRARY_PATH=/opt/amazon-kinesis-video-streams-producer-sdk-cpp/build"
 ExecStart=/usr/bin/node --max-old-space-size=16384 --experimental-transform-types --no-warnings src/index.ts
@@ -98,6 +114,28 @@ systemctl daemon-reload
 
 # Enable service to start on boot
 systemctl enable video-streaming.service
+
+# Verify what the SRTP pipeline helper needs, before the service starts so the result
+# is in the bootstrap log next to the rest of the setup.
+#
+# Warning only, and deliberately so. These conditions are identical on every instance
+# in the fleet, and the Auto Scaling group replaces instances that fail their health
+# check - so making this fatal would turn a missing package into the whole fleet
+# cycling through identically broken replacements, taking the unencrypted path with it.
+# A keyless or unusable SRTP port simply drops its traffic, which shows up in the SRTP
+# zero-ingestion alarm.
+#
+# Note this probes the Python bindings, not gst-inspect-1.0: the helper needs the
+# GObject typelib, and the command line tools can be absent while the typelib is fine.
+if python3 -c "import gi; gi.require_version('Gst','1.0')
+from gi.repository import Gst
+Gst.init(None)
+missing = [n for n in ['udpsrc','srtpdec','rtpjitterbuffer','rtph264depay','h264parse','capsfilter'] if not Gst.ElementFactory.find(n)]
+raise SystemExit('missing GStreamer elements: ' + ', '.join(missing) if missing else 0)"; then
+  echo "SRTP pipeline prerequisites present"
+else
+  echo "WARNING: SRTP pipeline prerequisites missing; SRTP ingestion will not work until this is resolved. The unencrypted MPEG-TS path is unaffected."
+fi
 
 # Start the application service immediately so the app is always running
 systemctl start video-streaming.service

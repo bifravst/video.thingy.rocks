@@ -278,6 +278,9 @@ export class StreamingStack extends Stack {
 			.replace(/__AWS_REGION__/g, this.region)
 			.replace(/__TABLE_NAME__/g, this.streamTable.tableName)
 			.replace(/__KINESIS_STREAM_PREFIX__/g, kinesisStreamPrefix)
+			.replace(/__SRTP_KEY_PARAMETER_PREFIX__/g, `/${this.stackName}/srtp/port`)
+			.replace(/__SRTP_PORT_RANGE_START__/g, String(srtpPorts[0]))
+			.replace(/__SRTP_PORT_RANGE_END__/g, String(srtpPorts.at(-1)))
 			.replace(/__CODE_BUCKET__/g, this.codeBucket.bucketName)
 
 		const userData = ec2.UserData.custom(userDataScript)

@@ -262,6 +262,39 @@ void describe('StreamingStack', () => {
 		})
 	})
 
+	void describe('instance bootstrap', () => {
+		/**
+		 * An unsubstituted placeholder would reach the instance verbatim, and the
+		 * backend would read it as a literal value - disabling the ingest path it
+		 * configures rather than failing loudly.
+		 */
+		void it('leaves no placeholder unsubstituted in the user data', () => {
+			const templates = template().findResources('AWS::EC2::LaunchTemplate')
+			const userData = JSON.stringify(
+				Object.values(templates).map(
+					(launchTemplate) =>
+						launchTemplate.Properties?.LaunchTemplateData?.UserData,
+				),
+			)
+			const leftover = userData.match(/__[A-Z_]+__/g)
+			assert.deepStrictEqual(leftover, null)
+		})
+
+		void it('configures the SRTP key parameter path and port range', () => {
+			const templates = template().findResources('AWS::EC2::LaunchTemplate')
+			const userData = JSON.stringify(
+				Object.values(templates).map(
+					(launchTemplate) =>
+						launchTemplate.Properties?.LaunchTemplateData?.UserData,
+				),
+			)
+			assert.ok(userData.includes('SRTP_PORT_RANGE_START=6000'))
+			assert.ok(userData.includes('SRTP_PORT_RANGE_END=6009'))
+			// SRTP is enabled by this being set, so the path has to be the real one.
+			assert.ok(userData.includes('/srtp/port'))
+		})
+	})
+
 	void describe('stream metadata table', () => {
 		// The lock row is keyed by the raw ingest port, unchanged, so there is no data
 		// migration and the existing rows stay meaningful.
