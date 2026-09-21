@@ -173,7 +173,7 @@ export class IngestionService {
 	}
 
 	/**
-	 * Binds every transport, then opens the health port.
+	 * Binds the primary transport, opens the health port, then adds the rest.
 	 *
 	 * The first transport is the one the health port represents and its failure is
 	 * fatal; every later transport is additive, so a failure there is logged and the
@@ -181,6 +181,12 @@ export class IngestionService {
 	 * says "this instance's backend is up", and the Auto Scaling group replaces
 	 * instances that fail it - so a condition identical on every instance, like an
 	 * unreachable parameter store, must not be able to close it and churn the fleet.
+	 *
+	 * The health port therefore opens as soon as the primary listener is serving,
+	 * before any additive setup. An additive transport is explicitly allowed to stall
+	 * for minutes on an unreachable dependency, and waiting for it would leave a new
+	 * instance failing health checks in every target group for that whole time -
+	 * which is the same fleet-wide outage in a different disguise.
 	 */
 	async start(): Promise<void> {
 		const [primary, ...additive] = this.options.transports
@@ -189,11 +195,24 @@ export class IngestionService {
 
 		await primary.prepare?.()
 		await primary.listener.start()
+
+		try {
+			await this.options.healthServer.start()
+		} catch (err) {
+			// Nothing is serving traffic yet, so leave nothing bound behind either.
+			await primary.listener.stop()
+			throw err
+		}
+		this.logger.info('Serving', {
+			transport: primary.name,
+			ports: `${primary.portRange.start}-${primary.portRange.end}`,
+			healthPort: this.options.healthServer.port,
+		})
+
 		for (const transport of additive) {
 			try {
-				// After the primary listener is serving, deliberately: an additive
-				// transport's setup can stall for minutes on an unreachable dependency,
-				// and the working path must not wait behind it.
+				// After the primary listener is serving and the health port is open,
+				// deliberately: see start()'s doc comment.
 				await transport.prepare?.()
 				await transport.listener.start()
 				this.logger.info('Transport started', {
@@ -215,7 +234,6 @@ export class IngestionService {
 			}
 		}
 
-		await this.options.healthServer.start()
 		this.logger.info('Ingestion started', {
 			transports: this.options.transports.map((t) => t.name).join(', '),
 			healthPort: this.options.healthServer.port,

@@ -430,8 +430,10 @@ void describe('IngestionService transport preparation', () => {
 	})
 
 	// An additive transport's setup can stall for minutes on an unreachable
-	// dependency, so it must not run before the working path is already serving.
-	void it('prepares an additive transport only after the primary is serving', async () => {
+	// dependency, so it must not run before the working path is already serving - and
+	// the health port must not wait behind it either, or the instance stays unhealthy
+	// in every target group for the length of that stall.
+	void it('prepares an additive transport only after the health port is open', async () => {
 		const order: string[] = []
 		const primary = new ListenerFake()
 		const primaryStart = primary.start.bind(primary)
@@ -445,9 +447,15 @@ void describe('IngestionService transport preparation', () => {
 			order.push('srtp-listen')
 			await srtpStart()
 		}
+		const health = new HealthFake()
+		health.start = async () => {
+			order.push('health')
+			health.started = true
+		}
 
 		const { service } = build({
 			listener: primary,
+			health,
 			extraTransports: [
 				{
 					name: 'srtp',
@@ -463,9 +471,41 @@ void describe('IngestionService transport preparation', () => {
 		await service.start()
 		assert.deepStrictEqual(order, [
 			'primary-listen',
+			'health',
 			'srtp-prepare',
 			'srtp-listen',
 		])
+	})
+
+	// The stall this exists for: an SRTP key lookup that never returns must not hold
+	// the health port closed, so it is tested with preparation that does not finish.
+	void it('opens the health port while an additive transport is still stalled', async () => {
+		const srtpListener = new ListenerFake()
+		const health = new HealthFake()
+		const { service } = build({
+			health,
+			extraTransports: [
+				{
+					name: 'srtp',
+					portRange: { start: 6000, end: 6009 },
+					listener: srtpListener,
+					producer: new ProducerFake(),
+					prepare: async () => new Promise(() => undefined),
+				},
+			],
+		})
+
+		const starting = service.start()
+		await settle()
+		assert.strictEqual(health.started, true)
+		assert.strictEqual(srtpListener.started, false)
+		// start() is still pending on the stalled transport, which is why the health
+		// port could not be left until the end.
+		const outcome = await Promise.race([
+			starting.then(() => 'returned'),
+			new Promise((resolve) => setTimeout(() => resolve('pending'), 20)),
+		])
+		assert.strictEqual(outcome, 'pending')
 	})
 
 	void it('keeps serving when an additive transport cannot prepare', async () => {
