@@ -16,6 +16,7 @@ type SentCommand = {
 /** Minimal stand-in for the document client, recording what would have been sent. */
 const fakeDocClient = (
 	outcomes: ('ok' | 'conditional' | 'error')[] = [],
+	item?: Record<string, unknown>,
 ): {
 	client: DynamoDBDocumentClient
 	sent: SentCommand[]
@@ -36,7 +37,7 @@ const fakeDocClient = (
 				err.name = 'ProvisionedThroughputExceededException'
 				throw err
 			}
-			return {}
+			return item === undefined ? {} : { Item: item }
 		},
 	} as unknown as DynamoDBDocumentClient
 	return { client, sent }
@@ -44,11 +45,12 @@ const fakeDocClient = (
 
 const service = (
 	outcomes?: ('ok' | 'conditional' | 'error')[],
+	item?: Record<string, unknown>,
 ): {
 	subject: StreamMetadataService
 	sent: SentCommand[]
 } => {
-	const { client, sent } = fakeDocClient(outcomes)
+	const { client, sent } = fakeDocClient(outcomes, item)
 	return {
 		subject: new StreamMetadataService(
 			{ tableName: 'StreamMetadata' },
@@ -146,5 +148,110 @@ void describe('StreamMetadataService.updateLastPacketTime', () => {
 		)
 		assert.strictEqual(await subject.updateLastPacketTime(5000, 'i-1'), 'ok')
 		assert.strictEqual(sent.length, 2)
+	})
+})
+
+const FINGERPRINT = 'abc123def4567890'
+
+void describe('StreamMetadataService SRTP rollover hint', () => {
+	const stored = (overrides: Record<string, unknown> = {}) => ({
+		port: 6000,
+		srtpRocHint: 7,
+		srtpRocSsrc: 42,
+		srtpRocKeyFingerprint: FINGERPRINT,
+		...overrides,
+	})
+
+	void it('round-trips a confirmed hint', async () => {
+		const { subject, sent } = service(undefined, stored())
+		assert.strictEqual(await subject.getSrtpRocHint(6000, 42, FINGERPRINT), 7)
+		assert.deepStrictEqual(sent[0]?.input.Key, { port: 6000 })
+	})
+
+	// Zero is a real rollover counter, so "no idea" has to be a different value -
+	// conflating them is what seeded fresh decoders incorrectly before.
+	void it('returns undefined, not zero, when there is nothing usable', async () => {
+		for (const item of [
+			undefined,
+			stored({ srtpRocHint: undefined }),
+			stored({ srtpRocHint: 'seven' }),
+			stored({ srtpRocHint: 1.5 }),
+			stored({ srtpRocHint: -1 }),
+		]) {
+			const { subject } = service(undefined, item)
+			assert.strictEqual(
+				await subject.getSrtpRocHint(6000, 42, FINGERPRINT),
+				undefined,
+				JSON.stringify(item),
+			)
+		}
+	})
+
+	void it('returns a hint of zero when zero was confirmed', async () => {
+		const { subject } = service(undefined, stored({ srtpRocHint: 0 }))
+		assert.strictEqual(await subject.getSrtpRocHint(6000, 42, FINGERPRINT), 0)
+	})
+
+	// A different sender or a rotated key means the hint describes another session.
+	void it('ignores a hint confirmed for another sender or key', async () => {
+		const wrongSsrc = service(undefined, stored({ srtpRocSsrc: 43 }))
+		assert.strictEqual(
+			await wrongSsrc.subject.getSrtpRocHint(6000, 42, FINGERPRINT),
+			undefined,
+		)
+		const rotated = service(
+			undefined,
+			stored({ srtpRocKeyFingerprint: 'other' }),
+		)
+		assert.strictEqual(
+			await rotated.subject.getSrtpRocHint(6000, 42, FINGERPRINT),
+			undefined,
+		)
+		const missing = service(
+			undefined,
+			stored({ srtpRocKeyFingerprint: undefined }),
+		)
+		assert.strictEqual(
+			await missing.subject.getSrtpRocHint(6000, 42, FINGERPRINT),
+			undefined,
+		)
+	})
+
+	void it('treats a read failure as having no hint', async () => {
+		const { subject } = service(['error'], stored())
+		assert.strictEqual(
+			await subject.getSrtpRocHint(6000, 42, FINGERPRINT),
+			undefined,
+		)
+	})
+
+	// No ownership condition, no throttle: losing this value costs a short search on
+	// the next start and nothing else, and the machinery those guarantees needed was
+	// itself a source of bugs.
+	void it('writes the hint unconditionally and unthrottled', async () => {
+		const { subject, sent } = service()
+		await subject.putSrtpRocHint(6000, 9, 42, FINGERPRINT)
+		await subject.putSrtpRocHint(6000, 10, 42, FINGERPRINT)
+
+		assert.strictEqual(sent.length, 2)
+		assert.strictEqual(sent[0]?.input.ConditionExpression, undefined)
+		assert.deepStrictEqual(sent[0]?.input.Key, { port: 6000 })
+		assert.strictEqual(
+			sent[1]?.input.ExpressionAttributeValues?.[':roc'],
+			10 as unknown as string,
+		)
+	})
+
+	void it('records the identity the hint was confirmed under', async () => {
+		const { subject, sent } = service()
+		await subject.putSrtpRocHint(6000, 9, 42, FINGERPRINT)
+		const values = sent[0]?.input.ExpressionAttributeValues ?? {}
+		assert.strictEqual(values[':ssrc'], 42 as unknown as string)
+		assert.strictEqual(values[':fingerprint'], FINGERPRINT)
+	})
+
+	void it('swallows a write failure, because the next start can search again', async () => {
+		const { subject } = service(['error'])
+		await subject.putSrtpRocHint(6000, 9, 42, FINGERPRINT)
 	})
 })

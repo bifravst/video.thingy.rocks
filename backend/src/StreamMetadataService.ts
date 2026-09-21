@@ -1,6 +1,7 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
 import {
 	DynamoDBDocumentClient,
+	GetCommand,
 	PutCommand,
 	UpdateCommand,
 } from '@aws-sdk/lib-dynamodb'
@@ -17,6 +18,21 @@ export type StreamMetadata = {
 	lastFramePath?: string
 	hlsManifestPath?: string
 	rawStreamPath?: string
+	/**
+	 * Last SRTP rollover counter that was *confirmed by authentication* for this port.
+	 *
+	 * A hint, deliberately: the pipeline seeds it as its first candidate and libsrtp
+	 * decides whether it was right, so a stale, absent or plainly wrong value costs a
+	 * few datagrams while the search converges and is then overwritten. Nothing about
+	 * correctness depends on it, which is why writing it needs no ownership condition,
+	 * no throttle and no fencing - and why a value that was never authenticated must
+	 * never be written here.
+	 */
+	srtpRocHint?: number
+	/** SSRC the hint was confirmed for; a different sender starts the search over. */
+	srtpRocSsrc?: number
+	/** Fingerprint of the key the hint was confirmed under; a rotation invalidates it. */
+	srtpRocKeyFingerprint?: string
 	createdAt: string
 	updatedAt: string
 }
@@ -267,6 +283,86 @@ export class StreamMetadataService {
 				error,
 			)
 			return 'writeError'
+		}
+	}
+
+	/**
+	 * Reads the rollover-counter hint for a port, if one matches this sender.
+	 *
+	 * Not a consistent read. A stale value is corrected by the search within a few
+	 * datagrams, so asking for consistency would pay for a guarantee the value does
+	 * not need - and would imply the hint is authoritative, which it is not.
+	 *
+	 * Returns undefined rather than zero when there is nothing usable: zero is a real
+	 * rollover counter, and conflating "no idea" with "the beginning of the session"
+	 * is what made the previous implementation seed fresh decoders incorrectly.
+	 */
+	async getSrtpRocHint(
+		port: number,
+		expectedSsrc: number,
+		expectedKeyFingerprint: string,
+	): Promise<number | undefined> {
+		try {
+			const result = await this.docClient.send(
+				new GetCommand({ TableName: this.tableName, Key: { port } }),
+			)
+			const item = result.Item as StreamMetadata | undefined
+			if (item === undefined) return undefined
+			const { srtpRocHint, srtpRocSsrc, srtpRocKeyFingerprint } = item
+			if (typeof srtpRocHint !== 'number' || !Number.isInteger(srtpRocHint)) {
+				return undefined
+			}
+			if (srtpRocHint < 0) return undefined
+			// A different sender or a rotated key means the hint describes another
+			// session. Starting the search at zero is then strictly better than
+			// starting it somewhere unrelated.
+			if (srtpRocSsrc !== expectedSsrc) return undefined
+			if (srtpRocKeyFingerprint !== expectedKeyFingerprint) return undefined
+			return srtpRocHint
+		} catch (error) {
+			console.error(
+				`[StreamMetadataService] Could not read the SRTP rollover hint for port ${port}:`,
+				error,
+			)
+			return undefined
+		}
+	}
+
+	/**
+	 * Stores a rollover counter that authentication has confirmed.
+	 *
+	 * Best effort on purpose. There is no ownership condition, no throttle and no
+	 * forced final write, because losing this value costs a short search on the next
+	 * start and nothing else - whereas the machinery those guarantees needed was
+	 * itself a source of bugs. Callers write only on a change, which is once at
+	 * confirmation and once per rollover.
+	 */
+	async putSrtpRocHint(
+		port: number,
+		roc: number,
+		ssrc: number,
+		keyFingerprint: string,
+	): Promise<void> {
+		try {
+			await this.docClient.send(
+				new UpdateCommand({
+					TableName: this.tableName,
+					Key: { port },
+					UpdateExpression:
+						'SET srtpRocHint = :roc, srtpRocSsrc = :ssrc, srtpRocKeyFingerprint = :fingerprint, updatedAt = :now',
+					ExpressionAttributeValues: {
+						':roc': roc,
+						':ssrc': ssrc,
+						':fingerprint': keyFingerprint,
+						':now': new Date().toISOString(),
+					},
+				}),
+			)
+		} catch (error) {
+			console.warn(
+				`[StreamMetadataService] Could not store the SRTP rollover hint for port ${port}; the next start will search for it:`,
+				error,
+			)
 		}
 	}
 
