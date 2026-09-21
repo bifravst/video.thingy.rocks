@@ -3,7 +3,7 @@
   "version": "0.0.0-development",
   "type": "module",
   "scripts": {
-    "test": "node --no-warnings --experimental-transform-types --test \"backend/**/*.spec.ts\"",
+    "test": "node --no-warnings --experimental-transform-types --test \"backend/**/*.spec.ts\" \"cdk/**/*.spec.ts\"",
     "test:integration": "node --no-warnings --experimental-transform-types --test \"test/integration/**/*.spec.ts\"",
     "test:all": "node --no-warnings --experimental-transform-types --test \"!(node_modules)/**/*.spec.ts\"",
     "test:watch": "node --no-warnings --experimental-transform-types --test --watch \"!(node_modules)/**/*.spec.ts\"",

@@ -90,15 +90,27 @@ export class StreamingStack extends Stack {
 			removalPolicy: RemovalPolicy.DESTROY,
 		})
 
-		// Kinesis Video Streams: one per UDP port (5000-5009)
-		const kinesisStreamPortStart = 5000
-		const kinesisStreamPortEnd = 5009
+		// Ingest ports. The unencrypted MPEG-TS transport is the original path; SRTP is
+		// additive and uses its own ports, keys and streams.
+		const portRange = (start: number, end: number): number[] =>
+			Array.from({ length: end - start + 1 }, (_, i) => start + i)
+		const unencryptedPorts = portRange(5000, 5009)
+		const srtpPorts = portRange(6000, 6009)
+
+		// Kinesis Video Streams: one per ingest port, on both transports.
+		//
+		// Each transport gets its own streams rather than sharing one set, which keeps
+		// this deployment purely additive: the existing 5000-5009 streams keep both
+		// their construct IDs and their names, so nothing is renamed or replaced.
+		// Kinesis Video has no rename operation, so a changed name replaces the stream
+		// and drops its retained media - and sharing a stream between two transports
+		// would also mean two producers arbitrating over one destination.
 		const kinesisStreamPrefix = `${this.stackName}-video`
-		for (
-			let port = kinesisStreamPortStart;
-			port <= kinesisStreamPortEnd;
-			port++
-		) {
+		for (const port of [
+			...unencryptedPorts,
+			// SRTP ports, whose streams are additions.
+			...srtpPorts,
+		]) {
 			const stream = new kinesisvideo.CfnStream(
 				this,
 				`KinesisVideoStream${port}`,
@@ -128,6 +140,18 @@ export class StreamingStack extends Stack {
 			ec2.Peer.anyIpv6(),
 			ec2.Port.udpRange(5000, 5009),
 			'Allow UDP video ingestion on ports 5000-5009 (IPv6)',
+		)
+		// Allow UDP ingress on the SRTP ports (6000-6009), same dual-stack reasoning
+		// as the unencrypted range above.
+		this.udpSecurityGroup.addIngressRule(
+			ec2.Peer.anyIpv4(),
+			ec2.Port.udpRange(6000, 6009),
+			'Allow SRTP video ingestion on ports 6000-6009',
+		)
+		this.udpSecurityGroup.addIngressRule(
+			ec2.Peer.anyIpv6(),
+			ec2.Port.udpRange(6000, 6009),
+			'Allow SRTP video ingestion on ports 6000-6009 (IPv6)',
 		)
 		// Allow TCP health checks from NLB (originates within VPC)
 		this.udpSecurityGroup.addIngressRule(
@@ -177,6 +201,19 @@ export class StreamingStack extends Stack {
 					'kinesisvideo:PutMedia',
 				],
 				resources: ['*'],
+			}),
+		)
+
+		// Grant read access to the SRTP keys, scoped to this stack's parameters.
+		// The partition comes from the stack rather than being hardcoded as "aws", so
+		// this is still correct in other partitions.
+		this.ec2Role.addToPolicy(
+			new iam.PolicyStatement({
+				effect: iam.Effect.ALLOW,
+				actions: ['ssm:GetParameter', 'ssm:GetParameters'],
+				resources: [
+					`arn:${this.partition}:ssm:${this.region}:${this.account}:parameter/${this.stackName}/srtp/*`,
+				],
 			}),
 		)
 
@@ -333,55 +370,71 @@ export class StreamingStack extends Stack {
 			},
 		]
 
-		// Create target groups for UDP ports 5000-5009
-		const targetGroups: elbv2.NetworkTargetGroup[] = []
-		for (let port = 5000; port <= 5009; port++) {
-			const targetGroup = new elbv2.NetworkTargetGroup(
-				this,
-				`TargetGroup${port}`,
-				{
-					vpc: this.vpc,
-					port,
-					protocol: elbv2.Protocol.UDP,
-					targetType: elbv2.TargetType.INSTANCE,
-					ipAddressType: elbv2.TargetGroupIpAddressType.IPV6,
-					healthCheck: {
-						protocol: elbv2.Protocol.TCP,
-						port: '9999',
-						healthyThresholdCount: 2,
-						unhealthyThresholdCount: 2,
-						interval: Duration.seconds(10),
-						timeout: Duration.seconds(10),
-					},
-					deregistrationDelay: Duration.seconds(30),
-					preserveClientIp: true,
+		/**
+		 * Creates the UDP target group for one ingest port.
+		 *
+		 * Every target group health-checks port 9999, including the SRTP ones. That
+		 * port means "this instance's backend is up", not "this transport can ingest":
+		 * the Auto Scaling group uses ELB health checks, and with those, any attached
+		 * target group reporting an instance unhealthy gets the instance replaced. A
+		 * per-transport health port would therefore let an SRTP-only condition that is
+		 * identical on every instance - an unreachable parameter store, a missing
+		 * plugin, one unprovisioned key - churn the entire fleet and take the
+		 * unencrypted path down with it. The cost of this choice is that an instance
+		 * whose SRTP listener never bound still receives SRTP traffic and drops it;
+		 * that shows up in the SRTP zero-ingestion alarm rather than in a fleet-wide
+		 * outage.
+		 */
+		const createTargetGroup = (
+			id: string,
+			port: number,
+		): elbv2.NetworkTargetGroup => {
+			const targetGroup = new elbv2.NetworkTargetGroup(this, id, {
+				vpc: this.vpc,
+				port,
+				protocol: elbv2.Protocol.UDP,
+				targetType: elbv2.TargetType.INSTANCE,
+				ipAddressType: elbv2.TargetGroupIpAddressType.IPV6,
+				healthCheck: {
+					protocol: elbv2.Protocol.TCP,
+					port: '9999',
+					healthyThresholdCount: 2,
+					unhealthyThresholdCount: 2,
+					interval: Duration.seconds(10),
+					timeout: Duration.seconds(10),
 				},
-			)
+				deregistrationDelay: Duration.seconds(30),
+				preserveClientIp: true,
+			})
 
 			// Enable stickiness for single active instance pattern
 			targetGroup.setAttribute('stickiness.enabled', 'true')
 			targetGroup.setAttribute('stickiness.type', 'source_ip')
-
-			targetGroups.push(targetGroup)
+			return targetGroup
 		}
 
-		// Create UDP listeners for ports 5000-5009
-		for (let i = 0; i < targetGroups.length; i++) {
-			const port = 5000 + i
-			const targetGroup = targetGroups[i]
-			if (!targetGroup) {
-				throw new Error(`Target group for port ${port} is undefined`)
-			}
-			this.networkLoadBalancer.addListener(`UDPListener${port}`, {
+		// Existing construct IDs are kept for the unencrypted ports so this deployment
+		// does not replace their target groups; the SRTP ones are new.
+		const targetGroups = [
+			...unencryptedPorts.map((port) => ({
+				port,
+				targetGroup: createTargetGroup(`TargetGroup${port}`, port),
+				listenerId: `UDPListener${port}`,
+			})),
+			...srtpPorts.map((port) => ({
+				port,
+				targetGroup: createTargetGroup(`SrtpTargetGroup${port}`, port),
+				listenerId: `SrtpUDPListener${port}`,
+			})),
+		]
+
+		for (const { port, targetGroup, listenerId } of targetGroups) {
+			this.networkLoadBalancer.addListener(listenerId, {
 				port,
 				protocol: elbv2.Protocol.UDP,
 				defaultAction: elbv2.NetworkListenerAction.forward([targetGroup]),
 			})
-		}
-
-		// Attach all target groups to the Auto Scaling Group
-		// This enables automatic registration/deregistration of instances
-		for (const targetGroup of targetGroups) {
+			// Attaching to the ASG is what registers and deregisters instances.
 			this.autoScalingGroup.attachToNetworkTargetGroup(targetGroup)
 		}
 
@@ -541,38 +594,78 @@ export class StreamingStack extends Stack {
 			},
 		)
 
-		const kvsIncomingMetrics: Record<string, cloudwatch.IMetric> = {}
-		this.kinesisVideoStreams.forEach((_, i) => {
-			const port = kinesisStreamPortStart + i
-			const streamName = `${kinesisStreamPrefix}-${port}`
-			kvsIncomingMetrics[`s${i}`] = new cloudwatch.Metric({
-				namespace: 'AWS/KinesisVideo',
-				metricName: 'PutMedia.IncomingBytes',
-				dimensionsMap: { StreamName: streamName },
-				statistic: 'Sum',
-				period: Duration.minutes(1),
+		/**
+		 * Sums PutMedia.IncomingBytes over an explicit set of ports.
+		 *
+		 * Built from a port list rather than from this.kinesisVideoStreams, which now
+		 * holds both transports: iterating it would silently change what the existing
+		 * alarm watches every time a transport is added. A metric-math alarm is also
+		 * limited in how many metrics it can carry, so one alarm per transport is both
+		 * clearer and necessary.
+		 */
+		const kvsIncomingSumFor = (ports: number[]): cloudwatch.MathExpression => {
+			const metrics: Record<string, cloudwatch.IMetric> = {}
+			ports.forEach((port, i) => {
+				metrics[`s${i}`] = new cloudwatch.Metric({
+					namespace: 'AWS/KinesisVideo',
+					metricName: 'PutMedia.IncomingBytes',
+					dimensionsMap: { StreamName: `${kinesisStreamPrefix}-${port}` },
+					statistic: 'Sum',
+					period: Duration.minutes(1),
+				})
 			})
-		})
-		const kvsIncomingSum = new cloudwatch.MathExpression({
-			expression: this.kinesisVideoStreams.map((_, i) => `s${i}`).join('+'),
-			usingMetrics: kvsIncomingMetrics,
-			period: Duration.minutes(1),
-			label: 'PutMedia Incoming Bytes (all streams)',
-		})
+			return new cloudwatch.MathExpression({
+				expression: ports.map((_, i) => `s${i}`).join('+'),
+				usingMetrics: metrics,
+				period: Duration.minutes(1),
+				label: 'PutMedia Incoming Bytes',
+			})
+		}
+
 		const kvsNoIngestionAlarm = new cloudwatch.Alarm(
 			this,
 			'KVSNoPutMediaIngestionAlarm',
 			{
 				alarmName: `${Stack.of(this).stackName}-KVS-PutMedia-Incoming-Zero`,
 				alarmDescription:
-					'Sum of PutMedia.IncomingBytes across all Kinesis Video Streams is 0',
-				metric: kvsIncomingSum,
+					'Sum of PutMedia.IncomingBytes across the unencrypted Kinesis Video Streams is 0',
+				metric: kvsIncomingSumFor(unencryptedPorts),
 				threshold: 0,
 				evaluationPeriods: 5,
 				comparisonOperator:
 					cloudwatch.ComparisonOperator.LESS_THAN_OR_EQUAL_TO_THRESHOLD,
 				treatMissingData: cloudwatch.TreatMissingData.BREACHING,
 			},
+		)
+
+		/**
+		 * The same signal for the SRTP streams - but notify only.
+		 *
+		 * No SRTP ingestion is the *normal* state until devices are provisioned, so
+		 * this must not be wired to the restart topic the way the composite alarm
+		 * below is: that would reboot the fleet forever over a fleet doing nothing
+		 * wrong. Missing data is likewise not a breach, for the same reason. It is also
+		 * not combined with the load-balancer UDP byte metric, which counts both
+		 * transports - unencrypted traffic would satisfy the "there is traffic" leg and
+		 * make the composite fire whenever no SRTP device happened to be sending.
+		 */
+		const srtpNoIngestionAlarm = new cloudwatch.Alarm(
+			this,
+			'KVSNoPutMediaIngestionAlarmSrtp',
+			{
+				alarmName: `${Stack.of(this).stackName}-KVS-PutMedia-Incoming-Zero-SRTP`,
+				alarmDescription:
+					'Sum of PutMedia.IncomingBytes across the SRTP Kinesis Video Streams is 0',
+				metric: kvsIncomingSumFor(srtpPorts),
+				threshold: 0,
+				evaluationPeriods: 5,
+				comparisonOperator:
+					cloudwatch.ComparisonOperator.LESS_THAN_OR_EQUAL_TO_THRESHOLD,
+				treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+			},
+		)
+		srtpNoIngestionAlarm.addAlarmAction(
+			new cloudwatch_actions.SnsAction(alarmTopic),
 		)
 
 		const udpTrafficNoIngestionAlarm = new cloudwatch.CompositeAlarm(
