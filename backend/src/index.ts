@@ -1,4 +1,5 @@
 import { fromNodeProviderChain } from '@aws-sdk/credential-providers'
+import { loadConfig } from './config.ts'
 import { HealthServer } from './HealthServer.ts'
 import { resolveInstanceId } from './InstanceId.ts'
 import { KinesisIngestionPipeline } from './KinesisIngestionPipeline.ts'
@@ -39,28 +40,9 @@ const ensureAwsCredentials = async (): Promise<void> => {
  * - Optionally sends UDP/MPEG-TS to Kinesis Video Streams (GStreamer (TS -> H.264) -> kvssink -> Kinesis Video)
  */
 
-const KINESIS_MIN_BYTES_BEFORE_START =
-	Number(process.env.KINESIS_MIN_BYTES_BEFORE_START ?? 10) * 1024 * 1024 // 10 MB default
-
-// Configuration
-const config = {
-	portRange: { start: 5000, end: 5009 },
-	bufferSize: 1024 * 1024, // 1MB
-	flushInterval: 5000, // 5 seconds
-	outputDirectory: process.env.OUTPUT_DIR ?? '/tmp/video-streams',
-	transcodingOutputDirectory:
-		process.env.TRANSCODING_OUTPUT_DIR ?? '/tmp/video-streams/transcoding',
-	inactivityTimeout: 60000, // 1 minute
-	dynamoDBTableName: process.env.TABLE_NAME ?? 'StreamMetadata',
-	awsRegion: process.env.AWS_REGION ?? 'eu-central-1',
-	segmentDuration: 6, // 6 seconds for HLS segments
-	kinesisStreamPrefix: process.env.KINESIS_STREAM_PREFIX ?? '',
-	kinesisIngestionEnabled: Boolean(process.env.KINESIS_STREAM_PREFIX),
-	kinesisLogGstreamerOutput:
-		process.env.KINESIS_INGESTION_LOG_GSTREAMER === 'true' ||
-		process.env.KINESIS_INGESTION_LOG_GSTREAMER === '1',
-	kinesisMinBytesBeforeStart: KINESIS_MIN_BYTES_BEFORE_START,
-}
+// Throws on invalid configuration rather than starting with a value that would
+// silently disable ingestion (see config.ts).
+const config = loadConfig()
 
 const streamStateManager = new StreamStateManager({
 	inactivityTimeout: config.inactivityTimeout,
