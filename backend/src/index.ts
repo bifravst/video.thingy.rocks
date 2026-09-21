@@ -95,8 +95,17 @@ const preStartBufferByPort = new Map<
 /** Resolved at startup; used by packet handler for lock acquisition and DynamoDB updates. */
 let instanceId = 'local'
 
-const createPacketHandler = (): PacketHandler => ({
-	onPacket: async (port, data, timestamp) => {
+/**
+ * Packet handling that needs to await anything (DynamoDB, credentials, a pipeline
+ * start) lives here rather than in onPacket, which must return synchronously so the
+ * UDP socket is never behind an unbounded promise chain. See PacketHandler.onPacket.
+ */
+const createPacketHandler = (): PacketHandler => {
+	const handlePacket = async (
+		port: number,
+		data: Buffer,
+		timestamp: Date,
+	): Promise<void> => {
 		const streamState = streamStateManager.getStreamState(port)
 		const isFirstPacket = streamState === undefined
 		const isResume = streamState?.status === 'inactive'
@@ -165,39 +174,47 @@ const createPacketHandler = (): PacketHandler => ({
 		) {
 			kinesisIngestionPipeline.writePacket(port, data)
 		}
-	},
+	}
 
-	onStreamStart: async (port) => {
-		console.log(`[Main] Stream started on port ${port}`)
-
-		// Resume Kinesis pipeline only if we hold the lock (e.g. stream resume after brief inactivity)
-		if (kinesisIngestionPipeline && kinesisLockHeldForPorts.has(port)) {
-			void kinesisIngestionPipeline.start(port).catch((err) => {
-				console.error(
-					`[Main] Error starting Kinesis ingestion for port ${port}:`,
-					err,
-				)
+	return {
+		onPacket: (port, data, timestamp) => {
+			void handlePacket(port, data, timestamp).catch((err) => {
+				console.error(`[Main] Error handling packet for port ${port}:`, err)
 			})
-		}
-	},
+		},
 
-	onStreamStop: async (port, inactivityDuration) => {
-		console.log(
-			`[Main] Stream stopped on port ${port} after ${inactivityDuration}ms`,
-		)
+		onStreamStart: async (port) => {
+			console.log(`[Main] Stream started on port ${port}`)
 
-		preStartBufferByPort.delete(port)
+			// Resume Kinesis pipeline only if we hold the lock (e.g. stream resume after brief inactivity)
+			if (kinesisIngestionPipeline && kinesisLockHeldForPorts.has(port)) {
+				void kinesisIngestionPipeline.start(port).catch((err) => {
+					console.error(
+						`[Main] Error starting Kinesis ingestion for port ${port}:`,
+						err,
+					)
+				})
+			}
+		},
 
-		if (kinesisLockHeldForPorts.has(port)) {
-			await streamMetadataService.releaseKinesisLock(port, instanceId)
-			kinesisLockHeldForPorts.delete(port)
-		}
+		onStreamStop: async (port, inactivityDuration) => {
+			console.log(
+				`[Main] Stream stopped on port ${port} after ${inactivityDuration}ms`,
+			)
 
-		if (kinesisIngestionPipeline) {
-			await kinesisIngestionPipeline.stop(port)
-		}
-	},
-})
+			preStartBufferByPort.delete(port)
+
+			if (kinesisLockHeldForPorts.has(port)) {
+				await streamMetadataService.releaseKinesisLock(port, instanceId)
+				kinesisLockHeldForPorts.delete(port)
+			}
+
+			if (kinesisIngestionPipeline) {
+				await kinesisIngestionPipeline.stop(port)
+			}
+		},
+	}
+}
 
 const packetHandler = createPacketHandler()
 

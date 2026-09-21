@@ -10,7 +10,16 @@ export type UDPListenerConfig = {
 }
 
 export type PacketHandler = {
-	onPacket(port: number, data: Buffer, timestamp: Date): Promise<void>
+	/**
+	 * Called for every valid datagram, synchronously on the socket's 'message' event.
+	 *
+	 * Returns void, not a promise: the listener cannot apply backpressure to a UDP socket,
+	 * so a handler that awaited anything here (a DynamoDB write, credential resolution, a
+	 * pipeline start) would let datagrams accumulate in an unbounded promise chain outside
+	 * any buffer that bounds them. Handlers must record the packet and return; anything
+	 * slower belongs behind their own bounded queue.
+	 */
+	onPacket(port: number, data: Buffer, timestamp: Date): void
 	onStreamStart(port: number): Promise<void>
 	onStreamStop(port: number, inactivityDuration: number): Promise<void>
 }
@@ -148,7 +157,17 @@ export class UDPListener extends EventEmitter {
 				}
 
 				if (this.packetHandler) {
-					void this.packetHandler.onPacket(port, msg, timestamp)
+					// A throw here would otherwise escape the 'message' listener as an
+					// uncaught exception and take the process down, losing every port.
+					try {
+						this.packetHandler.onPacket(port, msg, timestamp)
+					} catch (err) {
+						this.logger.error(
+							'Packet handler threw',
+							err instanceof Error ? err : new Error(String(err)),
+							{ port },
+						)
+					}
 				}
 
 				this.emit('packet', { port, data: msg, timestamp })
