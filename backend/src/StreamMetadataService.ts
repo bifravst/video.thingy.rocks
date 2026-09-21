@@ -26,17 +26,39 @@ export type StreamMetadataServiceConfig = {
 	region?: string
 }
 
+/**
+ * Outcome of a write that is conditional on still owning the port's lock.
+ *
+ * `lostLock` and `writeError` are distinct because they demand opposite responses:
+ * losing the lock means another instance owns the stream and this one must stop
+ * producing immediately, whereas a transient DynamoDB error means nothing about
+ * ownership - the lease is still held until it goes stale, so tearing down and
+ * retrying on every failed write would churn the pipeline for no reason.
+ */
+export type OwnedWriteResult = 'ok' | 'lostLock' | 'writeError'
+
+const isConditionalCheckFailed = (err: unknown): boolean =>
+	err instanceof Error && err.name === 'ConditionalCheckFailedException'
+
 export class StreamMetadataService {
 	private readonly docClient: DynamoDBDocumentClient
 	private readonly tableName: string
 	private readonly lastUpdateTimes: Map<number, number> = new Map()
 	private readonly updateThrottleMs = 15_000 // 15 seconds
 
-	constructor(config: StreamMetadataServiceConfig) {
-		const client = new DynamoDBClient({
-			region: config.region ?? 'eu-central-1',
-		})
-		this.docClient = DynamoDBDocumentClient.from(client)
+	/**
+	 * `deps.docClient` is injectable so this service can be tested without AWS; production
+	 * callers omit it and get a real client for the configured region.
+	 */
+	constructor(
+		config: StreamMetadataServiceConfig,
+		deps?: { docClient?: DynamoDBDocumentClient },
+	) {
+		this.docClient =
+			deps?.docClient ??
+			DynamoDBDocumentClient.from(
+				new DynamoDBClient({ region: config.region ?? 'eu-central-1' }),
+			)
 		this.tableName = config.tableName
 	}
 
@@ -183,24 +205,34 @@ export class StreamMetadataService {
 	 * Updates lastPacketTime for a port. Only succeeds if this instance holds the Kinesis lock,
 	 * ensuring only the designated sender refreshes the heartbeat.
 	 */
+	/**
+	 * Refreshes the port's lock lease, throttled to once per 15 seconds.
+	 *
+	 * Takes no timestamp on purpose. `lastPacketTime` is both the record of activity and
+	 * the lock's lease (tryAcquireKinesisLock treats a row older than
+	 * KINESIS_LOCK_STALE_MS as available), so it must carry the time the lease was
+	 * refreshed. Writing a packet's arrival time instead would let a lease expire while
+	 * the owner is still receiving traffic, whenever processing runs behind arrival -
+	 * another instance could then take the slot and both would produce at once. Arrival
+	 * times belong to stream-activity tracking, not here.
+	 *
+	 * Returns an outcome rather than throwing so the caller can distinguish losing the
+	 * lock (stop producing) from a transient write failure (keep going; the lease has not
+	 * expired yet). A failed write clears the throttle so the next packet retries
+	 * immediately instead of waiting out the window.
+	 */
 	async updateLastPacketTime(
 		port: number,
-		timestamp: Date,
 		instanceId: string,
-	): Promise<void> {
-		// Throttle updates to max once per 15 seconds
+	): Promise<OwnedWriteResult> {
 		const now = Date.now()
 		const lastUpdate = this.lastUpdateTimes.get(port) ?? 0
-		const timeSinceLastUpdate = now - lastUpdate
-
-		if (timeSinceLastUpdate < this.updateThrottleMs) {
-			return
+		if (now - lastUpdate < this.updateThrottleMs) {
+			return 'ok'
 		}
 
 		this.lastUpdateTimes.set(port, now)
-
-		const isoTimestamp = timestamp.toISOString()
-		const isoNow = new Date().toISOString()
+		const isoNow = new Date(now).toISOString()
 
 		try {
 			await this.docClient.send(
@@ -214,20 +246,27 @@ export class StreamMetadataService {
 					},
 					ExpressionAttributeValues: {
 						':status': 'active',
-						':lastPacketTime': isoTimestamp,
+						':lastPacketTime': isoNow,
 						':updatedAt': isoNow,
 						':instanceId': instanceId,
 					},
 					ConditionExpression: 'kinesisOwnerInstanceId = :instanceId',
 				}),
 			)
+			return 'ok'
 		} catch (error) {
+			this.lastUpdateTimes.delete(port)
+			if (isConditionalCheckFailed(error)) {
+				console.warn(
+					`[StreamMetadataService] Lost the Kinesis lock for port ${port}; another instance owns it`,
+				)
+				return 'lostLock'
+			}
 			console.error(
-				`[StreamMetadataService] Error updating last packet time for port ${port}:`,
+				`[StreamMetadataService] Error refreshing the lock lease for port ${port}:`,
 				error,
 			)
-			this.lastUpdateTimes.delete(port)
-			throw error
+			return 'writeError'
 		}
 	}
 

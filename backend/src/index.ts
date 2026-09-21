@@ -135,16 +135,19 @@ const createPacketHandler = (): PacketHandler => {
 
 		streamStateManager.onPacketReceived(port, timestamp)
 
-		// Only update DynamoDB lastPacketTime if we hold the lock
+		// Only refresh the lock lease if we hold the lock. A lost lock means another
+		// instance owns the stream, so this one must stop producing rather than keep
+		// writing alongside it; a transient write error says nothing about ownership and
+		// the lease has not expired yet, so ingestion continues.
 		if (kinesisLockHeldForPorts.has(port)) {
-			try {
-				await streamMetadataService.updateLastPacketTime(
-					port,
-					timestamp,
-					instanceId,
-				)
-			} catch (err) {
-				console.error(`[Main] Error updating DynamoDB for port ${port}:`, err)
+			const outcome = await streamMetadataService.updateLastPacketTime(
+				port,
+				instanceId,
+			)
+			if (outcome === 'lostLock') {
+				kinesisLockHeldForPorts.delete(port)
+				await kinesisIngestionPipeline?.stop(port)
+				return
 			}
 		}
 
