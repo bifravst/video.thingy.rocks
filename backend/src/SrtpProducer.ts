@@ -13,6 +13,8 @@ import type { SrtpKeyStore } from './SrtpKeyStore.ts'
 
 /** How long the helper gets to report the port it bound before the start fails. */
 const READY_TIMEOUT_MS = 10_000
+/** How long SIGTERM gets to end the stream cleanly before SIGKILL follows it. */
+const STOP_SIGKILL_AFTER_MS = 8_000
 /** Datagrams held while the helper is starting, so the buffer's order survives. */
 const DEFAULT_PENDING_MAX_BYTES = 8 * 1024 * 1024
 /** Paced replay, so a large startup buffer does not arrive as one burst. */
@@ -43,6 +45,8 @@ export type SrtpProducerOptions = {
 	helperPath?: string
 	readyTimeoutMs?: number
 	pendingMaxBytes?: number
+	/** How long SIGTERM gets before SIGKILL follows; see stop(). */
+	stopSigkillAfterMs?: number
 	/** Called when the helper reports that libsrtp authenticated traffic. */
 	onAuthenticated?: (port: number) => void
 	spawn?: typeof nodeSpawn
@@ -141,7 +145,7 @@ export class SrtpProducer implements ExitingProducer {
 
 		const session: Session = {
 			child,
-			socket: dgram.createSocket('udp4'),
+			socket: this.createRelaySocket(port),
 			relayPort: 0,
 			ready: false,
 			pending: [...datagrams],
@@ -174,6 +178,26 @@ export class SrtpProducer implements ExitingProducer {
 			throw err
 		}
 		await this.replay(port, session)
+	}
+
+	/**
+	 * The loopback socket datagrams are relayed over, with its errors handled.
+	 *
+	 * A connected UDP socket reports failures asynchronously - ECONNREFUSED once the
+	 * helper's relay port is gone, for one - and an unhandled 'error' event ends the
+	 * process, which would let an SRTP-only failure take unencrypted ingest with it.
+	 * Logging is all that is needed here: the helper's own exit handling is what
+	 * rebuilds the pipeline.
+	 */
+	private createRelaySocket(port: number): dgram.Socket {
+		const socket = dgram.createSocket('udp4')
+		socket.on('error', (err) => {
+			this.logger.warn('SRTP relay socket error', {
+				port,
+				error: err.message,
+			})
+		})
+		return socket
 	}
 
 	/**
@@ -379,6 +403,14 @@ export class SrtpProducer implements ExitingProducer {
 		return unsent
 	}
 
+	/**
+	 * Ends the helper for a port and returns only once it is gone.
+	 *
+	 * Exiting is the only thing that resolves this, SIGKILL included: PortIngestion
+	 * releases the port's lock as soon as stop() returns, so another instance can
+	 * acquire the stream from that moment - and a helper that has been signalled but
+	 * not yet reaped is still a second writer to it.
+	 */
 	async stop(port: number): Promise<void> {
 		const session = this.sessions.get(port)
 		if (session === undefined) return
@@ -394,9 +426,9 @@ export class SrtpProducer implements ExitingProducer {
 			const timer = setTimeout(() => {
 				// The helper ends its stream on SIGTERM so the sink can flush; if it is
 				// still alive after that, it must not outlive the lock this port holds.
+				this.logger.warn('SRTP helper ignored SIGTERM; killing it', { port })
 				session.child.kill('SIGKILL')
-				resolve()
-			}, 8000)
+			}, this.options.stopSigkillAfterMs ?? STOP_SIGKILL_AFTER_MS)
 			session.child.once('exit', () => {
 				clearTimeout(timer)
 				resolve()
