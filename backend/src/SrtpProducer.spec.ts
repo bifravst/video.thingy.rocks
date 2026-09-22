@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import type { ChildProcess, spawn as nodeSpawn } from 'node:child_process'
+import dgram from 'node:dgram'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import { describe, it } from 'node:test'
@@ -70,16 +71,60 @@ class HelperFake extends EventEmitter {
 	}
 }
 
+/**
+ * A bound loopback socket standing in for the helper's udpsrc.
+ *
+ * Only the ordering tests need one - the rest are happier with nothing listening, so
+ * that a relayed datagram draws the asynchronous error they are about.
+ */
+class RelayFake {
+	readonly received: Buffer[] = []
+	private readonly socket = dgram.createSocket('udp4')
+
+	async bind(): Promise<number> {
+		this.socket.on('message', (data) => this.received.push(data))
+		await new Promise<void>((resolve) =>
+			this.socket.bind(0, '127.0.0.1', resolve),
+		)
+		return this.socket.address().port
+	}
+
+	close(): void {
+		this.socket.close()
+	}
+
+	/** Resolves once `count` datagrams have arrived, or throws on timeout. */
+	async waitFor(count: number, timeoutMs = 5000): Promise<void> {
+		const deadline = Date.now() + timeoutMs
+		while (this.received.length < count) {
+			if (Date.now() > deadline)
+				throw new Error(
+					`only ${String(this.received.length)} of ${String(count)} datagrams arrived`,
+				)
+			await delay(5)
+		}
+	}
+}
+
 const start = async (
-	options: { ignoreSignals?: boolean; stopSigkillAfterMs?: number } = {},
+	options: {
+		ignoreSignals?: boolean
+		stopSigkillAfterMs?: number
+		relayPort?: number
+		/** Startup buffer handed to start(), as the state machine would. */
+		datagrams?: Buffer[]
+		/** Leaves the start pending, so a test can act during the replay. */
+		awaitStart?: boolean
+	} = {},
 ): Promise<{
 	producer: SrtpProducer
 	helper: HelperFake
 	logger: CapturingLogger
+	started: Promise<void>
 }> => {
-	// Nothing is bound to the relay port: the fake helper only has to report one, and
-	// no test depends on the datagrams arriving anywhere.
-	const helper = new HelperFake(45_454)
+	// Nothing is bound to the default relay port: the fake helper only has to report
+	// one, and most tests do not depend on the datagrams arriving anywhere.
+	const helper = new HelperFake(options.relayPort ?? 45_454)
 	helper.ignoreSignals = options.ignoreSignals ?? false
 	const logger = new CapturingLogger()
 	const producer = new SrtpProducer({
@@ -104,8 +149,9 @@ const start = async (
 			helper as unknown as ChildProcess) as unknown as typeof nodeSpawn,
 		logger,
 	})
-	await producer.start(PORT, [], { epoch: 1 })
-	return { producer, helper, logger }
+	const started = producer.start(PORT, options.datagrams ?? [], { epoch: 1 })
+	if (options.awaitStart !== false) await started
+	return { producer, helper, logger, started }
 }
 
 void describe('SrtpProducer', () => {
@@ -147,6 +193,76 @@ void describe('SrtpProducer', () => {
 			helper.exit(0)
 			await producer.stop(PORT)
 			assert.deepStrictEqual(helper.signals, [])
+		})
+	})
+
+	/**
+	 * The startup buffer only helps if it reaches the helper in order.
+	 *
+	 * SRTP rejects a packet whose sequence number falls outside its replay window, so
+	 * one live datagram arriving ahead of the buffer makes libsrtp discard the older
+	 * ones behind it - taking the keyframe the buffer was held for with them.
+	 */
+	void describe('replaying the startup buffer', () => {
+		void it('sends live traffic behind the buffer, not ahead of it', async () => {
+			const relay = new RelayFake()
+			const relayPort = await relay.bind()
+			// More than one batch, so the replay has to pause - and it is during a
+			// pause that a live datagram used to overtake the rest of the buffer.
+			const buffered = Array.from({ length: 180 }, (_, i) =>
+				Buffer.from(`buffered-${String(i).padStart(3, '0')}`),
+			)
+
+			const { producer, started } = await start({
+				relayPort,
+				datagrams: buffered,
+				awaitStart: false,
+			})
+			try {
+				// Mid-replay: the first batch is out and the loop is in a pause.
+				await relay.waitFor(1)
+				producer.writePacket(PORT, Buffer.from('live'))
+
+				await started
+				await relay.waitFor(buffered.length + 1)
+
+				assert.deepStrictEqual(
+					relay.received.map((d) => d.toString()),
+					[...buffered.map((d) => d.toString()), 'live'],
+					'the live datagram must arrive after every buffered one',
+				)
+			} finally {
+				await producer.stop(PORT)
+				relay.close()
+			}
+		})
+
+		void it('only reports itself active once the buffer is drained', async () => {
+			const relay = new RelayFake()
+			const relayPort = await relay.bind()
+			const buffered = Array.from({ length: 180 }, (_, i) =>
+				Buffer.from(`buffered-${String(i)}`),
+			)
+
+			const { producer, started } = await start({
+				relayPort,
+				datagrams: buffered,
+				awaitStart: false,
+			})
+			try {
+				await relay.waitFor(1)
+				assert.strictEqual(
+					producer.isActive(PORT),
+					false,
+					'a session mid-replay is not yet passing traffic through',
+				)
+
+				await started
+				assert.strictEqual(producer.isActive(PORT), true)
+			} finally {
+				await producer.stop(PORT)
+				relay.close()
+			}
 		})
 	})
 
