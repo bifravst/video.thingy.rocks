@@ -341,6 +341,23 @@ export class KinesisIngestionPipeline extends EventEmitter {
 
 		const gstStderrThrottle: GstStderrThrottle = { lastLog: {} }
 		const gstStdoutThrottle: GstStdoutThrottle = { lastLog: {} }
+		// Reading a pipe is not the same as handling its errors, and an unhandled
+		// 'error' on either would end the process rather than this one pipeline. The
+		// child's own exit handling is what rebuilds it, so there is nothing to do here
+		// beyond having a listener.
+		for (const [stream, target] of Object.entries({
+			stdout: gst.stdout,
+			stderr: gst.stderr,
+		})) {
+			target?.on('error', (err: Error) => {
+				this.logger.warn('GStreamer stream error', {
+					port,
+					streamName,
+					stream,
+					message: err.message,
+				})
+			})
+		}
 		gst.stdout?.on('data', (data: Buffer) => {
 			const text = data.toString()
 			if (text.trim().length > 0) {

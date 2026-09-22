@@ -266,6 +266,40 @@ void describe('SrtpProducer', () => {
 		})
 	})
 
+	/**
+	 * Every pipe of the child, not only the ones that are read.
+	 *
+	 * An unhandled 'error' on a stream is rethrown and ends the Node process, so one
+	 * pipe without a listener lets an SRTP-only failure take unencrypted ingest with
+	 * it - the same failure the relay socket's handler exists for. stdin is the one
+	 * that gets there in practice: the init frame is written to it immediately, and a
+	 * helper that exits first turns that write into EPIPE.
+	 */
+	void describe('the helper streams', () => {
+		for (const stream of ['stdin', 'stdout', 'stderr'] as const) {
+			void it(`reports an error on ${stream} instead of letting it escape`, async () => {
+				const { producer, helper, logger } = await start()
+				try {
+					// EventEmitter rethrows an 'error' nobody is listening for, so this
+					// throws here and ends the process in production without a handler.
+					assert.doesNotThrow(() =>
+						helper[stream].emit('error', new Error('EPIPE')),
+					)
+					assert.deepStrictEqual(
+						logger.warnings
+							.filter((w) => w.message === 'SRTP helper stream error')
+							.map((w): unknown[] => [w.context?.port, w.context?.stream]),
+						[[PORT, stream]],
+					)
+					// A stream error is not the helper exiting, so the session stands.
+					assert.strictEqual(producer.isActive(PORT), true)
+				} finally {
+					await producer.stop(PORT)
+				}
+			})
+		}
+	})
+
 	void describe('the relay socket', () => {
 		// Relaying to a port nothing is listening on is the real case: the helper's
 		// udpsrc is gone, so the loopback datagram draws an ICMP port-unreachable and

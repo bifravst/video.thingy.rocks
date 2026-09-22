@@ -240,6 +240,14 @@ export class SrtpProducer implements ExitingProducer {
 			}
 		})
 
+		// Every one of the child's pipes, not just the ones read below. An unhandled
+		// 'error' on any stream ends the Node process, which would let an SRTP-only
+		// failure take unencrypted ingest with it - the same reason the relay socket
+		// has a handler. stdin is the one that actually gets there: the init frame is
+		// written to it immediately, and a helper that exits first (a missing `gi`
+		// import, which is explicitly tolerated) turns that write into EPIPE.
+		this.handleStreamErrors(port, session)
+
 		session.child.stdout?.setEncoding('utf8')
 		session.child.stdout?.on('data', (chunk: string) => {
 			for (const message of protocol.push(chunk)) {
@@ -265,6 +273,31 @@ export class SrtpProducer implements ExitingProducer {
 			this.exitListener(port)
 		})
 		return ready
+	}
+
+	/**
+	 * Logs, rather than throws, whatever any of the child's pipes reports.
+	 *
+	 * Nothing here needs to act on a stream error: the child exiting is what tears the
+	 * session down, and that has its own listener. What matters is only that the event
+	 * has a listener at all, because an unhandled 'error' on a stream is rethrown and
+	 * ends the process.
+	 */
+	private handleStreamErrors(port: number, session: Session): void {
+		const streams = {
+			stdin: session.child.stdin,
+			stdout: session.child.stdout,
+			stderr: session.child.stderr,
+		}
+		for (const [stream, target] of Object.entries(streams)) {
+			target?.on('error', (err: Error) => {
+				this.logger.warn('SRTP helper stream error', {
+					port,
+					stream,
+					error: err.message,
+				})
+			})
+		}
 	}
 
 	private handleMessage(
