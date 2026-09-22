@@ -73,6 +73,50 @@ void describe('HealthServer', () => {
 		})
 	})
 
+	/**
+	 * A probe that resets the connection must not take the process with it.
+	 *
+	 * The server's own 'error' handler does not cover the sockets it accepts, and an
+	 * unhandled 'error' on one of those is rethrown - so a load balancer that resets a
+	 * health check between accept and close could end the process. The health port is
+	 * probed continuously by every target group, which makes it the most-exercised
+	 * socket in the service.
+	 */
+	void it('survives a health check that resets the connection', async () => {
+		const port = await freePort()
+		const server = track(new HealthServer(port))
+		await server.start()
+
+		for (let i = 0; i < 25; i++) {
+			await new Promise<void>((resolve) => {
+				const socket = net.connect({ port, host: '127.0.0.1' }, () => {
+					// A reset rather than a FIN, which is what the accepted socket sees
+					// as ECONNRESET.
+					socket.resetAndDestroy()
+					resolve()
+				})
+				socket.once('error', () => resolve())
+			})
+		}
+
+		// Still serving, which it would not be if one of those had escaped.
+		await new Promise<void>((resolve, reject) => {
+			const socket = net.connect({ port, host: '127.0.0.1' })
+			const timer = setTimeout(() => {
+				socket.destroy()
+				reject(new Error('health port stopped accepting connections'))
+			}, 5000)
+			socket.once('error', (err) => {
+				clearTimeout(timer)
+				reject(err)
+			})
+			socket.once('close', () => {
+				clearTimeout(timer)
+				resolve()
+			})
+		})
+	})
+
 	void it('rejects instead of throwing uncaught when the port is taken', async () => {
 		const { port, close } = await bindEphemeral()
 		try {

@@ -41,6 +41,16 @@ export class HealthServer {
 			throw new Error(`Health server already started on port ${this.port}`)
 		}
 		const server = net.createServer((socket) => {
+			// An accepted connection is its own error source: the load balancer's health
+			// probe can reset it between accept and end, and an unhandled 'error' on the
+			// socket is rethrown and takes the process with it. The server's own handler
+			// below does not cover connection sockets.
+			socket.on('error', (err) => {
+				this.logger.warn('Health check connection error', {
+					port: this.port,
+					error: err.message,
+				})
+			})
 			socket.end()
 		})
 		this.server = server
