@@ -38,6 +38,7 @@ export type HealthPort = {
  */
 export type TrafficRecorder = {
 	record(transport: string, byteCount: number): void
+	setServing(transport: string, serving: boolean): void
 	start(): void
 	stop(): void
 	publishNow(): Promise<void>
@@ -237,6 +238,7 @@ export class IngestionService {
 		// Its zeros are what tell the alarms this instance is reporting at all, so a
 		// stalled additive transport must not delay them - the same reason the health
 		// port opens here.
+		this.options.traffic?.setServing(primary.name, true)
 		this.options.traffic?.start()
 
 		for (const transport of additive) {
@@ -245,6 +247,13 @@ export class IngestionService {
 				// deliberately: see start()'s doc comment.
 				await transport.prepare?.()
 				await transport.listener.start()
+				// Every transport counts as not serving until it says otherwise, so one
+				// that never gets here - because its preparation threw, or never
+				// returned - is reported as not serving rather than going unmentioned.
+				// Nothing arrives on a listener that never bound, so its byte count is a
+				// steady zero that no traffic-gated alarm can tell from an idle
+				// transport; this is the only signal that distinguishes them.
+				this.options.traffic?.setServing(transport.name, true)
 				this.logger.info('Transport started', {
 					transport: transport.name,
 					ports: `${transport.portRange.start}-${transport.portRange.end}`,
@@ -281,6 +290,7 @@ export class IngestionService {
 		await this.options.healthServer.stop()
 		for (const transport of this.options.transports) {
 			await transport.listener.stop()
+			this.options.traffic?.setServing(transport.name, false)
 		}
 		// Once no listener can add to them, report the counters one last time so the
 		// final period is not lost - and stop first, so the interval cannot race it.

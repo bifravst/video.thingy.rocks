@@ -141,9 +141,17 @@ will not authenticate against a backend provisioned with your own key.
   while the sender runs. The stored hint is tried first, so this usually
   recovers with `trials: 1`.
 - **Send noise.** Anything that is not authentic SRTP is dropped. The port may
-  briefly claim its slot while the pipeline starts - that window is bounded at
-  twenty seconds, after which it gives the slot back and waits a minute - but it
-  never refreshes its lease or stores a rollover counter.
+  briefly claim its slot while the pipeline starts, but it never refreshes its
+  lease or stores a rollover counter while it does.
+
+  Two different things end that window, and which one applies depends on whether
+  the noise keeps coming. A sender that keeps going hits the twenty-second
+  provisional deadline, after which the port gives the slot back and waits a
+  minute before trying again. A burst that stops reaches no deadline at all:
+  every deadline in `PortIngestion` is compared against the clock when the next
+  datagram is handled, by design, so with no next datagram the one-minute
+  inactivity timeout is what releases the slot. **Twenty seconds is therefore
+  not an upper bound on holding a slot; one minute is.**
 
 ## Troubleshooting
 

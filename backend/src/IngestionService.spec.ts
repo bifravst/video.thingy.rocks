@@ -145,12 +145,16 @@ class HealthFake implements HealthPort {
 /** Records what the service counts, so the per-transport scoping can be asserted. */
 class TrafficFake implements TrafficRecorder {
 	readonly recorded: { transport: string; byteCount: number }[] = []
+	readonly serving = new Map<string, boolean>()
 	started = false
 	stopped = false
 	publishCalls = 0
 
 	record(transport: string, byteCount: number) {
 		this.recorded.push({ transport, byteCount })
+	}
+	setServing(transport: string, serving: boolean) {
+		this.serving.set(transport, serving)
 	}
 	start() {
 		this.started = true
@@ -636,6 +640,113 @@ void describe('IngestionService transport preparation', () => {
 			listener.deliver(5000, Buffer.alloc(10), new Date())
 			await settle()
 			await assert.doesNotReject(service.shutdown())
+		})
+
+		/**
+		 * The one failure a traffic-gated alarm cannot see.
+		 *
+		 * A transport whose listener never bound receives nothing, so its byte count is
+		 * a steady zero - identical to an idle transport. An unreachable parameter
+		 * store produces exactly that: the key load throws, the transport is skipped,
+		 * and the ports stay closed. So the failure the additive-transport isolation
+		 * exists to survive was the one nothing could report, until this signal.
+		 */
+		void describe('reporting whether a transport is serving', () => {
+			void it('reports a transport that started', async () => {
+				const traffic = new TrafficFake()
+				const { service } = withSrtp(traffic)
+				await service.start()
+
+				assert.strictEqual(traffic.serving.get('unencrypted'), true)
+				assert.strictEqual(traffic.serving.get('srtp'), true)
+			})
+
+			void it('reports a transport whose preparation failed', async () => {
+				const traffic = new TrafficFake()
+				const srtpListener = new ListenerFake()
+				const { service } = build({
+					traffic,
+					extraTransports: [
+						{
+							name: 'srtp',
+							portRange: { start: 6000, end: 6009 },
+							listener: srtpListener,
+							producer: new ProducerFake(),
+							prepare: async () => {
+								throw new Error('parameter store unreachable')
+							},
+						},
+					],
+				})
+				await service.start()
+
+				assert.strictEqual(traffic.serving.get('unencrypted'), true)
+				assert.notStrictEqual(
+					traffic.serving.get('srtp'),
+					true,
+					'a transport that never bound must not be reported as serving',
+				)
+			})
+
+			void it('reports a transport whose listener could not bind', async () => {
+				const traffic = new TrafficFake()
+				const srtpListener = new ListenerFake()
+				srtpListener.failOnStart = new Error('address in use')
+				const { service } = build({
+					traffic,
+					extraTransports: [
+						{
+							name: 'srtp',
+							portRange: { start: 6000, end: 6009 },
+							listener: srtpListener,
+							producer: new ProducerFake(),
+						},
+					],
+				})
+				await service.start()
+
+				assert.notStrictEqual(traffic.serving.get('srtp'), true)
+			})
+
+			// A preparation that never returns is explicitly tolerated, so it must not
+			// leave the transport looking healthy either.
+			void it('reports a transport still stalled in preparation', async () => {
+				const traffic = new TrafficFake()
+				const srtpListener = new ListenerFake()
+				const { service } = build({
+					traffic,
+					extraTransports: [
+						{
+							name: 'srtp',
+							portRange: { start: 6000, end: 6009 },
+							listener: srtpListener,
+							producer: new ProducerFake(),
+							prepare: async () => new Promise(() => undefined),
+						},
+					],
+				})
+
+				void service.start()
+				await settle()
+
+				assert.strictEqual(traffic.started, true)
+				assert.notStrictEqual(traffic.serving.get('srtp'), true)
+			})
+
+			void it('reports every transport as not serving once shut down', async () => {
+				const traffic = new TrafficFake()
+				const { service } = withSrtp(traffic)
+				await service.start()
+				await service.shutdown()
+
+				assert.deepStrictEqual(
+					[...traffic.serving.entries()],
+					[
+						['unencrypted', false],
+						['srtp', false],
+					],
+				)
+			})
 		})
 	})
 

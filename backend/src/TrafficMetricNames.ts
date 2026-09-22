@@ -24,6 +24,17 @@ export const trafficMetricNamespace = (stackName: string): string =>
  */
 export const RECEIVED_BYTES_METRIC = 'ReceivedBytes'
 
+/**
+ * 1 while a transport's listener is bound and serving, 0 while it is not.
+ *
+ * The byte count cannot answer this. A transport whose listener never bound receives
+ * nothing, so it reports a steady zero that is indistinguishable from an idle
+ * transport - which makes the failure the additive-transport isolation exists to
+ * survive, an unreachable parameter store, the one failure no traffic-gated alarm can
+ * see.
+ */
+export const SERVING_METRIC = 'TransportServing'
+
 /** Dimension carrying the transport name; its values are the constants below. */
 export const TRANSPORT_DIMENSION = 'Transport'
 
