@@ -18,11 +18,15 @@ const delay = async (ms: number): Promise<void> =>
 
 class CapturingLogger extends Logger {
 	readonly warnings: { message: string; context?: LogContext }[] = []
+	readonly errors: { message: string; context?: LogContext }[] = []
 	constructor() {
 		super('SrtpProducerSpec')
 	}
 	override warn(message: string, context?: LogContext): void {
 		this.warnings.push({ message, context })
+	}
+	override error(message: string, _error?: Error, context?: LogContext): void {
+		this.errors.push({ message, context })
 	}
 }
 
@@ -119,6 +123,8 @@ const start = async (
 		datagrams?: Buffer[]
 		/** Leaves the start pending, so a test can act during the replay. */
 		awaitStart?: boolean
+		/** Rollover counter this key and SSRC previously reached, if any. */
+		rocHint?: number
 	} = {},
 ): Promise<{
 	producer: SrtpProducer
@@ -142,7 +148,7 @@ const start = async (
 			}),
 		} as unknown as SrtpKeyStore,
 		hints: {
-			getSrtpRocHint: async () => undefined,
+			getSrtpRocHint: async () => options.rocHint,
 			putSrtpRocHint: async () => undefined,
 		},
 		region: 'eu-central-1',
@@ -266,6 +272,77 @@ void describe('SrtpProducer', () => {
 			} finally {
 				await producer.stop(PORT)
 				relay.close()
+			}
+		})
+	})
+
+	/**
+	 * A sender that rewinds its packet index under a key it has already used.
+	 *
+	 * The keys here are static and the SSRC fixed per port, so SRTP's keystream
+	 * depends only on those and the packet index. Restarting the index reuses the
+	 * keystream, and two packets sharing one reveal the XOR of their plaintexts. Only
+	 * provisioning can prevent it; the receiver can at least say it happened, which
+	 * the persisted rollover counter makes cheap.
+	 */
+	void describe('a reused keystream', () => {
+		const confirm = (helper: HelperFake, roc: number): void => {
+			helper.stdout.write(
+				`${JSON.stringify({
+					t: 'auth',
+					status: 'ok',
+					first: true,
+					roc,
+					trials: 1,
+					candidate: roc,
+					authenticated: 1,
+				})}\n`,
+			)
+		}
+
+		const rewinds = async (
+			rocHint: number | undefined,
+			confirmedRoc: number,
+		): Promise<CapturingLogger> => {
+			const { producer, helper, logger } = await start({ rocHint })
+			try {
+				confirm(helper, confirmedRoc)
+				await delay(20)
+				return logger
+			} finally {
+				await producer.stop(PORT)
+			}
+		}
+
+		void it('reports a counter below the one this key already reached', async () => {
+			const logger = await rewinds(7, 0)
+			assert.deepStrictEqual(
+				logger.errors.map((e): unknown[] => [
+					e.context?.previousRoc,
+					e.context?.roc,
+				]),
+				[[7, 0]],
+			)
+		})
+
+		void it('says nothing when the counter carried on from where it was', async () => {
+			assert.deepStrictEqual((await rewinds(7, 7)).errors, [])
+			assert.deepStrictEqual((await rewinds(7, 9)).errors, [])
+		})
+
+		// A key this port has never confirmed anything under cannot have been reused.
+		void it('says nothing when there is no counter to compare against', async () => {
+			assert.deepStrictEqual((await rewinds(undefined, 0)).errors, [])
+		})
+
+		void it('keeps ingesting, because refusing would not undo the reuse', async () => {
+			const { producer, helper } = await start({ rocHint: 7 })
+			try {
+				confirm(helper, 0)
+				await delay(20)
+				assert.strictEqual(producer.isActive(PORT), true)
+			} finally {
+				await producer.stop(PORT)
 			}
 		})
 	})

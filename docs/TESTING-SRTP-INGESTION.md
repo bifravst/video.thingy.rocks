@@ -64,10 +64,21 @@ right and is stored as a hint for next time; if not, those packets are counted
 as dropped and the next candidate is tried. The candidates are the stored hint
 first, then zero, then outwards in both directions.
 
-**There is therefore nothing to do when a sender restarts.** Re-running the test
-sender below, rebooting a camera, or restarting the backend all recover on their
-own, typically within a few tens of datagrams. You do not need to reprovision a
-key, pick a new SSRC, clear anything in DynamoDB, or restart the backend.
+**Recovery needs no operator action.** Re-running the test sender below,
+rebooting a camera, or restarting the backend all recover on their own,
+typically within a few tens of datagrams. You do not need to pick a new SSRC,
+clear anything in DynamoDB, or restart the backend.
+
+**Recovering is not the same as being safe, though.** If the sender restarts its
+sequence numbering rather than carrying on from where it was, it has to be given
+a fresh key before it does: the keystream is derived from the key, the SSRC and
+the packet index, so rewinding the index with the same key encrypts new video
+under a keystream already used, and XORing two such packets cancels it. The
+search here exists for the case where the _receiver_ lost track of a sender that
+kept counting - it is not permission for a sender to rewind. See the SRTP
+section of `backend/README.md`, and note the receiver logs
+`SRTP sender restarted its packet index under a key it has already used` when it
+can tell.
 
 The one visible cost of a wrong hint is that the datagrams spent on failed
 candidates are lost, so video resumes at the sender's **next keyframe**. With a
@@ -184,8 +195,10 @@ will not authenticate against a backend provisioned with your own key.
   typelib is fine.
 
 - **A device that picks a new SSRC per session will not work.** `srtpdec` is
-  pinned to the provisioned SSRC. A stable SSRC per port is required; a stable
-  _sequence numbering_ is not.
+  pinned to the provisioned SSRC, so a stable SSRC per port is required.
+  Sequence numbering need not be continuous for the receiver to recover, but a
+  device that rewinds it must be given a fresh key at the same time - see the
+  SRTP section of `backend/README.md`.
 
 ## What cannot be tested locally
 

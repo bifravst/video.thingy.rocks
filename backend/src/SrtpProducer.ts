@@ -70,6 +70,8 @@ type Session = {
 	pending: Buffer[]
 	pendingBytes: number
 	confirmedRoc: number | undefined
+	/** Rollover counter this key and SSRC last reached, if it has been seen before. */
+	rocHint: number | undefined
 	stopping: boolean
 }
 
@@ -174,6 +176,7 @@ export class SrtpProducer implements ExitingProducer {
 			pending: [...datagrams],
 			pendingBytes: datagrams.reduce((sum, d) => sum + d.length, 0),
 			confirmedRoc: undefined,
+			rocHint,
 			stopping: false,
 		}
 		this.sessions.set(port, session)
@@ -291,6 +294,46 @@ export class SrtpProducer implements ExitingProducer {
 	}
 
 	/**
+	 * Reports a sender that has gone backwards through its packet index.
+	 *
+	 * SRTP derives its keystream from the master key, the SSRC and the packet index,
+	 * and the keys here are static and the SSRC fixed per port. A sender that restarts
+	 * its sequence numbering therefore encrypts new payloads under a keystream it has
+	 * already used, and two packets sharing one keystream reveal the XOR of their
+	 * plaintexts. It also makes packets captured before the restart authenticate
+	 * again, because their index is back inside the receiver's window.
+	 *
+	 * Only the operator can prevent this, by provisioning a fresh key before a device
+	 * restarts its numbering - see backend/README.md. All the receiver can do is say
+	 * that it happened, which is still worth more than accepting it in silence, and is
+	 * cheap because the counter this key last reached is already persisted.
+	 *
+	 * Detection is one-sided: a counter that went backwards proves reuse, while one
+	 * that did not prove nothing, since a rewind within a single rollover epoch leaves
+	 * the counter unchanged. Ingestion continues either way - refusing would not undo
+	 * the reuse, and would strand a device that had merely rebooted.
+	 */
+	private reportCounterRewind(
+		port: number,
+		session: Session,
+		key: { ssrc: number; keyFingerprint: string },
+		roc: number,
+	): void {
+		if (session.rocHint === undefined || roc >= session.rocHint) return
+		this.logger.error(
+			'SRTP sender restarted its packet index under a key it has already used; its keystream is being reused, so rotate this port key with scripts/provision-srtp-key.sh',
+			new Error('SRTP rollover counter went backwards'),
+			{
+				port,
+				ssrc: key.ssrc,
+				keyFingerprint: key.keyFingerprint,
+				previousRoc: session.rocHint,
+				roc,
+			},
+		)
+	}
+
+	/**
 	 * Logs, rather than throws, whatever any of the child's pipes reports.
 	 *
 	 * Nothing here needs to act on a stream error: the child exiting is what tears the
@@ -345,6 +388,7 @@ export class SrtpProducer implements ExitingProducer {
 							roc: message.roc,
 							trials: message.trials,
 						})
+						this.reportCounterRewind(port, session, key, message.roc)
 						// Only now does this port count as producing: until libsrtp has
 						// authenticated something, the traffic is unproven.
 						this.options.onAuthenticated?.(port)
