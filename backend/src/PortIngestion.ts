@@ -63,6 +63,11 @@ export type PortIngestionConfig = {
 	 * the machine passes through Provisional, where datagrams are relayed but earn no
 	 * lease refresh. Used by SRTP, where nothing can be authenticated until a pipeline
 	 * exists to authenticate it.
+	 *
+	 * Like every other deadline here, it is evaluated when the next datagram arrives
+	 * rather than on a timer, so it bounds a *stream* that never authenticates. Traffic
+	 * that stops instead is released by the inactivity event, which is the slower path
+	 * of the two - see the class comment.
 	 */
 	provisionalTimeoutMs?: number
 	/** Cooldown applied when a provisional pipeline never authenticates. */
@@ -196,6 +201,13 @@ const LOCK_HELD_STATES = new Set([
  * fields compared against the clock when the next packet arrives; if no packet ever
  * arrives, the inactivity event releases the port. A timer would be a second way into
  * the state, which is what this design exists to avoid.
+ *
+ * So each of those deadlines bounds a stream that keeps sending, not wall clock. A port
+ * whose traffic stops dead holds what it holds until the inactivity event, whatever its
+ * own deadline says - which matters most for the provisional deadline, since that is
+ * the one a burst of unauthenticated traffic can reach. The inactivity timeout is
+ * therefore the real upper bound on holding a slot, and it is deliberately the only
+ * clock this class answers to.
  */
 export class PortIngestion {
 	readonly port: number

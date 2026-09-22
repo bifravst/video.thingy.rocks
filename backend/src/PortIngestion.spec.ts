@@ -892,6 +892,41 @@ void describe('PortIngestion', () => {
 			await h2.settle()
 			assert.strictEqual(h2.machine.stateName, 'Idle')
 		})
+
+		/**
+		 * What actually bounds a burst that starts a pipeline and then goes quiet.
+		 *
+		 * Every deadline here is compared against the clock when the next datagram is
+		 * handled, so the provisional window bounds a stream that keeps sending. Traffic
+		 * that stops reaches no deadline of its own and is released by the inactivity
+		 * event instead - the slower of the two, and the real upper bound on holding a
+		 * slot. Pinned because the comments on both timeouts say so.
+		 */
+		void it('holds the slot past its deadline until something else happens', async () => {
+			const h2 = provisional()
+			h2.send()
+			await h2.settle()
+			assert.strictEqual(h2.machine.stateName, 'Provisional')
+
+			// Well past the 20s window, but no datagram arrived to notice.
+			h2.advance(120_000)
+			await h2.settle()
+			assert.strictEqual(
+				h2.machine.stateName,
+				'Provisional',
+				'without a datagram there is nothing to evaluate the deadline',
+			)
+			assert.strictEqual(h2.machine.ownsSlot, true)
+
+			// The inactivity event is what gets the slot back, and it releases without
+			// the provisional cooldown: the stream is gone rather than unauthenticated.
+			h2.activity.goInactive()
+			h2.machine.onInactive()
+			await h2.settle()
+			assert.strictEqual(h2.machine.stateName, 'Idle')
+			assert.strictEqual(h2.producer.stopCount, 1)
+			assert.deepStrictEqual(h2.locks.calls, ['acquire', 'release'])
+		})
 	})
 
 	void describe('port independence', () => {
