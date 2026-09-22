@@ -145,9 +145,22 @@ will not authenticate against a backend provisioned with your own key.
 
 ## 5. Recovery behaviour worth checking
 
-- **Restart the sender.** Stop the script and run it again. Ingestion recovers
-  by itself; the log shows a second `SRTP traffic authenticated`, usually with
-  `trials: 2`.
+- **Restart the sender.** Provision a fresh key for the port first, restart the
+  backend so it reads the new one, and only then run the script again with the
+  new key. Ingestion recovers by itself and the log shows a second
+  `SRTP traffic authenticated`, with `trials: 1` - the fresh key has no stored
+  hint, so the search starts at zero, which is where a new session begins.
+
+  The key rotation is not optional here, and it is the sender restart that makes
+  it necessary rather than the backend one. `srtpenc` starts a new session at
+  rollover counter zero, so relaunching it under the key it was already using
+  rewinds the packet index and reuses the keystream - the thing the SRTP section
+  of `backend/README.md` says must not happen. Doing it anyway is visible: the
+  backend logs
+  `SRTP sender restarted its packet index under a key it has already used`, and
+  the `trials: 2` that a reused key produces is the search falling back to zero
+  because the stored hint described the previous session.
+
 - **Restart the backend.** `systemctl restart video-streaming` on the instance
   while the sender runs. The stored hint is tried first, so this usually
   recovers with `trials: 1`.

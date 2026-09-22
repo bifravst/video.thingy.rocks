@@ -9,6 +9,11 @@
 # TEST KEY ONLY - the default key/SSRC below are for local testing only. Never reuse them
 # as a real SSM-provisioned production value; provision real keys with
 # scripts/provision-srtp-key.sh using freshly generated key material.
+#
+# Each run is a new SRTP session starting at rollover counter zero, so running this
+# twice under one key rewinds the packet index and reuses the keystream - which is why
+# the key has to be rotated between runs against anything that matters. See the SRTP
+# section of backend/README.md; the receiver logs the reuse when it can see it.
 
 set -e
 
