@@ -24,12 +24,24 @@ class ListenerFake implements PacketSource {
 	started = false
 	stopped = false
 	failOnStart?: Error
+	/**
+	 * Datagrams to deliver before start() throws.
+	 *
+	 * UDPListener binds its ports one at a time, so a failure part-way leaves the
+	 * earlier ones bound and already serving - and those are wired to their machines
+	 * from the constructor, so traffic on them is accepted while the start is still
+	 * failing.
+	 */
+	deliverBeforeFailing: number[] = []
 
 	setPacketHandler(handler: { onPacket: PacketDelivery }) {
 		this.deliver = handler.onPacket
 	}
 
 	async start() {
+		for (const port of this.deliverBeforeFailing) {
+			this.deliver(port, Buffer.alloc(10), new Date())
+		}
 		if (this.failOnStart !== undefined) throw this.failOnStart
 		this.started = true
 	}
@@ -436,6 +448,58 @@ void describe('IngestionService with an additive transport', () => {
 		const { service, healthServer } = build({ listener })
 		await assert.rejects(async () => service.start())
 		assert.strictEqual((healthServer as HealthFake).started, false)
+	})
+
+	/**
+	 * A failed primary start has to leave nothing behind, not just nothing bound.
+	 *
+	 * The listener binds one port at a time, so a failure part-way leaves the earlier
+	 * ports serving, and those are wired to their machines already - a datagram on one
+	 * takes a DynamoDB lock and spawns a producer. The caller's answer to this throw
+	 * is to exit the process, which does not kill a spawned child: it would be
+	 * reparented and carry on writing to a stream this instance no longer owns, while
+	 * the lock saying it does owns it sits in DynamoDB until the lease expires. That
+	 * is the two-writers case the locking exists to prevent.
+	 */
+	void it('releases everything a half-bound primary listener claimed', async () => {
+		const listener = new ListenerFake()
+		listener.deliverBeforeFailing = [5000, 5001]
+		listener.failOnStart = new Error('EADDRINUSE on 5002')
+		const { service, locks, producer } = build({ listener })
+
+		await assert.rejects(async () => service.start())
+		await settle()
+
+		const acquired = locks.order.filter((o) => o.startsWith('acquire'))
+		assert.deepStrictEqual(
+			acquired,
+			['acquire:5000', 'acquire:5001'],
+			'the test only means anything if those ports really did take locks',
+		)
+		assert.deepStrictEqual(
+			locks.order.filter((o) => o.startsWith('release')),
+			['release:5000', 'release:5001'],
+			'every lock taken before the failure has to be given back',
+		)
+		assert.deepStrictEqual(
+			(producer as ProducerFake).stoppedPorts.sort((a, b) => a - b),
+			[5000, 5001],
+			'a producer left running would outlive the process as an orphan',
+		)
+		assert.strictEqual((producer as ProducerFake).shutdownCalls, 1)
+		assert.strictEqual(listener.stopped, true)
+	})
+
+	// The rollback must not replace the error that explains why startup failed.
+	void it('reports the start failure even when the rollback fails too', async () => {
+		const listener = new ListenerFake()
+		listener.failOnStart = new Error('EADDRINUSE on 5002')
+		listener.stop = async () => {
+			throw new Error('could not close sockets')
+		}
+		const { service } = build({ listener })
+
+		await assert.rejects(async () => service.start(), /EADDRINUSE on 5002/)
 	})
 
 	void it('shuts every transport down', async () => {

@@ -212,20 +212,21 @@ export class IngestionService {
 		if (primary === undefined)
 			throw new Error('no ingest transports configured')
 
-		await primary.prepare?.()
-		await primary.listener.start()
-
 		try {
+			await primary.prepare?.()
+			await primary.listener.start()
 			await this.options.healthServer.start()
 		} catch (err) {
-			// Nothing is serving traffic yet, so leave nothing bound behind either. The
-			// health port's failure is the one worth reporting, so a listener that also
-			// fails to stop must not replace it.
-			try {
-				await primary.listener.stop()
-			} catch {
-				// Nothing more to do.
-			}
+			// A failed primary start rolls the whole service back, not just the step
+			// that failed. The listener binds its ports one at a time, so a failure
+			// part-way through leaves the earlier ones bound - and they are already
+			// wired to their machines, so a datagram arriving on one takes a lock and
+			// spawns a producer. Stopping only the listener would leave that lock held
+			// and that child running, and since the caller's response to this throw is
+			// to exit, the child outlives the process as an orphan still writing to a
+			// stream this instance no longer owns. Two writers to one Kinesis stream is
+			// exactly what the locking exists to prevent.
+			await this.rollBack()
 			throw err
 		}
 		this.logger.info('Serving', {
@@ -277,6 +278,25 @@ export class IngestionService {
 			transports: this.options.transports.map((t) => t.name).join(', '),
 			healthPort: this.options.healthServer.port,
 		})
+	}
+
+	/**
+	 * Undoes a failed start, keeping the error that caused it.
+	 *
+	 * Shutdown is the rollback: it closes the health port, stops every listener,
+	 * releases every lock and reaps every producer, and each of those steps is a no-op
+	 * for something that never started. A rollback that fails itself is logged rather
+	 * than thrown, because the start failure is the one that explains the exit.
+	 */
+	private async rollBack(): Promise<void> {
+		try {
+			await this.shutdown()
+		} catch (err) {
+			this.logger.error(
+				'Could not fully roll back a failed start; something may still be bound or running',
+				err instanceof Error ? err : new Error(String(err)),
+			)
+		}
 	}
 
 	/**
