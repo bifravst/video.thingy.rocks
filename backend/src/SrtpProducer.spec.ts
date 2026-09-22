@@ -39,12 +39,16 @@ class HelperFake extends EventEmitter {
 	signalCode: NodeJS.Signals | null = null
 	/** Models a helper wedged in a flush: signals arrive, the process stays. */
 	ignoreSignals = false
+	/** Cleared to model a helper that dies before it can report a relay port. */
+	reportReadyOnInit = true
 
 	constructor(private readonly relayPort: number) {
 		super()
 		// The real helper reports readiness once it has the key, so readiness is
 		// triggered by the init frame here too.
-		this.stdin.on('data', () => this.reportReady())
+		this.stdin.on('data', () => {
+			if (this.reportReadyOnInit) this.reportReady()
+		})
 	}
 
 	kill(signal?: NodeJS.Signals): boolean {
@@ -263,6 +267,78 @@ void describe('SrtpProducer', () => {
 				await producer.stop(PORT)
 				relay.close()
 			}
+		})
+	})
+
+	/**
+	 * A failed start must hand the startup buffer back, not drop it.
+	 *
+	 * PortIngestion puts whatever the producer never sent at the front of the buffer
+	 * so a retry still begins with the oldest datagrams, which is normally the
+	 * keyframe. Everything that fails a start also closes the session - the readiness
+	 * rejection stops the helper, and the child's exit handler closes it before
+	 * rejecting - so reading the datagrams off the session returned nothing.
+	 */
+	void describe('a start that fails', () => {
+		const startFailing = async (
+			fail: (helper: HelperFake) => void,
+			datagrams: Buffer[],
+		): Promise<SrtpProducer> => {
+			const helper = new HelperFake(45_454)
+			// Readiness never arrives, so the start fails however `fail` chooses.
+			helper.reportReadyOnInit = false
+			const producer = new SrtpProducer({
+				keyStore: {
+					getKeyForPort: () => ({
+						keyHex: KEY,
+						ssrc: 42,
+						cipher: 'aes-128-icm',
+						auth: 'hmac-sha1-80',
+						keyFingerprint: 'abcdef0123456789',
+					}),
+				} as unknown as SrtpKeyStore,
+				hints: {
+					getSrtpRocHint: async () => undefined,
+					putSrtpRocHint: async () => undefined,
+				},
+				region: 'eu-central-1',
+				streamNameForPort: (port) => `test-video-${String(port)}`,
+				kvsLogConfigPath: '/dev/null',
+				readyTimeoutMs: 60,
+				spawn: (() =>
+					helper as unknown as ChildProcess) as unknown as typeof nodeSpawn,
+				logger: new CapturingLogger(),
+			})
+
+			const starting = producer.start(PORT, datagrams, { epoch: 1 })
+			await delay(5)
+			fail(helper)
+			await assert.rejects(async () => starting)
+			return producer
+		}
+
+		const buffered = [Buffer.from('keyframe'), Buffer.from('rest')]
+
+		void it('hands the buffer back when the helper exits during startup', async () => {
+			const producer = await startFailing((helper) => helper.exit(1), buffered)
+			assert.deepStrictEqual(
+				producer.takeUnsentDatagrams(PORT).map((d) => d.toString()),
+				['keyframe', 'rest'],
+			)
+		})
+
+		void it('hands the buffer back when readiness times out', async () => {
+			const producer = await startFailing(() => undefined, buffered)
+			assert.deepStrictEqual(
+				producer.takeUnsentDatagrams(PORT).map((d) => d.toString()),
+				['keyframe', 'rest'],
+			)
+		})
+
+		void it('hands them back only once', async () => {
+			const producer = await startFailing((helper) => helper.exit(1), buffered)
+			producer.takeUnsentDatagrams(PORT)
+			assert.deepStrictEqual(producer.takeUnsentDatagrams(PORT), [])
 		})
 	})
 

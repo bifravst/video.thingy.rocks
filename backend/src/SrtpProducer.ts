@@ -87,6 +87,16 @@ export class SrtpProducer implements ExitingProducer {
 	private readonly logger: Logger
 	private readonly spawn: typeof nodeSpawn
 	private readonly sessions = new Map<number, Session>()
+	/**
+	 * Datagrams a closed session never sent, held for the caller to take back.
+	 *
+	 * They cannot stay on the session, because everything that fails a start also
+	 * closes it: the readiness rejection stops the helper, and the child's own exit
+	 * handler closes the session before it rejects. By the time PortIngestion asks for
+	 * the unsent datagrams the session is gone, so without this the startup buffer -
+	 * the keyframe the port is waiting to ingest - is dropped on every failed start.
+	 */
+	private readonly unsent = new Map<number, Buffer[]>()
 	private readonly epochs = new Map<number, number>()
 	private exitListener: (port: number) => void = () => undefined
 	private closed = false
@@ -150,6 +160,11 @@ export class SrtpProducer implements ExitingProducer {
 				},
 			},
 		)
+
+		// Anything a previous session left unsent and nobody took is superseded by the
+		// datagrams handed to this start, so it must not be handed back later on top
+		// of them.
+		this.unsent.delete(port)
 
 		const session: Session = {
 			child,
@@ -459,14 +474,23 @@ export class SrtpProducer implements ExitingProducer {
 		return this.sessions.get(port)?.ready === true
 	}
 
-	/** Datagrams the helper never received, so a failed start can put them back. */
+	/**
+	 * Datagrams the helper never received, so a failed start can put them back.
+	 *
+	 * Reads the closed session's leftovers as well as a live one's, because the common
+	 * caller is a start that failed - and by then the session it failed on has already
+	 * been closed.
+	 */
 	takeUnsentDatagrams(port: number): Buffer[] {
+		const closed = this.unsent.get(port) ?? []
+		this.unsent.delete(port)
 		const session = this.sessions.get(port)
-		if (session === undefined) return []
+		if (session === undefined) return closed
 		const unsent = session.pending
 		session.pending = []
 		session.pendingBytes = 0
-		return unsent
+		// Closed first: it is the older session, so its datagrams came first.
+		return [...closed, ...unsent]
 	}
 
 	/**
@@ -492,6 +516,10 @@ export class SrtpProducer implements ExitingProducer {
 
 	private closeSession(port: number, session: Session): void {
 		if (this.sessions.get(port) === session) this.sessions.delete(port)
+		// Whatever it never sent outlives it, so a failed start can hand it back.
+		if (session.pending.length > 0) this.unsent.set(port, session.pending)
+		session.pending = []
+		session.pendingBytes = 0
 		try {
 			session.socket.close()
 		} catch {
