@@ -94,8 +94,15 @@ shell variable** - the sender needs the same one.
 
 ```bash
 TEST_KEY=$(openssl rand -hex 30)
-./scripts/provision-srtp-key.sh 6000 "$TEST_KEY" 3735928559
+printf '%s\n' "$TEST_KEY" | ./scripts/provision-srtp-key.sh 6000 3735928559
 ```
+
+The key goes in on stdin rather than as an argument, because arguments are
+readable by any local user through `/proc/<pid>/cmdline` while the process runs.
+The script also accepts a file
+(`./scripts/provision-srtp-key.sh 6000 3735928559 key.txt`), and prompts without
+echoing when stdin is a terminal - which is the one to use for a production key,
+since it keeps the key out of shell history too.
 
 Restart or redeploy the instances so the backend picks the parameter up; keys
 are resolved once at process start.
