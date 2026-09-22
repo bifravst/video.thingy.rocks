@@ -56,8 +56,14 @@ def candidates(hint: int, max_offset: int) -> "object":
 
     The hint comes first, because the common case is that nothing wrapped while
     ingestion was down. Zero comes second, because the next most likely explanation
-    is a sender that restarted its SRTP session - which used to be an unrecoverable
-    state requiring an operator to reprovision a key or edit the database by hand.
+    is a sender that restarted its SRTP session - which used to leave the port stuck
+    until an operator edited the database by hand.
+
+    Recovering from that is not the same as endorsing it. A sender that rewinds its
+    packet index while keeping its key reuses the keystream, and the operator still
+    has to rotate the key; this search exists for the case where *ingestion* was down
+    while the sender kept counting. SrtpProducer reports the rewind when it can see
+    one - see its reportCounterRewind, and the SRTP section of backend/README.md.
 
     After that the search walks outwards from the hint in *both* directions, and
     downwards is not optional: a hint one above the actual counter is what a stale
@@ -267,6 +273,10 @@ class SrtpPipeline:
         self.trial_started_ms = 0
         self.trial_inputs0 = 0
         self.trial_drops0 = 0
+        #: Authenticated count when this trial began. The count is cumulative across
+        #: trials, so only the difference says anything about the current candidate -
+        #: comparing the total against zero credits one candidate with another's work.
+        self.trial_auth0 = 0
         self.counters = Counters()
         self.confirmed = False
         self.loop = GLib.MainLoop()
@@ -530,11 +540,18 @@ class SrtpPipeline:
             last_auth_ms = self.counters.last_auth_ms
             self.counters.roc_changed = False
 
-        if authenticated == 0 and not self.confirmed:
+        # Only what authenticated under the candidate now being tried. The counter is
+        # cumulative, so testing the total against zero lets a packet that
+        # authenticated under the *previous* candidate - in the window between this
+        # snapshot and the key being removed - confirm the one that replaced it, and
+        # the reported roc is then the new candidate, which authenticated nothing.
+        authenticated_this_trial = authenticated - self.trial_auth0
+
+        if authenticated_this_trial == 0 and not self.confirmed:
             self._advance_search_if_tried()
             return True
 
-        if authenticated > 0 and not self.confirmed:
+        if authenticated_this_trial > 0 and not self.confirmed:
             self.confirmed = True
             # The counter is only ever reported once libsrtp authenticated traffic
             # under the candidate it was seeded from, which is what makes the value
@@ -549,7 +566,7 @@ class SrtpPipeline:
                 seq=highest_seq,
                 candidate=self.candidate,
                 trials=self.key_requests,
-                authenticated=authenticated,
+                authenticated=authenticated_this_trial,
             )
         elif self.confirmed and roc_changed:
             emit(t="auth", status="ok", first=False, roc=roc, seq=highest_seq)
@@ -571,6 +588,7 @@ class SrtpPipeline:
         """Snapshots the counters this trial will be judged against."""
         with self.counters.lock:
             self.trial_inputs0 = self.counters.inputs
+            self.trial_auth0 = self.counters.authenticated
         self.trial_drops0 = self._drop_count()
         self.trial_started_ms = now_ms()
 
@@ -580,9 +598,18 @@ class SrtpPipeline:
         Stepping on a timer alone would burn through the candidate list whenever a
         port is simply idle, so the trial ends only when datagrams were rejected
         under this candidate, or when datagrams arrived and the trial timed out.
+
+        The authenticated count is re-read here rather than taken from the caller's
+        snapshot: the caller released the lock before calling, and a packet that
+        authenticates in that window means this candidate is the right one. Discarding
+        it then would throw away the answer just as it arrived, and cost a full search
+        to find it again.
         """
         with self.counters.lock:
             inputs = self.counters.inputs
+            authenticated = self.counters.authenticated
+        if authenticated > self.trial_auth0:
+            return
         tried_inputs = inputs - self.trial_inputs0
         tried_drops = self._drop_count() - self.trial_drops0
         timed_out = now_ms() - self.trial_started_ms > self.args.trial_timeout_ms
