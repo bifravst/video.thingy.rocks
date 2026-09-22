@@ -3,6 +3,7 @@ import { describe, it } from 'node:test'
 
 import { Logger, type LogContext } from './Logger.ts'
 import {
+	trafficMetricRequest,
 	TransportTrafficMetrics,
 	type TransportTrafficSample,
 } from './TransportTrafficMetrics.ts'
@@ -36,6 +37,13 @@ class PublisherFake {
 	bytesFor(transport: string): number[] {
 		return this.batches.map(
 			(batch) => batch.find((s) => s.transport === transport)?.bytes ?? -1,
+		)
+	}
+
+	/** Serving flag reported for a transport, one entry per published period. */
+	servingFor(transport: string): number[] {
+		return this.batches.map(
+			(batch) => batch.find((s) => s.transport === transport)?.serving ?? -1,
 		)
 	}
 }
@@ -90,6 +98,37 @@ void describe('TransportTrafficMetrics', () => {
 		assert.deepStrictEqual(
 			publisher.batches[0]?.map((s) => s.bytes),
 			[0, 0],
+		)
+	})
+
+	/**
+	 * What the CDK alarms read, so its shape is part of the contract rather than an
+	 * implementation detail; cdk/StreamingStack.spec.ts checks the two sides agree.
+	 */
+	void it('turns each sample into both metrics under one dimension', () => {
+		const at = new Date()
+		const request = trafficMetricRequest(
+			[{ transport: 'srtp', bytes: 1234, serving: 1, at }],
+			'a-stack',
+		)
+
+		assert.strictEqual(request.Namespace, 'a-stack/ingest')
+		assert.deepStrictEqual(
+			request.MetricData?.map((d) => [
+				d.MetricName,
+				d.Value,
+				d.Unit,
+				d.Dimensions,
+			]),
+			[
+				[
+					'ReceivedBytes',
+					1234,
+					'Bytes',
+					[{ Name: 'Transport', Value: 'srtp' }],
+				],
+				['TransportServing', 1, 'None', [{ Name: 'Transport', Value: 'srtp' }]],
+			],
 		)
 	})
 
@@ -157,6 +196,58 @@ void describe('TransportTrafficMetrics', () => {
 			publisher.batches[0]?.map((s) => s.bytes),
 			[0, 0],
 		)
+	})
+
+	/**
+	 * A state, not a count, and reported separately from the bytes for that reason.
+	 *
+	 * A transport whose listener never bound receives nothing, so its byte count is a
+	 * steady zero that no alarm can tell from an idle transport. This is the only
+	 * signal that separates them.
+	 */
+	void describe('whether a transport is serving', () => {
+		void it('reports nothing as serving until told otherwise', async () => {
+			const publisher = new PublisherFake()
+			await metrics(publisher).publishNow()
+
+			assert.deepStrictEqual(publisher.servingFor('unencrypted'), [0])
+			assert.deepStrictEqual(publisher.servingFor('srtp'), [0])
+		})
+
+		void it('reports each transport on its own', async () => {
+			const publisher = new PublisherFake()
+			const m = metrics(publisher)
+
+			m.setServing('unencrypted', true)
+			await m.publishNow()
+
+			assert.deepStrictEqual(publisher.servingFor('unencrypted'), [1])
+			assert.deepStrictEqual(publisher.servingFor('srtp'), [0])
+		})
+
+		// Unlike the byte counter, which describes one period and resets with it.
+		void it('keeps reporting the state across periods', async () => {
+			const publisher = new PublisherFake()
+			const m = metrics(publisher)
+
+			m.setServing('srtp', true)
+			await m.publishNow()
+			await m.publishNow()
+			m.setServing('srtp', false)
+			await m.publishNow()
+
+			assert.deepStrictEqual(publisher.servingFor('srtp'), [1, 1, 0])
+		})
+
+		void it('ignores a transport it was not told about', async () => {
+			const publisher = new PublisherFake()
+			const m = metrics(publisher)
+
+			m.setServing('nonsense', true)
+			await m.publishNow()
+
+			assert.deepStrictEqual(publisher.batches[0]?.length, 2)
+		})
 	})
 
 	void describe('the reporting interval', () => {

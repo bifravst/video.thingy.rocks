@@ -32,8 +32,11 @@ import { fileURLToPath } from 'node:url'
 // share the names rather than spelling them out twice; see TrafficMetricNames.
 import {
 	RECEIVED_BYTES_METRIC,
-	TRANSPORT_DIMENSION,
+	SERVING_METRIC,
+	SRTP_TRANSPORT,
 	trafficMetricNamespace,
+	TRANSPORT_DIMENSION,
+	UNENCRYPTED_TRANSPORT,
 } from '../backend/src/TrafficMetricNames.ts'
 
 export class StreamingStack extends Stack {
@@ -576,6 +579,48 @@ export class StreamingStack extends Stack {
 		const oneMebibytePerSecondBytesPerMinute = 1024 * 1024 * 60 // 1 MiB/s * 60s
 
 		/**
+		 * The transports the alarms below are built for, one descriptor each.
+		 *
+		 * The three strings are kept apart because they have different jobs, and
+		 * merging them is how the SRTP traffic leg came to query `SRTP` for a dimension
+		 * the backend publishes as `srtp`. `dimension` has to match the published value
+		 * exactly and so is never written here - it comes from the constant the backend
+		 * publishes with. `label` names logical IDs and alarms, and `title` is prose. A
+		 * readable word is wrong in the one position where only an exact match works,
+		 * and nothing about `string` says so, which is why a single argument must not
+		 * serve two of these at once.
+		 */
+		const transports = [
+			{
+				dimension: UNENCRYPTED_TRANSPORT,
+				label: 'Unencrypted',
+				title: 'unencrypted',
+				ports: unencryptedPorts,
+			},
+			{
+				dimension: SRTP_TRANSPORT,
+				label: 'SRTP',
+				title: 'SRTP',
+				ports: srtpPorts,
+			},
+		] as const
+		type TransportAlarms = (typeof transports)[number]
+
+		/** One of the backend's per-transport metrics, for this stack. */
+		const backendMetric = (
+			metricName: string,
+			transport: TransportAlarms,
+			statistic: string,
+		): cloudwatch.Metric =>
+			new cloudwatch.Metric({
+				namespace: trafficMetricNamespace(Stack.of(this).stackName),
+				metricName,
+				dimensionsMap: { [TRANSPORT_DIMENSION]: transport.dimension },
+				statistic,
+				period: Duration.minutes(1),
+			})
+
+		/**
 		 * "Traffic is arriving on this transport", from the backend's own metric.
 		 *
 		 * Not from the load balancer. ProcessedBytes_UDP is published per load balancer
@@ -591,26 +636,50 @@ export class StreamingStack extends Stack {
 		 * instance that stops reporting is the Auto Scaling health check's problem, not
 		 * the restart automation's.
 		 */
-		const trafficArrivingOn = (
-			transport: string,
-			label: string,
-		): cloudwatch.Alarm =>
-			new cloudwatch.Alarm(this, `UDPTrafficArriving${label}`, {
-				alarmName: `${Stack.of(this).stackName}-UDP-Traffic-${label}`,
-				alarmDescription: `Bytes received on the ${transport} transport exceed 1 MB/s`,
-				metric: new cloudwatch.Metric({
-					namespace: trafficMetricNamespace(Stack.of(this).stackName),
-					metricName: RECEIVED_BYTES_METRIC,
-					dimensionsMap: { [TRANSPORT_DIMENSION]: transport },
-					statistic: 'Sum',
-					period: Duration.minutes(1),
-				}),
+		const trafficArrivingOn = (transport: TransportAlarms): cloudwatch.Alarm =>
+			new cloudwatch.Alarm(this, `UDPTrafficArriving${transport.label}`, {
+				alarmName: `${Stack.of(this).stackName}-UDP-Traffic-${transport.label}`,
+				alarmDescription: `Bytes received on the ${transport.title} transport exceed 1 MB/s`,
+				metric: backendMetric(RECEIVED_BYTES_METRIC, transport, 'Sum'),
 				threshold: oneMebibytePerSecondBytesPerMinute,
 				evaluationPeriods: 5,
 				comparisonOperator:
 					cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
 				treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
 			})
+
+		/**
+		 * A transport that is configured but not serving, which no traffic leg can see.
+		 *
+		 * The traffic-gated alarms answer "traffic arrives and is lost", so they are
+		 * blind to a transport whose listener never bound: nothing arrives, its byte
+		 * count is a steady zero, and the fault is indistinguishable from an idle
+		 * transport. That is precisely what an unreachable parameter store does - the
+		 * key load throws, its transport is skipped, and the ports stay closed - so the
+		 * failure the isolation exists to survive was also the one nothing reported.
+		 *
+		 * Minimum, so one degraded instance in the fleet is enough; notify only, since
+		 * restarting a fleet does not make a parameter store reachable.
+		 */
+		const notServingOn = (transport: TransportAlarms): cloudwatch.Alarm => {
+			const alarm = new cloudwatch.Alarm(
+				this,
+				`TransportNotServing${transport.label}`,
+				{
+					alarmName: `${Stack.of(this).stackName}-Transport-Not-Serving-${transport.label}`,
+					alarmDescription: `The ${transport.title} transport is configured but its listener is not serving on at least one instance`,
+					metric: backendMetric(SERVING_METRIC, transport, 'Minimum'),
+					threshold: 1,
+					evaluationPeriods: 5,
+					comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+					// A transport nobody reports on is the health check's problem, as
+					// above; this alarm is about an instance that reports and says no.
+					treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+				},
+			)
+			alarm.addAlarmAction(new cloudwatch_actions.SnsAction(alarmTopic))
+			return alarm
+		}
 
 		/**
 		 * Sums PutMedia.IncomingBytes over an explicit set of ports.
@@ -650,15 +719,11 @@ export class StreamingStack extends Stack {
 		 * unable to report a real SRTP failure while staying quiet before devices
 		 * existed.
 		 */
-		const noIngestionOn = (
-			ports: number[],
-			transport: string,
-			label: string,
-		): cloudwatch.Alarm =>
-			new cloudwatch.Alarm(this, `KVSNoPutMediaIngestion${label}`, {
-				alarmName: `${Stack.of(this).stackName}-KVS-PutMedia-Incoming-Zero-${label}`,
-				alarmDescription: `Sum of PutMedia.IncomingBytes across the ${transport} Kinesis Video Streams is 0, counting no data as 0`,
-				metric: kvsIncomingSumFor(ports),
+		const noIngestionOn = (transport: TransportAlarms): cloudwatch.Alarm =>
+			new cloudwatch.Alarm(this, `KVSNoPutMediaIngestion${transport.label}`, {
+				alarmName: `${Stack.of(this).stackName}-KVS-PutMedia-Incoming-Zero-${transport.label}`,
+				alarmDescription: `Sum of PutMedia.IncomingBytes across the ${transport.title} Kinesis Video Streams is 0, counting no data as 0`,
+				metric: kvsIncomingSumFor(transport.ports),
 				threshold: 0,
 				evaluationPeriods: 5,
 				comparisonOperator:
@@ -676,37 +741,32 @@ export class StreamingStack extends Stack {
 		 * the load-balancer-wide byte count.
 		 *
 		 * It also means a transport with no devices provisioned never fires, so the
-		 * SRTP alarm is quiet until SRTP is in use and then reports the failures the
-		 * bootstrap comments describe: a missing GStreamer plugin or an unreachable key
-		 * store leaves traffic arriving with nothing reaching Kinesis.
+		 * SRTP alarm is quiet until SRTP is in use and then reports a transport that is
+		 * serving but losing what it takes - a missing GStreamer plugin, say. A
+		 * transport that never bound at all arrives here as a steady zero and is
+		 * covered by notServingOn instead.
 		 */
 		const ingestFaultOn = (
-			ports: number[],
-			transport: string,
-			label: string,
+			transport: TransportAlarms,
 		): cloudwatch.CompositeAlarm => {
 			const alarm = new cloudwatch.CompositeAlarm(
 				this,
-				`UDPTrafficNoKinesisIngestion${label}`,
+				`UDPTrafficNoKinesisIngestion${transport.label}`,
 				{
 					alarmRule: cloudwatch.AlarmRule.allOf(
-						trafficArrivingOn(transport, label),
-						noIngestionOn(ports, transport, label),
+						trafficArrivingOn(transport),
+						noIngestionOn(transport),
 					),
-					alarmDescription: `Bytes are arriving on the ${transport} transport but PutMedia incoming data across its Kinesis Video Streams is 0`,
-					compositeAlarmName: `${Stack.of(this).stackName}-UDP-Traffic-No-KVS-Ingestion-${label}`,
+					alarmDescription: `Bytes are arriving on the ${transport.title} transport but PutMedia incoming data across its Kinesis Video Streams is 0`,
+					compositeAlarmName: `${Stack.of(this).stackName}-UDP-Traffic-No-KVS-Ingestion-${transport.label}`,
 				},
 			)
 			alarm.addAlarmAction(new cloudwatch_actions.SnsAction(alarmTopic))
 			return alarm
 		}
 
-		const unencryptedIngestFaultAlarm = ingestFaultOn(
-			unencryptedPorts,
-			'unencrypted',
-			'Unencrypted',
-		)
-		const srtpIngestFaultAlarm = ingestFaultOn(srtpPorts, 'SRTP', 'SRTP')
+		for (const transport of transports) notServingOn(transport)
+		const ingestFaultAlarms = transports.map(ingestFaultOn)
 
 		/**
 		 * Restart the fleet when either transport is in that state.
@@ -720,10 +780,7 @@ export class StreamingStack extends Stack {
 			this,
 			'UDPTrafficNoKinesisIngestionAlarm',
 			{
-				alarmRule: cloudwatch.AlarmRule.anyOf(
-					unencryptedIngestFaultAlarm,
-					srtpIngestFaultAlarm,
-				),
+				alarmRule: cloudwatch.AlarmRule.anyOf(...ingestFaultAlarms),
 				alarmDescription:
 					'Bytes are arriving on a UDP transport but none of them are reaching its Kinesis Video Streams',
 				compositeAlarmName: `${Stack.of(this).stackName}-UDP-Traffic-No-KVS-Ingestion`,

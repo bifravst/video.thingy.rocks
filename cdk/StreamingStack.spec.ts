@@ -3,6 +3,11 @@ import { Template } from 'aws-cdk-lib/assertions'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
+import {
+	SRTP_TRANSPORT,
+	UNENCRYPTED_TRANSPORT,
+} from '../backend/src/TrafficMetricNames.ts'
+import { trafficMetricRequest } from '../backend/src/TransportTrafficMetrics.ts'
 import { StreamingStack } from './StreamingStack.ts'
 
 const STACK_NAME = 'video-streaming-2026-05'
@@ -225,14 +230,74 @@ void describe('StreamingStack', () => {
 		const logicalIdOf = (type: string, name: string): string =>
 			named(type, name)[0]
 
+		// The dimension values come from the backend's own constants, never from a
+		// literal written here: a literal in the spec is authored from the same
+		// assumption as the code it checks, so it agrees with a wrong value as readily
+		// as a right one. That is how the SRTP leg came to query `SRTP` against a
+		// dimension published as `srtp`, with a passing test asserting it.
 		const transports = [
-			{ label: 'Unencrypted', transport: 'unencrypted', port: 5000 },
-			{ label: 'SRTP', transport: 'SRTP', port: 6000 },
+			{ label: 'Unencrypted', transport: UNENCRYPTED_TRANSPORT, port: 5000 },
+			{ label: 'SRTP', transport: SRTP_TRANSPORT, port: 6000 },
 		] as const
 
 		void it('watches each transport separately', () => {
 			for (const { label } of transports) {
 				compositeNamed(`${STACK_NAME}-UDP-Traffic-No-KVS-Ingestion-${label}`)
+			}
+		})
+
+		/**
+		 * Every alarm on a backend metric must name something the backend publishes.
+		 *
+		 * The two sides have to agree on a namespace, a metric name and a dimension
+		 * *value*, and disagreeing on any of them is invisible: CloudWatch does not
+		 * complain about an alarm watching a metric nobody publishes, it simply reports
+		 * no data, which reads as "no traffic" and never fires. The SRTP traffic leg
+		 * shipped querying `SRTP` for a dimension published as `srtp` - dimension
+		 * values are case-sensitive, so that whole fault composite was dead.
+		 *
+		 * Both sides are therefore compared against each other rather than against
+		 * literals: this builds the request the backend would actually send and checks
+		 * every alarm resolves to something in it. A fixture would only restate
+		 * whichever value was written first.
+		 */
+		void it('alarms only on metrics the backend actually publishes', () => {
+			const at = new Date()
+			const request = trafficMetricRequest(
+				transports.map(({ transport }) => ({
+					transport,
+					bytes: 0,
+					serving: 1,
+					at,
+				})),
+				STACK_NAME,
+			)
+			const publishes = new Set(
+				(request.MetricData ?? []).map((datum) =>
+					JSON.stringify([
+						request.Namespace,
+						datum.MetricName,
+						datum.Dimensions,
+					]),
+				),
+			)
+
+			const watched = resourcesOfType('AWS::CloudWatch::Alarm')
+				.map(([, alarm]) => alarm.Properties ?? {})
+				.filter((props) => props.Namespace === request.Namespace)
+				.map((props) =>
+					JSON.stringify([props.Namespace, props.MetricName, props.Dimensions]),
+				)
+
+			assert.ok(
+				watched.length > 0,
+				'no alarm reads the backend namespace at all',
+			)
+			for (const metric of watched) {
+				assert.ok(
+					publishes.has(metric),
+					`an alarm watches ${metric}, which the backend never publishes. It publishes ${[...publishes].join(', ')}`,
+				)
 			}
 		})
 
