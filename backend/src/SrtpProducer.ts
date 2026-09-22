@@ -1,6 +1,7 @@
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process'
 import dgram from 'node:dgram'
 
+import { endChildProcess } from './ChildProcessExit.ts'
 import type { ExitingProducer } from './IngestionService.ts'
 import { Logger } from './Logger.ts'
 import {
@@ -20,6 +21,13 @@ const DEFAULT_PENDING_MAX_BYTES = 8 * 1024 * 1024
 /** Paced replay, so a large startup buffer does not arrive as one burst. */
 const REPLAY_BATCH = 50
 const REPLAY_PAUSE_MS = 10
+/**
+ * Bound on the replay, which also drains what arrives during it; see replay().
+ *
+ * A full 8 MB buffer takes around a second to pace out, and video traffic arrives far
+ * slower than the replay sends, so this is only reached by a flood.
+ */
+const REPLAY_MAX_MS = 5_000
 
 export type SrtpRocHintStore = {
 	getSrtpRocHint(
@@ -344,22 +352,47 @@ export class SrtpProducer implements ExitingProducer {
 		}
 	}
 
-	/** Sends the startup buffer in paced batches, then lets live traffic through. */
+	/**
+	 * Sends the startup buffer in paced batches, then lets live traffic through.
+	 *
+	 * The session stays not-ready for the whole replay, including the pauses. That is
+	 * the point: writePacket appends to the same buffer while it is not ready, so a
+	 * datagram arriving mid-replay queues behind what is still being sent instead of
+	 * going straight out. Marking the session ready first - which is what this used to
+	 * do - let one live datagram reach the helper ahead of thousands of older ones,
+	 * and SRTP's replay window then rejects those older ones, losing the keyframe the
+	 * buffer exists to preserve.
+	 *
+	 * Draining live traffic as well as the original buffer means the loop only ends
+	 * once arrivals fall behind the send rate, so it is bounded by a deadline. Traffic
+	 * fast enough to outrun the replay is already past the buffer's cap, and the tail
+	 * is dropped rather than sent after newer datagrams: a gap costs a decode
+	 * artefact, while going backwards costs the whole replayed run.
+	 */
 	private async replay(port: number, session: Session): Promise<void> {
-		const queued = session.pending
-		session.pending = []
-		session.pendingBytes = 0
-		session.ready = true
+		const deadline = Date.now() + REPLAY_MAX_MS
 
-		for (let i = 0; i < queued.length; i += REPLAY_BATCH) {
-			if (!this.sessions.has(port)) return
-			for (const datagram of queued.slice(i, i + REPLAY_BATCH)) {
+		while (session.pending.length > 0) {
+			if (this.sessions.get(port) !== session) return
+			if (Date.now() > deadline) {
+				this.logger.warn(
+					'Startup replay outrun by live traffic; dropping the rest of the buffer',
+					{ port, dropped: session.pending.length },
+				)
+				break
+			}
+			for (const datagram of session.pending.splice(0, REPLAY_BATCH)) {
+				session.pendingBytes -= datagram.length
 				this.send(session, datagram)
 			}
-			if (i + REPLAY_BATCH < queued.length) {
+			if (session.pending.length > 0) {
 				await new Promise((resolve) => setTimeout(resolve, REPLAY_PAUSE_MS))
 			}
 		}
+
+		session.pending = []
+		session.pendingBytes = 0
+		session.ready = true
 	}
 
 	private send(session: Session, datagram: Buffer): void {
@@ -406,36 +439,21 @@ export class SrtpProducer implements ExitingProducer {
 	/**
 	 * Ends the helper for a port and returns only once it is gone.
 	 *
-	 * Exiting is the only thing that resolves this, SIGKILL included: PortIngestion
-	 * releases the port's lock as soon as stop() returns, so another instance can
-	 * acquire the stream from that moment - and a helper that has been signalled but
-	 * not yet reaped is still a second writer to it.
+	 * The helper ends its stream on SIGTERM so the sink can flush, so it is signalled
+	 * straight away rather than given an unsignalled drain. Exiting is the only thing
+	 * that resolves this - see ChildProcessExit for why the lock depends on it.
 	 */
 	async stop(port: number): Promise<void> {
 		const session = this.sessions.get(port)
 		if (session === undefined) return
 		session.stopping = true
-		const exited = new Promise<void>((resolve) => {
-			if (
-				session.child.exitCode !== null ||
-				session.child.signalCode !== null
-			) {
-				resolve()
-				return
-			}
-			const timer = setTimeout(() => {
-				// The helper ends its stream on SIGTERM so the sink can flush; if it is
-				// still alive after that, it must not outlive the lock this port holds.
-				this.logger.warn('SRTP helper ignored SIGTERM; killing it', { port })
-				session.child.kill('SIGKILL')
-			}, this.options.stopSigkillAfterMs ?? STOP_SIGKILL_AFTER_MS)
-			session.child.once('exit', () => {
-				clearTimeout(timer)
-				resolve()
-			})
+		await endChildProcess(session.child, {
+			sigkillAfterMs: this.options.stopSigkillAfterMs ?? STOP_SIGKILL_AFTER_MS,
+			onSignal: (signal) => {
+				if (signal === 'SIGKILL')
+					this.logger.warn('SRTP helper ignored SIGTERM; killing it', { port })
+			},
 		})
-		session.child.kill('SIGTERM')
-		await exited
 		this.closeSession(port, session)
 	}
 

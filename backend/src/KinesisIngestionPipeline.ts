@@ -6,6 +6,7 @@ import * as path from 'node:path'
 import type { Writable } from 'node:stream'
 
 import { fromNodeProviderChain } from '@aws-sdk/credential-providers'
+import { endChildProcess } from './ChildProcessExit.ts'
 import { Logger } from './Logger.ts'
 
 export type KinesisIngestionPipelineConfig = {
@@ -22,6 +23,10 @@ export type KinesisIngestionPipelineConfig = {
 	 * When true, log GStreamer/KVS stdout and stderr. Disabled by default to avoid noisy logs.
 	 */
 	logGstreamerOutput?: boolean
+	/** How long a closed input gets to end the process on its own; see stop(). */
+	stopDrainMs?: number
+	/** How long SIGTERM gets before SIGKILL follows it; see stop(). */
+	stopSigkillAfterMs?: number
 }
 
 const DEFAULT_REORDER_BUFFER_SIZE = 128
@@ -49,6 +54,15 @@ type PortPipeline = {
 	fifoPath?: string
 }
 
+/**
+ * How long closing the input gets to end GStreamer before it is signalled.
+ *
+ * kvssink uploads what it is holding when the stream ends, so this is the window in
+ * which a clean stop keeps the tail of the recording.
+ */
+const STOP_DRAIN_MS = 15_000
+/** How long SIGTERM gets to end the stream cleanly before SIGKILL follows it. */
+const STOP_SIGKILL_AFTER_MS = 8_000
 /** Throttle repeated GStreamer stderr warnings (same category) per port. */
 const GST_STDERR_THROTTLE_MS = 60_000
 /** Throttle noisy stdout (CONTINUITY, KVS 0x30000005, "Could not write to resource") per port. */
@@ -435,7 +449,14 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	}
 
 	/**
-	 * Stops the pipeline for a port: flushes reorder buffer, closes stdin, waits for process exit.
+	 * Stops the pipeline for a port and returns only once GStreamer is gone.
+	 *
+	 * Flushes the reorder buffer, closes the input so kvssink can upload what it holds,
+	 * and then waits the child out - escalating to SIGTERM and SIGKILL if the flush
+	 * does not end it. Returning earlier than that is not an option: PortIngestion
+	 * releases the port's lock as soon as this resolves, so another instance may
+	 * acquire the same Kinesis stream from that moment, and a signalled-but-living
+	 * kvssink is still writing to it.
 	 */
 	async stop(port: number): Promise<void> {
 		const pipeline = this.activePipelines.get(port)
@@ -466,12 +487,15 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		}
 
 		try {
-			await new Promise<void>((resolve) => {
-				const t = setTimeout(resolve, 15_000)
-				gst.once('exit', () => {
-					clearTimeout(t)
-					resolve()
-				})
+			await endChildProcess(gst, {
+				drainMs: this.config.stopDrainMs ?? STOP_DRAIN_MS,
+				sigkillAfterMs: this.config.stopSigkillAfterMs ?? STOP_SIGKILL_AFTER_MS,
+				onSignal: (signal) => {
+					this.logger.warn('GStreamer did not stop on its own; signalling it', {
+						port,
+						signal,
+					})
+				},
 			})
 		} catch (err) {
 			this.logger.warn('Error waiting for pipeline stop', {
@@ -479,7 +503,6 @@ export class KinesisIngestionPipeline extends EventEmitter {
 				error: err instanceof Error ? err.message : String(err),
 			})
 		}
-		gst.kill('SIGTERM')
 		this.logger.info('Kinesis ingestion stopped', { port })
 	}
 
