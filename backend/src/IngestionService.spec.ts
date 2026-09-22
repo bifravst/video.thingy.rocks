@@ -11,6 +11,7 @@ import {
 	type HealthPort,
 	type IngestionTransport,
 	type PacketSource,
+	type TrafficRecorder,
 } from './IngestionService.ts'
 import type { OwnedWriteResult } from './StreamMetadataService.ts'
 
@@ -141,12 +142,40 @@ class HealthFake implements HealthPort {
 	}
 }
 
+/** Records what the service counts, so the per-transport scoping can be asserted. */
+class TrafficFake implements TrafficRecorder {
+	readonly recorded: { transport: string; byteCount: number }[] = []
+	started = false
+	stopped = false
+	publishCalls = 0
+
+	record(transport: string, byteCount: number) {
+		this.recorded.push({ transport, byteCount })
+	}
+	start() {
+		this.started = true
+	}
+	stop() {
+		this.stopped = true
+	}
+	async publishNow() {
+		this.publishCalls += 1
+	}
+
+	bytesFor(transport: string): number {
+		return this.recorded
+			.filter((r) => r.transport === transport)
+			.reduce((sum, r) => sum + r.byteCount, 0)
+	}
+}
+
 const build = (
 	overrides: {
 		producer?: ExitingProducer | null
 		health?: HealthPort
 		listener?: ListenerFake
 		extraTransports?: IngestionTransport[]
+		traffic?: TrafficRecorder
 	} = {},
 ) => {
 	const listener = overrides.listener ?? new ListenerFake()
@@ -155,6 +184,7 @@ const build = (
 	const producer =
 		overrides.producer === undefined ? new ProducerFake() : overrides.producer
 	const healthServer = overrides.health ?? new HealthFake()
+	const traffic = overrides.traffic
 	const service = new IngestionService({
 		config: {
 			...loadConfig({ KINESIS_STREAM_PREFIX: 'test-video' }),
@@ -168,8 +198,9 @@ const build = (
 			...(overrides.extraTransports ?? []),
 		],
 		healthServer,
+		traffic,
 	})
-	return { service, listener, activity, locks, producer, healthServer }
+	return { service, listener, activity, locks, producer, healthServer, traffic }
 }
 
 const settle = async (): Promise<void> => {
@@ -506,6 +537,106 @@ void describe('IngestionService transport preparation', () => {
 			new Promise((resolve) => setTimeout(() => resolve('pending'), 20)),
 		])
 		assert.strictEqual(outcome, 'pending')
+	})
+
+	/**
+	 * The signal the zero-ingestion alarms pair with "did anything reach Kinesis".
+	 *
+	 * It has to be attributed to the transport the datagram arrived on: the load
+	 * balancer's own byte count covers both transports at once, which is what made the
+	 * restart composite compare two different things.
+	 */
+	void describe('per-transport traffic reporting', () => {
+		const withSrtp = (
+			traffic: TrafficRecorder,
+		): ReturnType<typeof build> & { srtpListener: ListenerFake } => {
+			const srtpListener = new ListenerFake()
+			const built = build({
+				traffic,
+				extraTransports: [
+					{
+						name: 'srtp',
+						portRange: { start: 6000, end: 6009 },
+						listener: srtpListener,
+						producer: new ProducerFake(),
+					},
+				],
+			})
+			return { ...built, srtpListener }
+		}
+
+		void it('attributes each datagram to the transport it arrived on', async () => {
+			const traffic = new TrafficFake()
+			const { listener, srtpListener } = withSrtp(traffic)
+
+			listener.deliver(5000, Buffer.alloc(700), new Date())
+			listener.deliver(5001, Buffer.alloc(300), new Date())
+			srtpListener.deliver(6000, Buffer.alloc(40), new Date())
+			await settle()
+
+			assert.strictEqual(traffic.bytesFor('unencrypted'), 1000)
+			assert.strictEqual(traffic.bytesFor('srtp'), 40)
+		})
+
+		// Otherwise the failure where a transport admits nothing looks like no traffic
+		// at all, and the alarm gated on traffic can never fire for it.
+		void it('counts a datagram no port accepts', async () => {
+			const traffic = new TrafficFake()
+			const { srtpListener } = withSrtp(traffic)
+
+			// Outside every configured port range, so no machine takes it.
+			srtpListener.deliver(6100, Buffer.alloc(80), new Date())
+			await settle()
+
+			assert.strictEqual(traffic.bytesFor('srtp'), 80)
+		})
+
+		// Its zeros are what tell the alarms this instance is reporting at all, so they
+		// must not wait behind an additive transport that can stall for minutes.
+		void it('starts reporting before any additive transport is prepared', async () => {
+			const traffic = new TrafficFake()
+			const srtpListener = new ListenerFake()
+			const { service } = build({
+				traffic,
+				extraTransports: [
+					{
+						name: 'srtp',
+						portRange: { start: 6000, end: 6009 },
+						listener: srtpListener,
+						producer: new ProducerFake(),
+						prepare: async () => new Promise(() => undefined),
+					},
+				],
+			})
+
+			void service.start()
+			await settle()
+
+			assert.strictEqual(traffic.started, true)
+			assert.strictEqual(srtpListener.started, false)
+		})
+
+		void it('reports the final period on shutdown, after stopping the interval', async () => {
+			const traffic = new TrafficFake()
+			const { service } = build({ traffic })
+			await service.start()
+			await service.shutdown()
+
+			assert.strictEqual(traffic.stopped, true)
+			assert.strictEqual(
+				traffic.publishCalls,
+				1,
+				'the last period would otherwise be lost',
+			)
+		})
+
+		void it('runs without a recorder at all', async () => {
+			const { service, listener } = build()
+			await service.start()
+			listener.deliver(5000, Buffer.alloc(10), new Date())
+			await settle()
+			await assert.doesNotReject(service.shutdown())
+		})
 	})
 
 	void it('keeps serving when an additive transport cannot prepare', async () => {

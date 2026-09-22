@@ -33,6 +33,17 @@ export type HealthPort = {
 }
 
 /**
+ * Where per-transport traffic is counted, so the restart alarms can be scoped to one
+ * transport. See TransportTrafficMetrics for why the load balancer's own metric cannot.
+ */
+export type TrafficRecorder = {
+	record(transport: string, byteCount: number): void
+	start(): void
+	stop(): void
+	publishNow(): Promise<void>
+}
+
+/**
  * A producer that also announces when one of its children exits on its own.
  *
  * The exit has to be attributable to the ownership lifetime that started it, which is
@@ -85,6 +96,8 @@ export type IngestionServiceOptions = {
 	activity: ActivitySource
 	transports: IngestionTransport[]
 	healthServer: HealthPort
+	/** Optional: without it the per-transport traffic metric is simply not reported. */
+	traffic?: TrafficRecorder
 	logger?: Logger
 }
 
@@ -122,6 +135,11 @@ export class IngestionService {
 
 		transport.listener.setPacketHandler({
 			onPacket: (port: number, data: Buffer, timestamp: Date) => {
+				// Counted before admission, deliberately: the metric answers "is traffic
+				// arriving on this transport", which is the question the restart alarms
+				// pair with "is it reaching Kinesis". Counting only admitted datagrams
+				// would hide the failure where nothing is admitted.
+				this.options.traffic?.record(transport.name, data.length)
 				this.machines.get(port)?.offer(data, timestamp)
 			},
 			// The machine starts from packets, so a resume needs no separate path - the
@@ -215,6 +233,12 @@ export class IngestionService {
 			healthPort: this.options.healthServer.port,
 		})
 
+		// Reporting starts with the primary listener rather than at the end of start().
+		// Its zeros are what tell the alarms this instance is reporting at all, so a
+		// stalled additive transport must not delay them - the same reason the health
+		// port opens here.
+		this.options.traffic?.start()
+
 		for (const transport of additive) {
 			try {
 				// After the primary listener is serving and the health port is open,
@@ -258,6 +282,10 @@ export class IngestionService {
 		for (const transport of this.options.transports) {
 			await transport.listener.stop()
 		}
+		// Once no listener can add to them, report the counters one last time so the
+		// final period is not lost - and stop first, so the interval cannot race it.
+		this.options.traffic?.stop()
+		await this.options.traffic?.publishNow()
 		this.options.activity.stop()
 		await Promise.all(
 			[...this.machines.values()].map(async (m) => m.shutdown()),

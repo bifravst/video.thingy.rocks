@@ -15,6 +15,11 @@ import { SrtpKeyStore } from './SrtpKeyStore.ts'
 import { SrtpProducer } from './SrtpProducer.ts'
 import { StreamMetadataService } from './StreamMetadataService.ts'
 import { StreamStateManager } from './StreamStateManager.ts'
+import { SRTP_TRANSPORT, UNENCRYPTED_TRANSPORT } from './TrafficMetricNames.ts'
+import {
+	cloudWatchTrafficPublisher,
+	TransportTrafficMetrics,
+} from './TransportTrafficMetrics.ts'
 import { UDPListener } from './UDPListener.ts'
 
 /**
@@ -47,11 +52,17 @@ const ensureAwsCredentials = async (): Promise<void> => {
 /** Where kvssink writes its own log configuration on the instances. */
 const KVS_LOG_CONFIG_PATH = '/opt/video-streaming/kvs_log_configuration'
 /**
- * How long an SRTP port may hold its slot without having authenticated anything.
+ * How long an SRTP port may keep receiving traffic without authenticating any of it.
  *
  * A pipeline has to exist before anything can be authenticated, so this window is
- * unavoidable - but it is bounded, and a port that never authenticates gives the slot
- * back and waits out a longer cooldown before trying again.
+ * unavoidable; a port that never authenticates gives the slot back and waits out a
+ * longer cooldown before trying again.
+ *
+ * Measured against arriving datagrams, not wall clock. PortIngestion has no timers of
+ * its own, so the deadline is compared against the clock when the next datagram is
+ * handled - see its class comment for why. A burst that starts a pipeline and then
+ * stops is therefore released by the inactivity timeout below rather than by this
+ * window, which is the longer of the two.
  */
 const SRTP_PROVISIONAL_MS = 20_000
 const SRTP_PROVISIONAL_COOLDOWN_MS = 60_000
@@ -87,9 +98,34 @@ const buildService = (instanceId: string): IngestionService => {
 			: 'disabled (KINESIS_STREAM_PREFIX not set)',
 	})
 
+	/**
+	 * The per-transport traffic reporter, or nothing when it cannot be namespaced.
+	 *
+	 * Built from the final transport list so that every transport reports a value each
+	 * minute, including a zero - which is what lets the alarms tell "no devices are
+	 * sending" from "this instance is not reporting".
+	 */
+	const buildTraffic = (
+		names: string[],
+	): TransportTrafficMetrics | undefined => {
+		if (config.stackName === undefined) {
+			logger.warn(
+				'STACK_NAME is not set, so per-transport traffic metrics are not reported; the zero-ingestion alarms depend on them',
+			)
+			return undefined
+		}
+		return new TransportTrafficMetrics({
+			transports: names,
+			publish: cloudWatchTrafficPublisher({
+				stackName: config.stackName,
+				region: config.awsRegion,
+			}),
+		})
+	}
+
 	const transports: IngestionTransport[] = [
 		{
-			name: 'unencrypted',
+			name: UNENCRYPTED_TRANSPORT,
 			portRange: config.portRange,
 			listener: new UDPListener({
 				portRange: config.portRange,
@@ -131,7 +167,7 @@ const buildService = (instanceId: string): IngestionService => {
 		})
 
 		transports.push({
-			name: 'srtp',
+			name: SRTP_TRANSPORT,
 			portRange: srtp.portRange,
 			// Resolved when this transport starts, which is after credentials have been
 			// verified and after the unencrypted listener is already serving: an
@@ -169,6 +205,7 @@ const buildService = (instanceId: string): IngestionService => {
 			activity: streamStateManager,
 			transports,
 			healthServer: new HealthServer(),
+			traffic: buildTraffic(transports.map((t) => t.name)),
 		})
 		return serviceRef.current
 	}
@@ -180,6 +217,7 @@ const buildService = (instanceId: string): IngestionService => {
 		activity: streamStateManager,
 		transports,
 		healthServer: new HealthServer(),
+		traffic: buildTraffic(transports.map((t) => t.name)),
 	})
 }
 

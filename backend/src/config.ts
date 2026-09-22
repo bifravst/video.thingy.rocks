@@ -21,6 +21,14 @@ export type IngestionConfig = {
 	kinesisIngestionEnabled: boolean
 	kinesisLogGstreamerOutput: boolean
 	kinesisMinBytesBeforeStart: number
+	/**
+	 * The stack this instance belongs to, which namespaces its published metrics.
+	 *
+	 * Undefined when not set, and the per-transport traffic metric then goes
+	 * unreported: publishing it into a namespace the stack's alarms do not read would
+	 * be worse than not publishing it, because the alarms treat a gap as a fault.
+	 */
+	stackName?: string
 	/** Undefined when SRTP ingestion is not configured; the path is entirely additive. */
 	srtp?: SrtpConfig
 }
@@ -134,6 +142,10 @@ export const loadConfig = (
 		kinesisIngestionEnabled: kinesisStreamPrefix.length > 0,
 		kinesisLogGstreamerOutput: isEnabled(env.KINESIS_INGESTION_LOG_GSTREAMER),
 		kinesisMinBytesBeforeStart: minBytesMb * 1024 * 1024,
+		stackName:
+			env.STACK_NAME === undefined || env.STACK_NAME.length === 0
+				? undefined
+				: env.STACK_NAME,
 		srtp: loadSrtpConfig(env, portRange),
 	}
 }
