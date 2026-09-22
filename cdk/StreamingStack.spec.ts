@@ -9,6 +9,9 @@ const STACK_NAME = 'video-streaming-2026-05'
 const UNENCRYPTED_PORTS = Array.from({ length: 10 }, (_, i) => 5000 + i)
 const SRTP_PORTS = Array.from({ length: 10 }, (_, i) => 6000 + i)
 
+/** One entry of a synthesised template's Resources, as findResources returns it. */
+type TemplateResource = { Properties?: Record<string, unknown> }
+
 /**
  * Synthesises the stack the way a deployment does.
  *
@@ -199,110 +202,195 @@ void describe('StreamingStack', () => {
 	})
 
 	void describe('alarms', () => {
-		void it('watches each transport separately', () => {
-			const alarms = template().findResources('AWS::CloudWatch::Alarm')
-			const names = Object.values(alarms).map(
-				(alarm) => alarm.Properties?.AlarmName as string | undefined,
+		const resourcesOfType = (type: string): [string, TemplateResource][] =>
+			Object.entries(
+				template().findResources(type) as Record<string, TemplateResource>,
 			)
-			assert.ok(names.includes(`${STACK_NAME}-KVS-PutMedia-Incoming-Zero`))
-			assert.ok(names.includes(`${STACK_NAME}-KVS-PutMedia-Incoming-Zero-SRTP`))
-		})
 
-		/**
-		 * No SRTP ingestion is the normal state until devices are provisioned, so this
-		 * alarm notifies and nothing more. Wiring it to the restart topic - as the
-		 * unencrypted composite alarm is - would reboot the fleet for as long as no
-		 * SRTP device happened to be sending.
-		 */
-		void it('keeps the SRTP alarm notify-only and not breaching on missing data', () => {
-			const alarms = template().findResources('AWS::CloudWatch::Alarm')
-			const srtp = Object.values(alarms).find(
-				(alarm) =>
-					alarm.Properties?.AlarmName ===
-					`${STACK_NAME}-KVS-PutMedia-Incoming-Zero-SRTP`,
+		const named = (type: string, name: string): [string, TemplateResource] => {
+			const entry = resourcesOfType(type).find(
+				([, resource]) => resource.Properties?.AlarmName === name,
 			)
-			assert.strictEqual(
-				(srtp?.Properties?.AlarmActions as unknown[]).length,
-				1,
-				'one action: notify',
-			)
-			assert.strictEqual(srtp?.Properties?.TreatMissingData, 'notBreaching')
+			assert.ok(entry !== undefined, `no ${type} named ${name}`)
+			return entry
+		}
+
+		const alarmNamed = (name: string): TemplateResource =>
+			named('AWS::CloudWatch::Alarm', name)[1]
+
+		const compositeNamed = (name: string): TemplateResource =>
+			named('AWS::CloudWatch::CompositeAlarm', name)[1]
+
+		/** Logical ID of the alarm with this name, as an alarm rule refers to it. */
+		const logicalIdOf = (type: string, name: string): string =>
+			named(type, name)[0]
+
+		const transports = [
+			{ label: 'Unencrypted', transport: 'unencrypted', port: 5000 },
+			{ label: 'SRTP', transport: 'SRTP', port: 6000 },
+		] as const
+
+		void it('watches each transport separately', () => {
+			for (const { label } of transports) {
+				compositeNamed(`${STACK_NAME}-UDP-Traffic-No-KVS-Ingestion-${label}`)
+			}
 		})
 
 		void it('gives each zero-ingestion alarm its own transport metrics', () => {
-			const alarms = template().findResources('AWS::CloudWatch::Alarm')
-			for (const [name, port] of [
-				[`${STACK_NAME}-KVS-PutMedia-Incoming-Zero`, 5000],
-				[`${STACK_NAME}-KVS-PutMedia-Incoming-Zero-SRTP`, 6000],
-			] as const) {
-				const alarm = Object.values(alarms).find(
-					(candidate) => candidate.Properties?.AlarmName === name,
+			for (const { label, port } of transports) {
+				const alarm = alarmNamed(
+					`${STACK_NAME}-KVS-PutMedia-Incoming-Zero-${label}`,
 				)
-				const metrics = JSON.stringify(alarm?.Properties?.Metrics)
 				assert.ok(
-					metrics.includes(`${STACK_NAME}-video-${String(port)}`),
-					`${name} must watch port ${String(port)}`,
+					JSON.stringify(alarm.Properties?.Metrics ?? null).includes(
+						`${STACK_NAME}-video-${String(port)}`,
+					),
+					`the ${label} alarm must watch port ${String(port)}`,
 				)
 			}
 		})
 
 		/**
-		 * The restart composite has to describe one failure, not two transports mixed.
+		 * The traffic leg has to be scoped to the same transport as the ingestion leg.
 		 *
-		 * Its traffic leg is the load-balancer-wide ProcessedBytes_UDP, which counts
-		 * both transports because CloudWatch publishes no narrower version of it. The
-		 * ingestion side therefore has to cover both too, or SRTP traffic ends up
-		 * deciding whether an unencrypted-ingestion failure restarts the fleet.
+		 * The load balancer's ProcessedBytes_UDP counts both transports, because
+		 * CloudWatch publishes no per-listener or per-target-group version of it. Built
+		 * on that, the pairing compares "is anything arriving anywhere" against "is
+		 * this transport reaching Kinesis", so traffic on the other transport decides
+		 * the answer. The backend publishes a per-transport byte count instead.
 		 */
-		void it('covers both transports on each leg of the restart composite', () => {
-			const synthesised = template()
-			const composites = synthesised.findResources(
-				'AWS::CloudWatch::CompositeAlarm',
-			)
-			const composite = Object.values(composites).find(
-				(alarm) =>
-					alarm.Properties?.AlarmName ===
-					`${STACK_NAME}-UDP-Traffic-No-KVS-Ingestion`,
-			)
-			const rule = JSON.stringify(composite?.Properties?.AlarmRule)
-
-			const alarms = synthesised.findResources('AWS::CloudWatch::Alarm')
-			const legFor = (transportPort: number): string => {
-				const [logicalId, alarm] =
-					Object.entries(alarms).find(
-						([, candidate]) =>
-							JSON.stringify(candidate.Properties?.Metrics ?? null).includes(
-								`${STACK_NAME}-video-${String(transportPort)}`,
-							) &&
-							candidate.Properties?.TreatMissingData === 'breaching' &&
-							candidate.Properties?.AlarmActions === undefined,
-					) ?? []
-				assert.ok(
-					logicalId !== undefined && alarm !== undefined,
-					`no composite-only zero-ingestion alarm for port ${String(transportPort)}`,
+		void it('scopes each traffic leg to its own transport', () => {
+			for (const { label, transport } of transports) {
+				const alarm = alarmNamed(`${STACK_NAME}-UDP-Traffic-${label}`)
+				assert.strictEqual(
+					alarm.Properties?.Namespace,
+					`${STACK_NAME}/ingest`,
+					'the traffic leg must read the backend metric, not the load balancer',
 				)
-				return logicalId
+				assert.strictEqual(alarm.Properties?.MetricName, 'ReceivedBytes')
+				assert.deepStrictEqual(alarm.Properties?.Dimensions, [
+					{ Name: 'Transport', Value: transport },
+				])
 			}
+		})
 
-			for (const port of [5000, 6000]) {
+		void it('reads no load-balancer-wide byte count anywhere', () => {
+			const alarms = JSON.stringify(
+				template().findResources('AWS::CloudWatch::Alarm'),
+			)
+			assert.ok(
+				!alarms.includes('ProcessedBytes_UDP'),
+				'a load-balancer-wide metric cannot describe one transport',
+			)
+		})
+
+		/**
+		 * Each per-transport fault is traffic arriving AND nothing being ingested.
+		 *
+		 * Both conditions, in the positive sense: the rule used to negate a
+		 * traffic-is-high alarm, which made it read "traffic is *below* 1 MB/s and
+		 * ingestion is zero" - the opposite of its own description, and true of an idle
+		 * fleet.
+		 */
+		void it('requires traffic and no ingestion on the same transport', () => {
+			for (const { label } of transports) {
+				const rule = JSON.stringify(
+					compositeNamed(`${STACK_NAME}-UDP-Traffic-No-KVS-Ingestion-${label}`)
+						.Properties?.AlarmRule,
+				)
 				assert.ok(
-					rule.includes(legFor(port)),
-					`the composite must include the ${String(port)} transport: ${rule}`,
+					!rule.includes('NOT'),
+					`the ${label} rule must not negate a leg: ${rule}`,
+				)
+				for (const legName of [
+					`${STACK_NAME}-UDP-Traffic-${label}`,
+					`${STACK_NAME}-KVS-PutMedia-Incoming-Zero-${label}`,
+				]) {
+					assert.ok(
+						rule.includes(logicalIdOf('AWS::CloudWatch::Alarm', legName)),
+						`the ${label} rule must include ${legName}: ${rule}`,
+					)
+				}
+			}
+		})
+
+		/**
+		 * A transport whose devices are not provisioned yet must stay silent, and one
+		 * that breaks after they are must not.
+		 *
+		 * Those two used to be in conflict: the SRTP alarm read the Kinesis metric
+		 * alone, and a producer that never starts publishes no samples at all. Treating
+		 * that gap as healthy was the only way to stay quiet before devices existed -
+		 * and it also suppressed the alarm when a working SRTP path stopped, which is
+		 * the failure the alarm is for. Gating on traffic separates them, so the gap
+		 * can now be read as the fault it is.
+		 */
+		void it('treats absent ingestion data as a fault, gated on traffic', () => {
+			for (const { label } of transports) {
+				const ingestion = alarmNamed(
+					`${STACK_NAME}-KVS-PutMedia-Incoming-Zero-${label}`,
+				)
+				assert.strictEqual(
+					ingestion.Properties?.TreatMissingData,
+					'breaching',
+					'no PutMedia samples is exactly the condition',
+				)
+				assert.strictEqual(
+					ingestion.Properties?.AlarmActions,
+					undefined,
+					'alone it would fire on an idle transport, so it must not notify',
+				)
+
+				const traffic = alarmNamed(`${STACK_NAME}-UDP-Traffic-${label}`)
+				assert.strictEqual(
+					traffic.Properties?.TreatMissingData,
+					'notBreaching',
+					'without a sample there is no evidence traffic is arriving',
 				)
 			}
 		})
 
-		// Missing data on the restart leg means "nothing was ingested", which is the
-		// condition being tested - unlike on the notify-only alarm, where it is normal.
-		void it('treats absent SRTP data as no ingestion on the restart leg', () => {
-			const alarms = template().findResources('AWS::CloudWatch::Alarm')
-			const leg = Object.values(alarms).find(
-				(alarm) =>
-					alarm.Properties?.AlarmName ===
-					`${STACK_NAME}-KVS-PutMedia-Incoming-Zero-SRTP-Restart-Leg`,
+		void it('notifies on each transport fault', () => {
+			for (const { label } of transports) {
+				const actions = compositeNamed(
+					`${STACK_NAME}-UDP-Traffic-No-KVS-Ingestion-${label}`,
+				).Properties?.AlarmActions as unknown[] | undefined
+				assert.strictEqual(actions?.length, 1, `${label} must notify`)
+			}
+		})
+
+		/**
+		 * The restart fires when *either* transport is faulty.
+		 *
+		 * The transports fail independently - a missing GStreamer plugin or an
+		 * unreachable key store takes SRTP down by itself - so requiring both would let
+		 * a healthy SRTP path suppress the restart an unencrypted failure needs.
+		 */
+		void it('restarts the fleet when either transport is losing its traffic', () => {
+			const composite = compositeNamed(
+				`${STACK_NAME}-UDP-Traffic-No-KVS-Ingestion`,
 			)
-			assert.strictEqual(leg?.Properties?.TreatMissingData, 'breaching')
-			assert.strictEqual(leg?.Properties?.AlarmActions, undefined)
+			const rule = JSON.stringify(composite.Properties?.AlarmRule)
+			assert.ok(
+				rule.includes('OR'),
+				`either transport must trigger it: ${rule}`,
+			)
+			for (const { label } of transports) {
+				assert.ok(
+					rule.includes(
+						logicalIdOf(
+							'AWS::CloudWatch::CompositeAlarm',
+							`${STACK_NAME}-UDP-Traffic-No-KVS-Ingestion-${label}`,
+						),
+					),
+					`the restart composite must include ${label}: ${rule}`,
+				)
+			}
+			// Notify and restart, in that order of severity.
+			assert.strictEqual(
+				(composite.Properties?.AlarmActions as unknown[]).length,
+				2,
+			)
 		})
 	})
 

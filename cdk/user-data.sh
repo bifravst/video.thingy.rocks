@@ -88,6 +88,9 @@ WorkingDirectory=/opt/video-streaming
 Environment="NODE_ENV=production"
 Environment="AWS_REGION=__AWS_REGION__"
 Environment="TABLE_NAME=__TABLE_NAME__"
+# Namespaces the per-transport traffic metric this stack's zero-ingestion alarms read.
+# Without it the metric is not published and those alarms see a permanent gap.
+Environment="STACK_NAME=__STACK_NAME__"
 Environment="OUTPUT_DIR=/var/video-streams"
 Environment="TRANSCODING_OUTPUT_DIR=/tmp/video-streams/transcoding"
 Environment="KINESIS_STREAM_PREFIX=__KINESIS_STREAM_PREFIX__"
