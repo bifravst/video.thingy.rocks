@@ -66,7 +66,9 @@ Ports **6000-6009** on the load balancer's address.
 - **Keyframes**: send SPS/PPS regularly (for example `config-interval=1` in
   GStreamer), so a receiver that joins mid-stream can start decoding.
 
-`scripts/stream-testsrc-to-srtp.sh` is a runnable example of the sender side.
+`scripts/stream-testsrc-to-srtp.py` is a runnable example of the sender side. It
+takes the key on stdin or from a file and sets it on `srtpenc` in process, so
+the key never appears in a command line - the same rule the receiver keeps.
 
 ### Unencrypted MPEG-TS
 

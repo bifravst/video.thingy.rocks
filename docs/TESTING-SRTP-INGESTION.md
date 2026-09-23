@@ -11,12 +11,17 @@ shares its fleet, load balancer and lock table.
   needs no migration, no cutover and no deploy-time context.
 - At least one SRTP port provisioned with a key (below). **One is enough** -
   ports are independent, and an unprovisioned port simply drops its traffic.
-- Local GStreamer with `gst-plugins-bad` (for `srtpenc`) **and**
-  `gst-plugins-ugly` (for `x264enc`), both used by the test sender:
+- For the test sender: Python 3 with the GStreamer bindings, plus
+  `gst-plugins-bad` (for `srtpenc`) **and** `gst-plugins-ugly` (for `x264enc`).
+  The sender is a small GStreamer application rather than a `gst-launch-1.0`
+  command line, for the same reason the receiver is - see section 3 - so the
+  command-line tools alone are not enough. On Ubuntu/Debian that is
+  `python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly`.
+  This checks the lot, through the bindings the sender actually uses:
 
   ```bash
-  gst-inspect-1.0 srtpenc
-  gst-inspect-1.0 x264enc
+  python3 -c "import gi; gi.require_version('Gst', '1.0'); from gi.repository import Gst; Gst.init(None); \
+    print([e for e in ('srtpenc', 'x264enc', 'rtph264pay') if not Gst.ElementFactory.find(e)] or 'ok')"
   ```
 
 ## How it works
@@ -127,11 +132,21 @@ instead of at load time.
 
 ```bash
 ./scripts/get-instance-ip.sh
-./scripts/stream-testsrc-to-srtp.sh <instance-ip> 6000 "$TEST_KEY" 3735928559
+printf '%s\n' "$TEST_KEY" | ./scripts/stream-testsrc-to-srtp.py <instance-ip> 6000 --ssrc 3735928559
 ```
 
-The script's built-in default key and SSRC are for local experiments only and
-will not authenticate against a backend provisioned with your own key.
+The key goes in on stdin here too, for the same reason as when provisioning it -
+and it matters more for the sender, which runs for the whole stream rather than
+for the length of one AWS call. It is never an argument to the sender or to
+anything the sender runs: the sender is a GStreamer application that sets the
+key on `srtpenc` in process, where a `gst-launch-1.0` pipeline would have had to
+carry it in its command line, readable by any local user through
+`/proc/<pid>/cmdline`. `--key-file <path>` works too, and with neither, the
+sender prompts without echoing.
+
+It also refuses to start with anything key-shaped among its arguments, and with
+a `GST_DEBUG` level above 3 - `srtpenc` copies the key into the caps it sends
+downstream, and GStreamer logs caps at those levels.
 
 ## 4. Verify
 
@@ -216,8 +231,10 @@ will not authenticate against a backend provisioned with your own key.
 ## What cannot be tested locally
 
 Real `srtpdec` authentication and the rollover-counter search are covered by
-`SrtpPipelineHelper.spec.ts` against real `libsrtp`. What needs a deployed
-stack: `kvssink` fed from the in-process pipeline, the Python bindings being
-present on the instance AMI, load balancer UDP forwarding and dual-stack
-translation, lock handoff between instances, and rollover-counter recovery
-across a real restart.
+`SrtpPipelineHelper.spec.ts` against real `libsrtp`, and the test sender by
+`scripts/stream-testsrc-to-srtp.spec.ts`, which streams it into that same
+receiver and checks both that it authenticates and that no command line on the
+machine holds its key while it does. What needs a deployed stack: `kvssink` fed
+from the in-process pipeline, the Python bindings being present on the instance
+AMI, load balancer UDP forwarding and dual-stack translation, lock handoff
+between instances, and rollover-counter recovery across a real restart.
