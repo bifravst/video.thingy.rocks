@@ -302,7 +302,9 @@ export class PortIngestion {
 
 		// An unowned port only buffers traffic that looks like the transport it serves;
 		// once owned, everything is relayed, so a filter that misjudges live traffic
-		// cannot starve a running stream.
+		// cannot starve a running stream. That also lets anything that reaches the port
+		// count as activity and, while running, refresh the lease - bounded by the
+		// producer ending when authentication stops; see runningWrite.
 		if (!this.ownsSlot && this.config.admit?.(data) === false) return
 
 		// Recorded immediately, with the real arrival time, so stream-activity and
@@ -571,6 +573,23 @@ export class PortIngestion {
 		await this.teardown(unsent, this.startRetryBackoffMs)
 	}
 
+	/**
+	 * Relays and refreshes the lease - on every datagram, authenticated or not.
+	 *
+	 * The invariant is that unauthenticated traffic earns no lease refresh, and this is
+	 * the one state where it holds only within a bound. By the time a port runs, the
+	 * filter is behind it (see offer), and this machine cannot tell which datagrams the
+	 * producer will authenticate. So for a transport that requires authentication, the
+	 * bound is the producer's: it must end once authentication stops, and the port then
+	 * restarts into Provisional, where nothing refreshes the lease until something
+	 * authenticates again. For SRTP that is AUTH_LOSS_MS in SrtpProducer - 3 seconds -
+	 * after which traffic nobody can authenticate has, at most, pushed a lease that
+	 * lasts minutes a few seconds further out.
+	 *
+	 * Keeping it here rather than tying the refresh to authenticated output keeps this
+	 * machine transport-neutral; the cost is that the bound lives in the producer, so
+	 * both halves of it are pinned by tests.
+	 */
 	private async runningWrite(): Promise<void> {
 		this.relay()
 

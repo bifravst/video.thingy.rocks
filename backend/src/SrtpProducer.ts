@@ -16,6 +16,18 @@ import type { SrtpKeyStore } from './SrtpKeyStore.ts'
 const READY_TIMEOUT_MS = 10_000
 /** How long SIGTERM gets to end the stream cleanly before SIGKILL follows it. */
 const STOP_SIGKILL_AFTER_MS = 8_000
+/**
+ * How long the helper keeps a pipeline once nothing has authenticated, before it
+ * declares the stream lost and exits.
+ *
+ * This is also the bound on how long unauthenticated traffic can keep a running port's
+ * lease fresh. Once a port runs, PortIngestion refreshes its lease on every datagram,
+ * authenticated or not, and relies on the producer ending when authentication stops -
+ * see runningWrite there. Passed to the helper explicitly rather than left to its
+ * default, so the bound is stated where the lease is decided rather than in another
+ * process.
+ */
+export const AUTH_LOSS_MS = 3_000
 /** Datagrams held while the helper is starting, so the buffer's order survives. */
 const DEFAULT_PENDING_MAX_BYTES = 8 * 1024 * 1024
 /** Paced replay, so a large startup buffer does not arrive as one burst. */
@@ -50,6 +62,8 @@ export type SrtpProducerOptions = {
 	streamNameForPort: (port: number) => string
 	kvsLogConfigPath: string
 	jitterBufferLatencyMs?: number
+	/** How long without authentication ends the helper; see AUTH_LOSS_MS. */
+	authLossMs?: number
 	helperPath?: string
 	readyTimeoutMs?: number
 	pendingMaxBytes?: number
@@ -151,6 +165,8 @@ export class SrtpProducer implements ExitingProducer {
 				this.options.kvsLogConfigPath,
 				'--jitter-latency-ms',
 				String(this.options.jitterBufferLatencyMs ?? 200),
+				'--auth-loss-ms',
+				String(this.options.authLossMs ?? AUTH_LOSS_MS),
 			],
 			{
 				stdio: ['pipe', 'pipe', 'pipe'],

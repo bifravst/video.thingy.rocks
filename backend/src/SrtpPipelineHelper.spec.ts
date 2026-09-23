@@ -266,6 +266,76 @@ void describe('srtp_pipeline.py', { skip }, () => {
 		})
 
 		/**
+		 * The producer's half of the bound on unauthenticated lease refresh.
+		 *
+		 * Once a port runs, PortIngestion refreshes its lease on every datagram,
+		 * authenticated or not, and relies on this: the helper ending once nothing has
+		 * authenticated for its loss window, even while forged traffic keeps arriving.
+		 * The flood uses the right SSRC, since it is public, so it is exactly what
+		 * anyone reaching the port can send. The window is shortened here; the parent
+		 * passes the production one, which SrtpProducer.spec.ts checks. The state
+		 * machine's half - no lease once this happens - is in PortIngestion.spec.ts.
+		 */
+		void it('ends within its loss window while forged traffic keeps arriving', async () => {
+			const lossMs = 600
+			const helper = await startHelper({
+				rocHint: 0,
+				extraArgs: ['--auth-loss-ms', String(lossMs)],
+			})
+			try {
+				sendBurst(helper, 0, 0, 10)
+				await helper.waitFor((m) => confirmation(m) !== undefined)
+				const confirmedAt = Date.now()
+
+				const exited = new Promise<number | null>((resolve) => {
+					helper.child.once('exit', (code) => resolve(code))
+				})
+				let forgedSent = 0
+				const flood = setInterval(() => {
+					for (let i = 0; i < 10; i++) {
+						const forged = Buffer.alloc(86)
+						forged[0] = 0x80
+						forged[1] = 96
+						forged.writeUInt16BE(20 + forgedSent, 2)
+						forged.writeUInt32BE(SSRC, 8)
+						helper.send(forged)
+						forgedSent += 1
+					}
+				}, 20)
+				try {
+					const lost = await helper.waitFor(
+						(m) => m.t === 'auth' && m.status === 'lost',
+						10_000,
+					)
+					const code = await exited
+					const elapsed = Date.now() - confirmedAt
+
+					assert.strictEqual(
+						code,
+						5,
+						'it exits, which is what restarts the port',
+					)
+					assert.ok(
+						lost.t === 'auth' &&
+							lost.status === 'lost' &&
+							(lost.sinceMs ?? 0) >= lossMs,
+						`not before the window: ${JSON.stringify(lost)}`,
+					)
+					// The window plus the supervisor tick and scheduling, not open-ended.
+					assert.ok(
+						elapsed < lossMs + 1_500,
+						`it ended ${String(elapsed)} ms after authentication stopped`,
+					)
+					assert.ok(forgedSent > 0, 'the flood was running throughout')
+				} finally {
+					clearInterval(flood)
+				}
+			} finally {
+				await helper.stop()
+			}
+		})
+
+		/**
 		 * Other SSRCs are counted, not reported one by one.
 		 *
 		 * The SSRC is in the clear and chosen by whoever sends, and srtpdec asks for a

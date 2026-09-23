@@ -93,6 +93,10 @@ export const startHelper = async (options: {
 			'--fake-sink',
 			'--stats-interval-ms',
 			'250',
+			// Out of the way, so a test that pauses between bursts is not ended by it.
+			// The window is a security bound, not just a timeout - it limits how long
+			// unauthenticated traffic keeps a running port's lease fresh - so the test
+			// for it overrides this through extraArgs rather than leaving it untested.
 			'--auth-loss-ms',
 			'100000',
 			'--trial-drops',

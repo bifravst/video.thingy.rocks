@@ -8,7 +8,7 @@ import { describe, it } from 'node:test'
 import { Logger, type LogContext } from './Logger.ts'
 import { SRTP_HELPER_PROTOCOL_VERSION } from './SrtpHelperProtocol.ts'
 import type { SrtpKeyStore } from './SrtpKeyStore.ts'
-import { SrtpProducer } from './SrtpProducer.ts'
+import { AUTH_LOSS_MS, SrtpProducer } from './SrtpProducer.ts'
 
 const PORT = 6000
 const KEY = '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d'
@@ -135,11 +135,14 @@ const start = async (
 	helper: HelperFake
 	logger: CapturingLogger
 	started: Promise<void>
+	/** The arguments the helper was started with. */
+	helperArgs: string[]
 }> => {
 	// Nothing is bound to the default relay port: the fake helper only has to report
 	// one, and most tests do not depend on the datagrams arriving anywhere.
 	const helper = new HelperFake(options.relayPort ?? 45_454)
 	helper.ignoreSignals = options.ignoreSignals ?? false
+	const helperArgs: string[] = []
 	const logger = new CapturingLogger()
 	const producer = new SrtpProducer({
 		keyStore: {
@@ -159,13 +162,15 @@ const start = async (
 		streamNameForPort: (port) => `test-video-${String(port)}`,
 		kvsLogConfigPath: '/dev/null',
 		stopSigkillAfterMs: options.stopSigkillAfterMs,
-		spawn: (() =>
-			helper as unknown as ChildProcess) as unknown as typeof nodeSpawn,
+		spawn: ((_command: string, args: string[]) => {
+			helperArgs.push(...args)
+			return helper as unknown as ChildProcess
+		}) as unknown as typeof nodeSpawn,
 		logger,
 	})
 	const started = producer.start(PORT, options.datagrams ?? [], { epoch: 1 })
 	if (options.awaitStart !== false) await started
-	return { producer, helper, logger, started }
+	return { producer, helper, logger, started, helperArgs }
 }
 
 void describe('SrtpProducer', () => {
@@ -281,6 +286,25 @@ void describe('SrtpProducer', () => {
 	})
 
 	/**
+	 * The loss window is passed, not left to the helper's default.
+	 *
+	 * It bounds how long unauthenticated traffic can keep a running port's lease
+	 * fresh, because PortIngestion refreshes on every datagram and relies on the
+	 * helper ending once authentication stops. A bound that rests on a default in
+	 * another process is one nobody sees change.
+	 */
+	void it('passes the helper its authentication loss window', async () => {
+		const { producer, helperArgs } = await start()
+		try {
+			const flag = helperArgs.indexOf('--auth-loss-ms')
+			assert.notStrictEqual(flag, -1, `not passed: ${helperArgs.join(' ')}`)
+			assert.strictEqual(helperArgs[flag + 1], String(AUTH_LOSS_MS))
+		} finally {
+			await producer.stop(PORT)
+		}
+	})
+
+	/**
 	 * The helper's stats, where an operator can read them.
 	 *
 	 * The troubleshooting guide tells an operator whose stream never authenticates to
@@ -303,7 +327,7 @@ void describe('SrtpProducer', () => {
 				stats(helper)
 				await delay(20)
 				assert.deepStrictEqual(
-					logged(logger).map((i) => [
+					logged(logger).map((i): unknown[] => [
 						i.context?.inputs,
 						i.context?.authenticated,
 						i.context?.drops,

@@ -830,7 +830,8 @@ void describe('PortIngestion', () => {
 			assert.strictEqual(h2.machine.ownsSlot, true)
 		})
 
-		// I7: unauthenticated traffic earns no lease refresh.
+		// I7: unauthenticated traffic earns no lease refresh - here outright; once
+		// running, within the bound pinned by the producer-exit test below.
 		void it('refreshes no lease while provisional', async () => {
 			const h2 = provisional()
 			h2.send()
@@ -884,6 +885,63 @@ void describe('PortIngestion', () => {
 			h2.send()
 			await h2.settle()
 			assert.strictEqual(h2.producer.startCalls.length, 2)
+		})
+
+		/**
+		 * The state machine's half of the bound on unauthenticated lease refresh.
+		 *
+		 * Once a port runs, every datagram refreshes its lease, authenticated or not -
+		 * the filter is behind it, and this machine cannot tell which ones the producer
+		 * will authenticate. What bounds that is the producer ending when
+		 * authentication stops (for SRTP, AUTH_LOSS_MS), and this: after that, the port
+		 * comes back in Provisional, and traffic nobody can authenticate earns it no
+		 * lease at all until the provisional window gives the slot back. The producer's
+		 * half is pinned in SrtpPipelineHelper.spec.ts.
+		 */
+		void it('refreshes no lease once the producer ends, however long traffic continues', async () => {
+			const h2 = provisional()
+			h2.send()
+			await h2.settle()
+			h2.machine.onAuthenticated()
+			await h2.settle()
+			assert.strictEqual(h2.machine.stateName, 'Running')
+
+			// While running, a datagram refreshes the lease whether or not it holds the key.
+			h2.machine.offer(datagram(5), new Date())
+			await h2.settle()
+			assert.deepStrictEqual(h2.locks.calls, ['acquire', 'heartbeat'])
+
+			// Authentication stops, so the producer ends...
+			h2.producer.simulateExit()
+			h2.machine.onProducerExited(h2.machine.currentEpoch)
+			await h2.settle()
+
+			// ...and the flood carries on, through the restart delay and into the restart.
+			for (let second = 0; second < 15; second++) {
+				h2.advance(1_000)
+				h2.machine.offer(datagram(5), new Date())
+				await h2.settle()
+			}
+			assert.strictEqual(h2.machine.stateName, 'Provisional')
+			assert.strictEqual(h2.producer.startCalls.length, 2)
+			assert.deepStrictEqual(
+				h2.locks.calls,
+				['acquire', 'heartbeat'],
+				'a restarted port earns no lease from traffic nobody authenticates',
+			)
+
+			// And through the rest of the provisional window, which then gives it back.
+			for (let second = 0; second < 20; second++) {
+				h2.advance(1_000)
+				h2.machine.offer(datagram(5), new Date())
+				await h2.settle()
+			}
+			assert.deepStrictEqual(h2.locks.calls, [
+				'acquire',
+				'heartbeat',
+				'release',
+			])
+			assert.strictEqual(h2.machine.stateName, 'Cooldown')
 		})
 
 		void it('ignores an authentication report when not provisional', async () => {
