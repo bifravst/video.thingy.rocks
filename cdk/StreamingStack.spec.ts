@@ -1,13 +1,16 @@
 import { App } from 'aws-cdk-lib'
 import { Template } from 'aws-cdk-lib/assertions'
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
+import { readdirSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { describe, it } from 'node:test'
 
 import {
 	SRTP_TRANSPORT,
 	UNENCRYPTED_TRANSPORT,
 } from '../backend/src/TrafficMetricNames.ts'
-import { trafficMetricRequest } from '../backend/src/TransportTrafficMetrics.ts'
+import { trafficMetricRequest } from '../backend/src/TrafficMetricRequest.ts'
 import { StreamingStack } from './StreamingStack.ts'
 
 const STACK_NAME = 'video-streaming-2026-05'
@@ -516,5 +519,58 @@ void describe('StreamingStack', () => {
 				AttributeDefinitions: [{ AttributeName: 'port', AttributeType: 'N' }],
 			})
 		})
+	})
+
+	/**
+	 * The CDK is installed from the repository root, which carries none of the
+	 * backend's AWS SDK clients - so every backend module the CDK code reads has to
+	 * load without them.
+	 *
+	 * This spec once imported the metric request builder from the module that also
+	 * publishes it, and so pulled in @aws-sdk/client-cloudwatch. It passed only because
+	 * backend/node_modules happened to be installed alongside; a clean root install
+	 * would have failed before the first CDK test. Checked by actually loading each
+	 * module with the SDK made unresolvable, rather than by reading import lines, so a
+	 * dependency that arrives transitively fails too.
+	 */
+	void it('reads only backend modules that load without the AWS SDK', () => {
+		const imported = new Set<string>()
+		for (const file of readdirSync('cdk').filter((f) => f.endsWith('.ts'))) {
+			const source = readFileSync(join('cdk', file), 'utf8')
+			for (const [, specifier] of source.matchAll(
+				/from '\.\.\/(backend\/[^']+)'/g,
+			)) {
+				if (specifier !== undefined) imported.add(`./${specifier}`)
+			}
+		}
+		assert.ok(imported.size > 0, 'expected the CDK to read some backend module')
+
+		const loader = `
+			const { registerHooks } = require('node:module')
+			registerHooks({
+				resolve(specifier, context, next) {
+					if (specifier.startsWith('@aws-sdk/')) throw new Error('needs ' + specifier)
+					return next(specifier, context)
+				},
+			})
+			const modules = ${JSON.stringify([...imported])}
+			Promise.allSettled(modules.map((m) => import(m))).then((results) => {
+				const failed = results
+					.map((r, i) => r.status === 'rejected' ? modules[i] + ': ' + r.reason.message : '')
+					.filter(Boolean)
+				console.log(failed.join('\\n'))
+				process.exitCode = failed.length === 0 ? 0 : 1
+			})
+		`
+		const result = spawnSync(
+			process.execPath,
+			['--no-warnings', '--experimental-transform-types', '-e', loader],
+			{ encoding: 'utf8', timeout: 60_000 },
+		)
+		assert.strictEqual(
+			result.status,
+			0,
+			`the CDK reads backend modules that need the backend's AWS SDK:\n${result.stdout}${result.stderr}`,
+		)
 	})
 })

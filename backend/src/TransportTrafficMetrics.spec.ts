@@ -4,9 +4,9 @@ import { describe, it } from 'node:test'
 import { Logger, type LogContext } from './Logger.ts'
 import {
 	trafficMetricRequest,
-	TransportTrafficMetrics,
 	type TransportTrafficSample,
-} from './TransportTrafficMetrics.ts'
+} from './TrafficMetricRequest.ts'
+import { TransportTrafficMetrics } from './TransportTrafficMetrics.ts'
 
 const delay = async (ms: number): Promise<void> =>
 	new Promise((resolve) => setTimeout(resolve, ms))

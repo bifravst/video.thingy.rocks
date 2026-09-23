@@ -1,27 +1,16 @@
 import {
 	CloudWatchClient,
 	PutMetricDataCommand,
-	type PutMetricDataCommandInput,
 } from '@aws-sdk/client-cloudwatch'
 
 import { Logger } from './Logger.ts'
 import {
-	RECEIVED_BYTES_METRIC,
-	SERVING_METRIC,
-	TRANSPORT_DIMENSION,
-	trafficMetricNamespace,
-} from './TrafficMetricNames.ts'
+	trafficMetricRequest,
+	type TransportTrafficSample,
+} from './TrafficMetricRequest.ts'
 
 /** How often the counters are published, matching the alarms' one-minute period. */
 const DEFAULT_INTERVAL_MS = 60_000
-
-export type TransportTrafficSample = {
-	transport: string
-	bytes: number
-	/** 1 while this transport's listener is serving, 0 while it is not. */
-	serving: number
-	at: Date
-}
 
 export type TransportTrafficPublisher = (
 	samples: TransportTrafficSample[],
@@ -137,41 +126,6 @@ export class TransportTrafficMetrics {
 		}
 	}
 }
-
-/**
- * The exact PutMetricData request these samples become.
- *
- * Separated from the call so that the CDK spec can compare what the backend publishes
- * against what the alarms query, without a CloudWatch client. That comparison is the
- * point: namespace, metric name and dimension *value* all have to match across the two
- * sides, and a mismatch in any of them produces an alarm watching a metric nobody
- * publishes, which reads as "no traffic" and so fails towards silence.
- */
-export const trafficMetricRequest = (
-	samples: TransportTrafficSample[],
-	stackName: string,
-): PutMetricDataCommandInput => ({
-	Namespace: trafficMetricNamespace(stackName),
-	MetricData: samples.flatMap((sample) => {
-		const Dimensions = [{ Name: TRANSPORT_DIMENSION, Value: sample.transport }]
-		return [
-			{
-				MetricName: RECEIVED_BYTES_METRIC,
-				Value: sample.bytes,
-				Unit: 'Bytes' as const,
-				Timestamp: sample.at,
-				Dimensions,
-			},
-			{
-				MetricName: SERVING_METRIC,
-				Value: sample.serving,
-				Unit: 'None' as const,
-				Timestamp: sample.at,
-				Dimensions,
-			},
-		]
-	}),
-})
 
 /** Publishes to CloudWatch, in the namespace the stack's alarms read. */
 export const cloudWatchTrafficPublisher = (options: {
