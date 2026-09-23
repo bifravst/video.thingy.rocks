@@ -53,7 +53,12 @@ export type SrtpHelperMessage =
 			drops: number
 	  }
 	| { t: 'warning'; element?: string; message: string }
-	| { t: 'error'; element?: string; message: string; debug?: string }
+	/**
+	 * No GStreamer debug string, deliberately: its text is unconstrained and can
+	 * describe caps, and the helper's caps carry the key. Leaving the field out of the
+	 * type means nothing downstream can start logging it.
+	 */
+	| { t: 'error'; element?: string; message: string }
 	| { t: 'fatal'; reason: SrtpHelperFatalReason; message: string }
 	| { t: 'eos' }
 	/** Anything that was not a message: kept so the caller can log it once. */
@@ -207,12 +212,7 @@ const parseMessage = (line: string): SrtpHelperMessage => {
 		case 'error': {
 			const message = str(value.message)
 			if (message === undefined) return unparsed
-			return {
-				t: 'error',
-				element: str(value.element),
-				message,
-				debug: str(value.debug),
-			}
+			return { t: 'error', element: str(value.element), message }
 		}
 		case 'fatal': {
 			const reason = str(value.reason)

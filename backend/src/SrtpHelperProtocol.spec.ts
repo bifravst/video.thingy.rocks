@@ -127,7 +127,9 @@ void describe('SrtpHelperProtocol', () => {
 				[
 					{ t: 'searching', candidate: 2, trial: 1 },
 					{ t: 'warning', element: 'srtpdec', message: 'unknown ssrc' },
-					{ t: 'error', element: 'kvssink', message: 'boom', debug: 'd' },
+					// No debug, even when a helper sends one: GStreamer's debug text is
+					// unconstrained, can describe caps, and the helper's caps carry the key.
+					{ t: 'error', element: 'kvssink', message: 'boom' },
 					{ t: 'fatal', reason: 'bind-failed', message: 'in use' },
 					{ t: 'eos' },
 				],

@@ -428,12 +428,16 @@ class SrtpPipeline:
 
     def _on_bus_message(self, _bus: Gst.Bus, message: Gst.Message) -> bool:
         if message.type == Gst.MessageType.ERROR:
-            err, debug = message.parse_error()
+            # The message only, never the debug string, exactly as for warnings below.
+            # The debug text is GStreamer's own and nothing constrains it - the
+            # GST_DEBUG guard does not cover it - while this pipeline's key is in the
+            # caps it hands srtpdec, and a debug string describing caps would carry it
+            # onto this protocol.
+            err, _debug = message.parse_error()
             emit(
                 t="error",
                 element=message.src.get_name() if message.src else "",
                 message=err.message,
-                debug=debug or "",
             )
             self._stop(4)
         elif message.type == Gst.MessageType.WARNING:

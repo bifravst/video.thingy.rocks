@@ -40,6 +40,31 @@ export const hasGstElements = (elements: string[]): boolean =>
 		{ timeout: 30_000 },
 	).status === 0
 
+/**
+ * Fails if the helper wrote its key anywhere the parent reads.
+ *
+ * The helper's rule is that the key reaches no emitted line, and its stderr is logged
+ * by the parent verbatim - so either stream carrying it would put the key in the
+ * application log. Checked on every stop, which makes each test that drives the helper
+ * through a failure path a leak test for that path too. Both cases, since caps print
+ * buffers in lower case and nothing guarantees every writer does.
+ */
+const assertKeyNotWritten = (
+	key: string,
+	stdout: string,
+	stderr: string,
+): void => {
+	for (const [stream, text] of [
+		['stdout', stdout],
+		['stderr', stderr],
+	] as const) {
+		const lower = text.toLowerCase()
+		if (lower.includes(key.toLowerCase())) {
+			throw new Error(`the SRTP helper wrote its key to ${stream}`)
+		}
+	}
+}
+
 export type Helper = {
 	child: ChildProcessWithoutNullStreams
 	messages: SrtpHelperMessage[]
@@ -81,8 +106,10 @@ export const startHelper = async (options: {
 
 	const protocol = new SrtpHelperProtocol()
 	const messages: SrtpHelperMessage[] = []
+	let stdout = ''
 	child.stdout.setEncoding('utf8')
 	child.stdout.on('data', (chunk: string) => {
+		stdout += chunk
 		messages.push(...protocol.push(chunk))
 	})
 	let stderr = ''
@@ -134,20 +161,22 @@ export const startHelper = async (options: {
 			socket.close()
 			// Already gone: 'exit' has fired and will not fire again, so waiting for it
 			// would just burn the timeout.
-			if (child.exitCode !== null || child.signalCode !== null) {
-				return child.exitCode
-			}
-			child.kill('SIGTERM')
-			return new Promise<number | null>((resolve) => {
-				const timer = setTimeout(() => {
-					child.kill('SIGKILL')
-					resolve(child.exitCode)
-				}, 8000)
-				child.once('exit', (code) => {
-					clearTimeout(timer)
-					resolve(code)
-				})
-			})
+			const code =
+				child.exitCode !== null || child.signalCode !== null
+					? child.exitCode
+					: await new Promise<number | null>((resolve) => {
+							child.kill('SIGTERM')
+							const timer = setTimeout(() => {
+								child.kill('SIGKILL')
+								resolve(child.exitCode)
+							}, 8000)
+							child.once('exit', (exitCode) => {
+								clearTimeout(timer)
+								resolve(exitCode)
+							})
+						})
+			assertKeyNotWritten(options.key, stdout, stderr)
+			return code
 		},
 		stderr: () => stderr,
 	}
