@@ -432,6 +432,22 @@ export class SrtpProducer implements ExitingProducer {
 				})
 				return
 			case 'stats':
+				// Logged only until something authenticates, which is when an operator
+				// needs them - the troubleshooting guide reads "inputs climbing with
+				// authenticated at 0" off these lines, and until now they were dropped
+				// here, so that advice pointed at nothing. Afterwards they are routine and
+				// stay out of the log, so a healthy stream adds nothing to it. Bounded
+				// either way: an unauthenticated port holds its slot for one provisional
+				// window at a time.
+				if (session.confirmedRoc === undefined) {
+					this.logger.info('SRTP pipeline stats', {
+						port,
+						inputs: message.inputs,
+						authenticated: message.authenticated,
+						drops: message.drops,
+					})
+				}
+				return
 			case 'searching':
 			case 'eos':
 				return

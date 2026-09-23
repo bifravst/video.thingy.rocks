@@ -196,9 +196,14 @@ downstream, and GStreamer logs caps at those levels.
 
 - **No fragments, and no `SRTP traffic authenticated` in the log.** Key, cipher
   suite, or SSRC mismatch between the sender and the provisioned parameter. The
-  `stats` lines distinguish the cases: `inputs` climbing with `authenticated` at
-  0 and `drops` climbing means datagrams are arriving and failing
-  authentication; `inputs` at 0 means nothing is arriving at all.
+  `SRTP pipeline stats` lines distinguish the cases: `inputs` climbing with
+  `authenticated` at 0 and `drops` climbing means datagrams are arriving and
+  failing authentication; `inputs` at 0 means nothing is arriving at all. They
+  are logged only until a port's traffic first authenticates, so a healthy
+  stream does not produce them. An SSRC mismatch produces none either: until a
+  port is claimed, datagrams for any other SSRC are dropped before a pipeline is
+  started for them, so no stats lines at all, with traffic arriving, points at
+  the SSRC.
 - **`No SRTP key configured for port`.** The parameter
   `/{stackName}/srtp/port/{port}/key` is missing, is not a `SecureString`, is
   not valid JSON, or its key is not 60 hex characters. Re-run

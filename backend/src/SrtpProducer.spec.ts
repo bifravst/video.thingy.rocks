@@ -17,10 +17,14 @@ const delay = async (ms: number): Promise<void> =>
 	new Promise((resolve) => setTimeout(resolve, ms))
 
 class CapturingLogger extends Logger {
+	readonly infos: { message: string; context?: LogContext }[] = []
 	readonly warnings: { message: string; context?: LogContext }[] = []
 	readonly errors: { message: string; context?: LogContext }[] = []
 	constructor() {
 		super('SrtpProducerSpec')
+	}
+	override info(message: string, context?: LogContext): void {
+		this.infos.push({ message, context })
 	}
 	override warn(message: string, context?: LogContext): void {
 		this.warnings.push({ message, context })
@@ -272,6 +276,57 @@ void describe('SrtpProducer', () => {
 			} finally {
 				await producer.stop(PORT)
 				relay.close()
+			}
+		})
+	})
+
+	/**
+	 * The helper's stats, where an operator can read them.
+	 *
+	 * The troubleshooting guide tells an operator whose stream never authenticates to
+	 * read "inputs climbing with authenticated at 0" off these lines. They were being
+	 * dropped, so that advice pointed at nothing; they are now logged until something
+	 * authenticates, and not after, so a healthy stream adds nothing to the log.
+	 */
+	void describe('stats', () => {
+		const stats = (helper: HelperFake): void => {
+			helper.stdout.write(
+				`${JSON.stringify({ t: 'stats', inputs: 12, authenticated: 0, aus: 0, roc: null, drops: 12 })}\n`,
+			)
+		}
+		const logged = (logger: CapturingLogger) =>
+			logger.infos.filter((i) => i.message === 'SRTP pipeline stats')
+
+		void it('logs them while nothing has authenticated', async () => {
+			const { producer, helper, logger } = await start()
+			try {
+				stats(helper)
+				await delay(20)
+				assert.deepStrictEqual(
+					logged(logger).map((i) => [
+						i.context?.inputs,
+						i.context?.authenticated,
+						i.context?.drops,
+					]),
+					[[12, 0, 12]],
+				)
+			} finally {
+				await producer.stop(PORT)
+			}
+		})
+
+		void it('stops logging them once traffic has authenticated', async () => {
+			const { producer, helper, logger } = await start()
+			try {
+				helper.stdout.write(
+					`${JSON.stringify({ t: 'auth', status: 'ok', first: true, roc: 0, trials: 1 })}\n`,
+				)
+				await delay(20)
+				stats(helper)
+				await delay(20)
+				assert.deepStrictEqual(logged(logger), [])
+			} finally {
+				await producer.stop(PORT)
 			}
 		})
 	})
