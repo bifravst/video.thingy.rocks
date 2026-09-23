@@ -5,6 +5,7 @@ Usage:
     printf '%s\\n' "$KEY" | ./scripts/stream-testsrc-to-srtp.py <host> <port> [--ssrc N]
     ./scripts/stream-testsrc-to-srtp.py <host> <port> --key-file key.txt [--ssrc N]
     ./scripts/stream-testsrc-to-srtp.py <host> <port> [--ssrc N]    # prompts, no echo
+    ./scripts/stream-testsrc-to-srtp.py --check    # can this machine run it?
 
 <port> is an SRTP ingest port (6000-6009) and --ssrc the SSRC provisioned for it,
 3735928559 by default. The key is the 60 hex characters provisioned for the port with
@@ -33,7 +34,7 @@ import os
 import re
 import signal
 import sys
-from typing import NoReturn
+from typing import Any, NoReturn
 
 #: Anything this long and hexadecimal in argv would be key material. The receiver's
 #: check_environment in backend/src/srtp_pipeline.py applies the same rule.
@@ -53,16 +54,26 @@ DEFAULT_SSRC = "3735928559"
 #: How long a clean end of stream gets after Ctrl+C before the pipeline is torn down.
 EOS_GRACE_MS = 3000
 
-#: Elements the pipeline needs, and where each one ships, since they are split across
-#: three plugin packages and a missing one otherwise fails as an opaque link error.
+#: Elements the pipeline needs, and the Ubuntu/Debian package each one ships in. They
+#: are spread across four plugin packages, and a missing one otherwise fails as an
+#: opaque link error. This table is the one list of what the sender needs: --check
+#: reports against it, and the guide's install command is checked against it, because
+#: a second copy of the list in the guide is how the two came to disagree.
 REQUIRED_ELEMENTS = {
-    "videotestsrc": "gst-plugins-base (Ubuntu/Debian: gstreamer1.0-plugins-base)",
-    "videoconvert": "gst-plugins-base (Ubuntu/Debian: gstreamer1.0-plugins-base)",
-    "x264enc": "gst-plugins-ugly (Ubuntu/Debian: gstreamer1.0-plugins-ugly)",
-    "rtph264pay": "gst-plugins-good (Ubuntu/Debian: gstreamer1.0-plugins-good)",
-    "srtpenc": "gst-plugins-bad (Ubuntu/Debian: gstreamer1.0-plugins-bad)",
-    "udpsink": "gst-plugins-good (Ubuntu/Debian: gstreamer1.0-plugins-good)",
+    "videotestsrc": "gstreamer1.0-plugins-base",
+    "videoconvert": "gstreamer1.0-plugins-base",
+    "x264enc": "gstreamer1.0-plugins-ugly",
+    "rtph264pay": "gstreamer1.0-plugins-good",
+    "srtpenc": "gstreamer1.0-plugins-bad",
+    "udpsink": "gstreamer1.0-plugins-good",
 }
+#: What the GStreamer Python bindings themselves come in.
+BINDINGS_PACKAGES = ("python3-gi", "gir1.2-gstreamer-1.0")
+
+
+def required_packages() -> list[str]:
+    """Every package the sender needs, bindings first, each once."""
+    return [*BINDINGS_PACKAGES, *dict.fromkeys(REQUIRED_ELEMENTS.values())]
 
 
 def fail(message: str, code: int = 2) -> NoReturn:
@@ -135,22 +146,58 @@ def read_key(key_file: str | None) -> str:
     return key
 
 
+def load_gstreamer() -> Any:
+    """The Gst module, initialised - or a failure naming what to install."""
+    try:
+        import gi
+
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+    except (ImportError, ValueError):
+        fail(
+            "the GStreamer Python bindings are not installed "
+            f"(Ubuntu/Debian: {' '.join(BINDINGS_PACKAGES)})",
+            1,
+        )
+    Gst.init(None)
+    return Gst
+
+
+def missing_elements(gst: Any) -> dict[str, str]:
+    """The required elements this machine lacks, each with the package it ships in."""
+    return {
+        element: package
+        for element, package in REQUIRED_ELEMENTS.items()
+        if gst.ElementFactory.find(element) is None
+    }
+
+
+def check() -> int:
+    """--check: whether this machine can run the sender, and what to install if not."""
+    missing = missing_elements(load_gstreamer())
+    if not missing:
+        print("ok")
+        return 0
+    for element, package in missing.items():
+        print(f"missing: {element} (ships in {package})")
+    print(f"install with: sudo apt install {' '.join(dict.fromkeys(missing.values()))}")
+    return 1
+
+
 def main(argv: list[str]) -> int:
     check_environment(argv)
+    if argv == ["--check"]:
+        return check()
     args = parse_args(argv)
     key = read_key(args.key_file)
 
     # Imported only now, so that every refusal above works on a machine without the
     # GStreamer bindings installed.
-    import gi
+    Gst = load_gstreamer()
+    from gi.repository import GLib
 
-    gi.require_version("Gst", "1.0")
-    from gi.repository import GLib, Gst
-
-    Gst.init(None)
-    for element, package in REQUIRED_ELEMENTS.items():
-        if Gst.ElementFactory.find(element) is None:
-            fail(f"GStreamer element '{element}' not found (ships in {package})", 1)
+    for element, package in missing_elements(Gst).items():
+        fail(f"GStreamer element '{element}' not found (ships in {package})", 1)
 
     # Built without any of the caller's input. Host, port and SSRC are set as
     # properties below rather than interpolated here, so nothing typed on the command

@@ -187,6 +187,126 @@ void describe('stream-testsrc-to-srtp.py', () => {
 	})
 
 	/**
+	 * What the sender needs, stated once.
+	 *
+	 * The guide used to carry its own list - an install command missing two of the
+	 * four plugin packages, and a probe checking three of the six elements, which
+	 * printed "ok" on a machine the sender would then refuse to run on. Both drifted
+	 * from the script in the commit that wrote them. The guide now defers to the
+	 * script: its probe is the sender's own --check, and its install command is
+	 * compared with the packages the script names.
+	 */
+	void describe('its prerequisites', () => {
+		const guide = readFileSync('docs/TESTING-SRTP-INGESTION.md', 'utf8')
+		const bindings = hasGstElements([])
+			? false
+			: 'requires python3 GStreamer bindings'
+
+		/** The packages the sender says it needs, read from the script itself. */
+		const requiredPackages = (): string[] =>
+			JSON.parse(
+				spawnSync(
+					'python3',
+					[
+						'-c',
+						'import json, runpy, sys\n' +
+							"print(json.dumps(runpy.run_path(sys.argv[1], run_name='packages')['required_packages']()))",
+						SENDER,
+					],
+					{ encoding: 'utf8', timeout: 30_000 },
+				).stdout,
+			) as string[]
+
+		void it('has an install command in the guide naming every package it needs', () => {
+			const install = guide
+				.split('\n')
+				.find((line) => line.trim().startsWith('sudo apt install'))
+			assert.ok(
+				install !== undefined,
+				'the guide should give an install command',
+			)
+			const listed = install.trim().split(/\s+/).slice(3)
+			const needed = requiredPackages()
+			assert.ok(needed.length > 0)
+			assert.deepStrictEqual(
+				needed.filter((pkg) => !listed.includes(pkg)),
+				[],
+				`the guide's install command is missing packages the sender needs: ${install}`,
+			)
+		})
+
+		void it('is checked in the guide with its own --check, not a separate list', () => {
+			assert.ok(guide.includes('./scripts/stream-testsrc-to-srtp.py --check'))
+		})
+
+		void it(
+			'passes --check on a machine with everything installed',
+			{
+				skip: hasGstElements([
+					'videotestsrc',
+					'videoconvert',
+					'x264enc',
+					'rtph264pay',
+					'srtpenc',
+					'udpsink',
+				])
+					? false
+					: 'requires every element the sender uses',
+			},
+			() => {
+				const result = spawnSync('python3', [SENDER, '--check'], {
+					encoding: 'utf8',
+					timeout: 30_000,
+				})
+				assert.strictEqual(result.status, 0, result.stdout + result.stderr)
+				assert.strictEqual(result.stdout.trim(), 'ok')
+			},
+		)
+
+		// The case --check exists for: a machine missing plugins. Simulated by pointing
+		// GStreamer at an empty plugin path and a fresh registry.
+		void it(
+			'names every missing element and its package',
+			{ skip: bindings },
+			() => {
+				const registry = mkdtempSync(join(tmpdir(), 'gst-registry-'))
+				try {
+					const result = spawnSync('python3', [SENDER, '--check'], {
+						encoding: 'utf8',
+						timeout: 30_000,
+						env: {
+							...process.env,
+							GST_PLUGIN_SYSTEM_PATH_1_0: join(registry, 'none'),
+							GST_PLUGIN_PATH_1_0: join(registry, 'none'),
+							GST_REGISTRY_1_0: join(registry, 'registry.bin'),
+						},
+					})
+					assert.strictEqual(result.status, 1)
+					for (const element of [
+						'videotestsrc',
+						'videoconvert',
+						'x264enc',
+						'rtph264pay',
+						'srtpenc',
+						'udpsink',
+					]) {
+						assert.match(
+							result.stdout,
+							new RegExp(`missing: ${element} \\(ships in `),
+						)
+					}
+					assert.match(
+						result.stdout,
+						/install with: sudo apt install .*gstreamer1\.0-plugins-good/,
+					)
+				} finally {
+					rmSync(registry, { recursive: true, force: true })
+				}
+			},
+		)
+	})
+
+	/**
 	 * Against the real receiver, with real libsrtp on both ends.
 	 *
 	 * The point of this rewrite is a property of the running process, so it is

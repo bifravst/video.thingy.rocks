@@ -11,17 +11,23 @@ shares its fleet, load balancer and lock table.
   needs no migration, no cutover and no deploy-time context.
 - At least one SRTP port provisioned with a key (below). **One is enough** -
   ports are independent, and an unprovisioned port simply drops its traffic.
-- For the test sender: Python 3 with the GStreamer bindings, plus
-  `gst-plugins-bad` (for `srtpenc`) **and** `gst-plugins-ugly` (for `x264enc`).
-  The sender is a small GStreamer application rather than a `gst-launch-1.0`
-  command line, for the same reason the receiver is - see section 3 - so the
-  command-line tools alone are not enough. On Ubuntu/Debian that is
-  `python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly`.
-  This checks the lot, through the bindings the sender actually uses:
+- For the test sender: Python 3 with the GStreamer bindings, and the plugins its
+  pipeline uses - `gst-plugins-base` (`videotestsrc`, `videoconvert`),
+  `gst-plugins-good` (`rtph264pay`, `udpsink`), `gst-plugins-bad` (`srtpenc`)
+  **and** `gst-plugins-ugly` (`x264enc`). The sender is a small GStreamer
+  application rather than a `gst-launch-1.0` command line, for the same reason
+  the receiver is - see section 3 - so the command-line tools alone are not
+  enough. On Ubuntu/Debian:
 
   ```bash
-  python3 -c "import gi; gi.require_version('Gst', '1.0'); from gi.repository import Gst; Gst.init(None); \
-    print([e for e in ('srtpenc', 'x264enc', 'rtph264pay') if not Gst.ElementFactory.find(e)] or 'ok')"
+  sudo apt install python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly
+  ```
+
+  Then ask the sender itself, which checks against the same element list it runs
+  with and names the package for anything missing:
+
+  ```bash
+  ./scripts/stream-testsrc-to-srtp.py --check
   ```
 
 ## How it works
