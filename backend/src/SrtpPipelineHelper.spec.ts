@@ -1,152 +1,26 @@
 import assert from 'node:assert/strict'
-import {
-	spawn,
-	spawnSync,
-	type ChildProcessWithoutNullStreams,
-} from 'node:child_process'
-import dgram from 'node:dgram'
+import { spawnSync } from 'node:child_process'
 import { describe, it } from 'node:test'
 
+import type { SrtpHelperMessage } from './SrtpHelperProtocol.ts'
 import {
-	SrtpHelperProtocol,
-	type SrtpHelperMessage,
-} from './SrtpHelperProtocol.ts'
+	HELPER,
+	hasGstElements,
+	startHelper as startHelperFor,
+	type Helper,
+} from './testing/srtpHelper.ts'
 import { h264Payload, srtpPacket } from './testing/srtpSender.ts'
 
-const HELPER = 'backend/src/srtp_pipeline.py'
 const KEY = '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d'
 const SSRC = 42
 
-/**
- * The helper needs the GStreamer Python bindings and the srtp plugin, which are not
- * present everywhere. Skip rather than fail where they are missing, so this suite can
- * run in the same command as the pure unit tests.
- */
-const capability = spawnSync(
-	'python3',
-	[
-		'-c',
-		"import gi; gi.require_version('Gst','1.0')\n" +
-			'from gi.repository import Gst\n' +
-			'Gst.init(None)\n' +
-			"raise SystemExit(0 if Gst.ElementFactory.find('srtpdec') else 1)",
-	],
-	{ timeout: 30_000 },
-)
-const available = capability.status === 0
-const skip = available
+const skip = hasGstElements(['srtpdec'])
 	? false
 	: 'requires python3 GStreamer bindings with the srtp plugin'
 
-type Helper = {
-	child: ChildProcessWithoutNullStreams
-	messages: SrtpHelperMessage[]
-	relayPort: number
-	send: (packet: Buffer) => void
-	waitFor: (
-		predicate: (m: SrtpHelperMessage) => boolean,
-		timeoutMs?: number,
-	) => Promise<SrtpHelperMessage>
-	stop: () => Promise<number | null>
-	stderr: () => string
-}
-
 const startHelper = async (
 	options: { rocHint?: number; extraArgs?: string[] } = {},
-): Promise<Helper> => {
-	const child = spawn(
-		'python3',
-		[
-			HELPER,
-			'--ssrc',
-			String(SSRC),
-			'--fake-sink',
-			'--stats-interval-ms',
-			'250',
-			'--auth-loss-ms',
-			'100000',
-			'--trial-drops',
-			'4',
-			'--trial-timeout-ms',
-			'400',
-			...(options.extraArgs ?? []),
-		],
-		{ stdio: ['pipe', 'pipe', 'pipe'] },
-	)
-
-	const protocol = new SrtpHelperProtocol()
-	const messages: SrtpHelperMessage[] = []
-	child.stdout.setEncoding('utf8')
-	child.stdout.on('data', (chunk: string) => {
-		messages.push(...protocol.push(chunk))
-	})
-	let stderr = ''
-	child.stderr.setEncoding('utf8')
-	child.stderr.on('data', (chunk: string) => {
-		stderr += chunk
-	})
-
-	const waitFor = async (
-		predicate: (m: SrtpHelperMessage) => boolean,
-		timeoutMs = 10_000,
-	): Promise<SrtpHelperMessage> => {
-		const deadline = Date.now() + timeoutMs
-		for (;;) {
-			const found = messages.find(predicate)
-			if (found !== undefined) return found
-			if (Date.now() > deadline) {
-				throw new Error(
-					`timed out; messages so far: ${JSON.stringify(messages)}\nstderr: ${stderr}`,
-				)
-			}
-			await new Promise((resolve) => setTimeout(resolve, 20))
-		}
-	}
-
-	child.stdin.write(
-		`${JSON.stringify({
-			type: 'init',
-			v: 1,
-			key: KEY,
-			ssrc: SSRC,
-			cipher: 'aes-128-icm',
-			auth: 'hmac-sha1-80',
-			...(options.rocHint === undefined ? {} : { rocHint: options.rocHint }),
-		})}\n`,
-	)
-
-	const ready = await waitFor((m) => m.t === 'ready')
-	const relayPort = ready.t === 'ready' ? ready.relayPort : 0
-	const socket = dgram.createSocket('udp4')
-
-	return {
-		child,
-		messages,
-		relayPort,
-		send: (packet) => socket.send(packet, relayPort, '127.0.0.1'),
-		waitFor,
-		stop: async () => {
-			socket.close()
-			// Already gone: 'exit' has fired and will not fire again, so waiting for it
-			// would just burn the timeout.
-			if (child.exitCode !== null || child.signalCode !== null) {
-				return child.exitCode
-			}
-			child.kill('SIGTERM')
-			return new Promise<number | null>((resolve) => {
-				const timer = setTimeout(() => {
-					child.kill('SIGKILL')
-					resolve(child.exitCode)
-				}, 8000)
-				child.once('exit', (code) => {
-					clearTimeout(timer)
-					resolve(code)
-				})
-			})
-		},
-		stderr: () => stderr,
-	}
-}
+): Promise<Helper> => startHelperFor({ key: KEY, ssrc: SSRC, ...options })
 
 const packetAt = (roc: number, seq: number): Buffer =>
 	srtpPacket({ keyHex: KEY, ssrc: SSRC, seq, roc, payload: h264Payload() })
