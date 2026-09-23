@@ -256,6 +256,15 @@ class Counters:
         #: candidate libsrtp was given, then advanced by authenticated packets.
         self.roc = 0
         self.roc_changed = False
+        #: The candidate srtpdec was last handed in request-key - the key it actually
+        #: holds - and how many packets have authenticated under it. Both are written
+        #: on the streaming thread, which is where request-key and the authentication
+        #: probe run, one packet after another. Crediting authentication here rather
+        #: than against a baseline the supervisor snapshots is what makes it exact: a
+        #: snapshot taken from the other thread always leaves a gap on one side of the
+        #: candidate switch or the other, and each side has been a bug.
+        self.key_candidate: int | None = None
+        self.key_authenticated = 0
         #: Datagrams for some other SSRC since the last report. Counted rather than
         #: reported one by one: the SSRC is in the clear, anyone who can reach the port
         #: picks it, and a report per datagram would let them write to the logs at
@@ -278,10 +287,6 @@ class SrtpPipeline:
         self.trial_started_ms = 0
         self.trial_inputs0 = 0
         self.trial_drops0 = 0
-        #: Authenticated count when this trial began. The count is cumulative across
-        #: trials, so only the difference says anything about the current candidate -
-        #: comparing the total against zero credits one candidate with another's work.
-        self.trial_auth0 = 0
         self.counters = Counters()
         self.confirmed = False
         self.loop = GLib.MainLoop()
@@ -375,9 +380,15 @@ class SrtpPipeline:
                         seq = (mapped.data[2] << 8) | mapped.data[3]
                 finally:
                     buffer.unmap(mapped)
+        self._record_authenticated(seq)
+        return Gst.PadProbeReturn.OK
+
+    def _record_authenticated(self, seq: int | None) -> None:
+        """Counts one packet libsrtp authenticated, under the key srtpdec holds."""
         with self.counters.lock:
             c = self.counters
             c.authenticated += 1
+            c.key_authenticated += 1
             c.last_auth_ms = now_ms()
             if seq is not None:
                 if c.highest_seq is None:
@@ -387,7 +398,6 @@ class SrtpPipeline:
                     if roc != c.roc:
                         c.roc = roc
                         c.roc_changed = True
-        return Gst.PadProbeReturn.OK
 
     def _on_access_unit(
         self, _pad: Gst.Pad, _info: Gst.PadProbeInfo
@@ -405,15 +415,28 @@ class SrtpPipeline:
             with self.counters.lock:
                 self.counters.foreign_ssrc += 1
             return None
-        self.key_requests += 1
-        emit(t="searching", candidate=self.candidate, trial=self.key_requests - 1)
-        # libsrtp is about to start counting from this candidate, so the tracker has to
-        # start from it too: the caps below say roc=candidate, and a request means there
-        # is no rollover or replay state left from any earlier attempt.
         with self.counters.lock:
-            self.counters.roc = self.candidate
-            self.counters.highest_seq = None
-            self.counters.roc_changed = False
+            c = self.counters
+            if c.key_candidate is not None and c.key_authenticated > 0:
+                # The key srtpdec held has authenticated traffic, so it is asking again
+                # only because the search stepped on and removed it - after the packet
+                # that proved it right was already on its way. That key was the
+                # answer: hand it back, with its credit, rather than the candidate the
+                # search moved to in the meantime.
+                self.candidate = c.key_candidate
+            else:
+                c.key_candidate = self.candidate
+                c.key_authenticated = 0
+            candidate = self.candidate
+            # libsrtp is about to start counting from this candidate, so the tracker
+            # has to start from it too: the caps below say roc=candidate, and a
+            # request means there is no rollover or replay state left from any
+            # earlier attempt.
+            c.roc = candidate
+            c.highest_seq = None
+            c.roc_changed = False
+        self.key_requests += 1
+        emit(t="searching", candidate=candidate, trial=self.key_requests - 1)
         # Built as a caps string in process. The key is in this string and nowhere
         # else: not in argv, not in the environment, not in any emitted line.
         return Gst.Caps.from_string(
@@ -423,7 +446,7 @@ class SrtpPipeline:
             f",srtp-auth=(string){self.auth}"
             f",srtcp-cipher=(string){self.cipher}"
             f",srtcp-auth=(string){self.auth}"
-            f",roc=(uint){self.candidate}"
+            f",roc=(uint){candidate}"
         )
 
     # -- bus and signals --------------------------------------------------------
@@ -545,25 +568,26 @@ class SrtpPipeline:
         if self.shutting_down:
             return True
         with self.counters.lock:
-            authenticated = self.counters.authenticated
-            roc = self.counters.roc
-            roc_changed = self.counters.roc_changed
-            highest_seq = self.counters.highest_seq
-            last_auth_ms = self.counters.last_auth_ms
-            self.counters.roc_changed = False
+            c = self.counters
+            # What authenticated under the key srtpdec holds - credited as it happened,
+            # on the streaming thread, rather than inferred from a snapshot of a
+            # running total taken here.
+            authenticated = c.key_authenticated
+            if authenticated > 0 and not self.confirmed and c.key_candidate is not None:
+                # That key is the answer whatever the search has stepped to since, so
+                # it is the one reported, and the one request-key hands out again.
+                self.candidate = c.key_candidate
+            roc = c.roc
+            roc_changed = c.roc_changed
+            highest_seq = c.highest_seq
+            last_auth_ms = c.last_auth_ms
+            c.roc_changed = False
 
-        # Only what authenticated under the candidate now being tried. The counter is
-        # cumulative, so testing the total against zero lets a packet that
-        # authenticated under the *previous* candidate - in the window between this
-        # snapshot and the key being removed - confirm the one that replaced it, and
-        # the reported roc is then the new candidate, which authenticated nothing.
-        authenticated_this_trial = authenticated - self.trial_auth0
-
-        if authenticated_this_trial == 0 and not self.confirmed:
+        if authenticated == 0 and not self.confirmed:
             self._advance_search_if_tried()
             return True
 
-        if authenticated_this_trial > 0 and not self.confirmed:
+        if authenticated > 0 and not self.confirmed:
             self.confirmed = True
             # The counter is only ever reported once libsrtp authenticated traffic
             # under the candidate it was seeded from, which is what makes the value
@@ -578,7 +602,7 @@ class SrtpPipeline:
                 seq=highest_seq,
                 candidate=self.candidate,
                 trials=self.key_requests,
-                authenticated=authenticated_this_trial,
+                authenticated=authenticated,
             )
         elif self.confirmed and roc_changed:
             emit(t="auth", status="ok", first=False, roc=roc, seq=highest_seq)
@@ -597,10 +621,16 @@ class SrtpPipeline:
         return True
 
     def _begin_trial(self) -> None:
-        """Snapshots the counters this trial will be judged against."""
+        """Snapshots what decides whether this trial was actually tried.
+
+        Only that. Whether a candidate authenticated is not judged from a snapshot at
+        all - see Counters.key_candidate - because this runs after the new key is
+        live, and a baseline taken here absorbed any packet that authenticated under
+        it first. Inputs and drops miscounted by a packet or two only move the moment
+        a trial is deemed tried, which is harmless.
+        """
         with self.counters.lock:
             self.trial_inputs0 = self.counters.inputs
-            self.trial_auth0 = self.counters.authenticated
         self.trial_drops0 = self._drop_count()
         self.trial_started_ms = now_ms()
 
@@ -610,18 +640,9 @@ class SrtpPipeline:
         Stepping on a timer alone would burn through the candidate list whenever a
         port is simply idle, so the trial ends only when datagrams were rejected
         under this candidate, or when datagrams arrived and the trial timed out.
-
-        The authenticated count is re-read here rather than taken from the caller's
-        snapshot: the caller released the lock before calling, and a packet that
-        authenticates in that window means this candidate is the right one. Discarding
-        it then would throw away the answer just as it arrived, and cost a full search
-        to find it again.
         """
         with self.counters.lock:
             inputs = self.counters.inputs
-            authenticated = self.counters.authenticated
-        if authenticated > self.trial_auth0:
-            return
         tried_inputs = inputs - self.trial_inputs0
         tried_drops = self._drop_count() - self.trial_drops0
         timed_out = now_ms() - self.trial_started_ms > self.args.trial_timeout_ms
@@ -629,19 +650,34 @@ class SrtpPipeline:
         if tried_drops < self.args.trial_drops and not (tried_inputs > 0 and timed_out):
             return
 
+        with self.counters.lock:
+            # The last look and the switch happen together, under the lock that
+            # request-key and the authentication probe take. A packet that
+            # authenticated since the caller looked means the key srtpdec holds is the
+            # answer, and stepping past it would throw that away.
+            if self.counters.key_authenticated > 0:
+                return
+            failed = self.candidate
+            self.trial_index += 1
+            self.candidate = next(self.candidates)
+
         emit(
             t="auth",
             status="fail",
-            candidate=self.candidate,
+            candidate=failed,
             inputs=tried_inputs,
             drops=tried_drops,
         )
-        self.trial_index += 1
-        self.candidate = next(self.candidates)
         if self.dec is not None:
             # Resetting the stream is what lets the next candidate be applied without
             # rebuilding anything: the next datagram re-requests the key, and no
-            # replay-window or rollover state from the failed attempt survives.
+            # replay-window or rollover state from the failed attempt survives. A
+            # packet that authenticates under the old key before this takes effect is
+            # still credited to that key, and request-key then hands it back.
+            #
+            # Not called under the counters lock: srtpdec takes its own lock around
+            # this, and its streaming thread takes ours from inside request-key, so
+            # holding both here could deadlock.
             self.dec.emit("remove-key", self.ssrc)
         self._begin_trial()
 

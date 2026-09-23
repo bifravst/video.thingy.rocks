@@ -340,6 +340,82 @@ void describe('srtp_pipeline.py', { skip }, () => {
 		})
 	})
 
+	/**
+	 * The search across the moment it switches candidate.
+	 *
+	 * The supervisor tick decides when to step on; srtpdec's streaming thread asks for
+	 * keys and authenticates packets. A packet can authenticate on either side of the
+	 * switch, and both sides have been bugs: a baseline snapshotted from the tick
+	 * always leaves a gap on one side or the other. Authentication is now credited to
+	 * the key srtpdec actually holds.
+	 *
+	 * These orderings cannot be forced from outside a running pipeline, which is why
+	 * this was once shipped as "reasoned rather than tested". They can be forced from
+	 * inside: srtp_pipeline_scenarios.py drives the helper's own methods with a stand-in
+	 * for srtpdec whose remove-key runs the streaming thread's side at the exact point
+	 * in question. Against the previous helper, both switch cases fail.
+	 */
+	void describe('the search across a candidate switch', () => {
+		type Outcome = {
+			confirmed: boolean
+			reportedCandidate: number | null
+			reportedRoc: number | null
+			handedToSrtpdec: number[]
+			searchingAt: number
+		}
+		const outcomes = (): Record<string, Outcome> => {
+			const result = spawnSync(
+				'python3',
+				['backend/src/testing/srtp_pipeline_scenarios.py'],
+				{ encoding: 'utf8', timeout: 30_000 },
+			)
+			assert.strictEqual(result.status, 0, result.stderr)
+			assert.ok(
+				!result.stdout.toLowerCase().includes(KEY),
+				'the scenarios must not print the key',
+			)
+			return JSON.parse(result.stdout) as Record<string, Outcome>
+		}
+		const all = outcomes()
+
+		// Copilot's case: the new candidate authenticates before its trial is set up.
+		void it('credits a new key that authenticates before its trial begins', () => {
+			const o = all.newKeyAuthenticatesBeforeTheTrialBaseline
+			assert.strictEqual(o?.confirmed, true)
+			assert.strictEqual(o.reportedCandidate, 0)
+			assert.strictEqual(o.reportedRoc, 0)
+		})
+
+		// The other side, which the earlier fix claimed and did not hold: the right key
+		// authenticates after the search has decided to leave it.
+		void it('keeps an old key that authenticates after the search stepped on', () => {
+			const o = all.oldKeyAuthenticatesAfterTheSwitch
+			assert.strictEqual(o?.confirmed, true)
+			assert.strictEqual(o.reportedCandidate, 5, 'the key that authenticated')
+			assert.deepStrictEqual(
+				o.handedToSrtpdec,
+				[5, 5],
+				'srtpdec is given that key back, not the candidate stepped to',
+			)
+		})
+
+		void it('confirms a live stream as before', () => {
+			const o = all.liveStream
+			assert.strictEqual(o?.confirmed, true)
+			assert.strictEqual(o.reportedCandidate, 5)
+		})
+
+		void it('never confirms noise, and keeps searching through it', () => {
+			const o = all.nothingAuthenticates
+			assert.strictEqual(o?.confirmed, false)
+			assert.strictEqual(o.reportedCandidate, null)
+			assert.ok(
+				o.handedToSrtpdec.length > 1,
+				`the search has to move: ${JSON.stringify(o.handedToSrtpdec)}`,
+			)
+		})
+	})
+
 	void describe('lifecycle', () => {
 		void it('ends the stream and exits cleanly on SIGTERM', async () => {
 			const helper = await startHelper({ rocHint: 0 })
