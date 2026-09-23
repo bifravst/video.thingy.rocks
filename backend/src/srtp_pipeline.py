@@ -256,6 +256,11 @@ class Counters:
         #: candidate libsrtp was given, then advanced by authenticated packets.
         self.roc = 0
         self.roc_changed = False
+        #: Datagrams for some other SSRC since the last report. Counted rather than
+        #: reported one by one: the SSRC is in the clear, anyone who can reach the port
+        #: picks it, and a report per datagram would let them write to the logs at
+        #: line rate. See _emit_stats.
+        self.foreign_ssrc = 0
 
 
 class SrtpPipeline:
@@ -394,8 +399,11 @@ class SrtpPipeline:
     def _on_request_key(self, _element: Gst.Element, ssrc: int) -> Gst.Caps | None:
         # A datagram carrying someone else's SSRC gets no key, so it cannot even be
         # attempted - and cannot disturb the stream this port is configured for.
+        # srtpdec asks again for every such datagram, so this only counts it; the
+        # count is reported with the stats, at most once an interval.
         if ssrc != self.ssrc:
-            emit(t="warning", element="srtpdec", message=f"ignoring unknown ssrc {ssrc}")
+            with self.counters.lock:
+                self.counters.foreign_ssrc += 1
             return None
         self.key_requests += 1
         emit(t="searching", candidate=self.candidate, trial=self.key_requests - 1)
@@ -660,6 +668,16 @@ class SrtpPipeline:
                 aus=c.access_units,
                 roc=c.roc if self.confirmed else None,
                 drops=self._drop_count(),
+            )
+            foreign, c.foreign_ssrc = c.foreign_ssrc, 0
+        # One line per interval however many there were, so what reaches the logs is
+        # bounded by the clock rather than by whoever is sending. The SSRCs themselves
+        # are left out: they are the sender's choice, and nothing here needs them.
+        if foreign > 0:
+            emit(
+                t="warning",
+                element="srtpdec",
+                message=f"ignored {foreign} datagrams for SSRCs other than {self.ssrc}",
             )
         return True
 

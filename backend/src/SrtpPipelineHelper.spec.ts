@@ -265,6 +265,61 @@ void describe('srtp_pipeline.py', { skip }, () => {
 			}
 		})
 
+		/**
+		 * Other SSRCs are counted, not reported one by one.
+		 *
+		 * The SSRC is in the clear and chosen by whoever sends, and srtpdec asks for a
+		 * key for every datagram of one it does not know - so a line per datagram let
+		 * anyone who could reach the port write to the logs at line rate, varying the
+		 * SSRC or not. Measured before the change: 200 datagrams, 200 lines, whether the
+		 * SSRC was fixed or new each time.
+		 */
+		void it('reports datagrams for other SSRCs as a count per interval', async () => {
+			const helper = await startHelper({ rocHint: 0 })
+			try {
+				const started = Date.now()
+				for (let i = 0; i < 200; i++) {
+					helper.send(
+						srtpPacket({
+							keyHex: KEY,
+							// Fixed for half, new each time for the rest: both used to cost
+							// one line apiece.
+							ssrc: i < 100 ? 99 : 1_000 + i,
+							seq: i,
+							roc: 0,
+							payload: h264Payload(),
+						}),
+					)
+				}
+				// Long enough for the count to be reported.
+				await new Promise((resolve) => setTimeout(resolve, 800))
+				const elapsedIntervals = Math.ceil((Date.now() - started) / 250)
+
+				const reports = helper.messages.filter(
+					(m) => m.t === 'warning' && m.message.includes('SSRCs other than'),
+				)
+				const counted = reports.reduce(
+					(sum, m) =>
+						sum +
+						Number(
+							m.t === 'warning' ? /ignored (\d+)/.exec(m.message)?.[1] : 0,
+						),
+					0,
+				)
+				assert.strictEqual(counted, 200, 'every one is still accounted for')
+				assert.ok(
+					reports.length <= elapsedIntervals + 1,
+					`at most one line per stats interval, not per datagram: got ${String(reports.length)}`,
+				)
+				assert.ok(
+					!reports.some((m) => m.t === 'warning' && /\b99\b/.test(m.message)),
+					'the SSRCs themselves are the sender’s choice and are not repeated',
+				)
+			} finally {
+				await helper.stop()
+			}
+		})
+
 		// Stepping on a timer alone would burn through the candidate list whenever a
 		// port is simply idle.
 		void it('does not step candidates while no traffic arrives', async () => {
