@@ -396,6 +396,28 @@ void describe('SrtpProducer', () => {
 
 		const buffered = [Buffer.from('keyframe'), Buffer.from('rest')]
 
+		/**
+		 * An unusable relay port fails the start, not the process.
+		 *
+		 * dgram.connect throws synchronously for a port it cannot use, and it runs in
+		 * the helper's stdout handler, so the throw is uncaught. Here the test runner
+		 * catches it and fails the test with ERR_SOCKET_BAD_PORT; in the backend
+		 * nothing does, and the process exits - taking the unencrypted path with it.
+		 */
+		for (const relayPort of [0, 1.5, 70000]) {
+			void it(`fails the start when the helper reports relay port ${String(relayPort)}`, async () => {
+				const producer = await startFailing((helper) => {
+					helper.stdout.write(
+						`${JSON.stringify({ t: 'ready', v: SRTP_HELPER_PROTOCOL_VERSION, relayPort })}\n`,
+					)
+				}, buffered)
+				assert.deepStrictEqual(
+					producer.takeUnsentDatagrams(PORT).map((d) => d.toString()),
+					['keyframe', 'rest'],
+				)
+			})
+		}
+
 		void it('hands the buffer back when the helper exits during startup', async () => {
 			const producer = await startFailing((helper) => helper.exit(1), buffered)
 			assert.deepStrictEqual(

@@ -204,6 +204,58 @@ void describe('SrtpHelperProtocol', () => {
 			)
 		})
 
+		/**
+		 * A relay port that cannot be connected to is not a relay port.
+		 *
+		 * SrtpProducer hands it straight to dgram.connect, which throws synchronously
+		 * for anything outside 1-65535 or not an integer - and it does so inside the
+		 * helper's stdout handler, where a throw ends the whole process.
+		 */
+		for (const relayPort of [
+			0,
+			-1,
+			1.5,
+			65536,
+			70000,
+			Number.MAX_SAFE_INTEGER,
+		]) {
+			void it(`rejects a ready frame with relay port ${String(relayPort)}`, () => {
+				assert.strictEqual(
+					parse(line({ t: 'ready', v: 1, relayPort }))[0]?.t,
+					'unparsed',
+				)
+			})
+		}
+
+		void it('accepts the ends of the port range', () => {
+			for (const relayPort of [1, 65535]) {
+				assert.strictEqual(
+					parse(line({ t: 'ready', v: 1, relayPort }))[0]?.t,
+					'ready',
+				)
+			}
+		})
+
+		// A rollover counter is persisted and handed back to the next helper as its
+		// hint, so one that could not be a uint32 must not get that far.
+		for (const roc of [-1, 0.5, 2 ** 32]) {
+			void it(`rejects an authentication at rollover counter ${String(roc)}`, () => {
+				assert.strictEqual(
+					parse(line({ t: 'auth', status: 'ok', first: true, roc }))[0]?.t,
+					'unparsed',
+				)
+			})
+		}
+
+		void it('drops an optional field that is out of range rather than keeping it', () => {
+			const [message] = parse(
+				line({ t: 'auth', status: 'ok', first: true, roc: 3, seq: 70000 }),
+			)
+			assert.ok(message?.t === 'auth' && message.status === 'ok')
+			assert.strictEqual(message.roc, 3)
+			assert.strictEqual(message.seq, undefined)
+		})
+
 		// A version this parser does not understand must not be treated as ready: the
 		// meaning of every later line would be a guess.
 		void it('rejects a ready frame with no version', () => {
