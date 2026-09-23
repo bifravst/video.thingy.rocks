@@ -92,10 +92,20 @@ REGION="${AWS_REGION:-eu-central-1}"
 PARAMETER_NAME="/${STACK_NAME}/srtp/port/${PORT}/key"
 
 # The whole request goes in a file so that neither the key nor the JSON wrapping it
-# appears in the AWS CLI's argument vector. mktemp creates it 0600, and the trap removes
-# it however this script ends - including on the `set -e` path below.
+# appears in the AWS CLI's argument vector. mktemp creates it 0600, and the EXIT trap
+# removes it however the script ends - normally, on the `set -e` path below, or on one
+# of the signals after it.
+#
+# Cleanup belongs to EXIT alone, and the signal traps only exit. A trap on a signal
+# replaces the signal's default action of ending the script, and when the handler
+# returns bash carries on from where it was interrupted - so a signal trap that merely
+# deleted the file let an interrupted run recreate it by plain redirection, with the
+# caller's umask rather than 0600, and then go on to provision the key anyway.
 REQUEST_FILE=$(mktemp "${TMPDIR:-/tmp}/srtp-key-request.XXXXXXXXXX")
-trap 'rm -f "$REQUEST_FILE"' EXIT INT TERM
+trap 'rm -f "$REQUEST_FILE"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # --cli-input-json takes the entire request body, so --value never appears. The inner
 # value is a JSON string containing JSON, hence the escaped quotes; every part of it is
