@@ -502,6 +502,107 @@ void describe('IngestionService with an additive transport', () => {
 		await assert.rejects(async () => service.start(), /EADDRINUSE on 5002/)
 	})
 
+	/**
+	 * A listener that will not close must not stop the rollback releasing locks.
+	 *
+	 * Those come after the listener in shutdown, so a failure there used to skip them
+	 * - and the rollback exists precisely so that a failed start does not leave a lock
+	 * held and a producer writing. An earlier version of the test above asserted only
+	 * the error message, which is why it passed while this was broken.
+	 */
+	void it('still releases what it claimed when the listener will not close', async () => {
+		const listener = new ListenerFake()
+		listener.deliverBeforeFailing = [5000]
+		listener.failOnStart = new Error('EADDRINUSE on 5001')
+		listener.stop = async () => {
+			throw new Error('could not close sockets')
+		}
+		const { service, locks, producer } = build({ listener })
+
+		await assert.rejects(async () => service.start(), /EADDRINUSE on 5001/)
+		await settle()
+
+		assert.deepStrictEqual(
+			locks.order.filter((o) => o.startsWith('acquire')),
+			['acquire:5000'],
+			'the test only means anything if the port really did take a lock',
+		)
+		assert.deepStrictEqual(
+			locks.order.filter((o) => o.startsWith('release')),
+			['release:5000'],
+		)
+		assert.deepStrictEqual((producer as ProducerFake).stoppedPorts, [5000])
+		assert.strictEqual((producer as ProducerFake).shutdownCalls, 1)
+	})
+
+	// Shutdown on a signal takes the same path, with no start failure to report.
+	void it('runs every shutdown step and then reports what failed', async () => {
+		const listener = new ListenerFake()
+		const { service, locks, producer } = build({ listener })
+		await service.start()
+		listener.deliver(5000, Buffer.alloc(10), new Date())
+		await settle()
+		listener.stop = async () => {
+			throw new Error('could not close sockets')
+		}
+
+		await assert.rejects(async () => service.shutdown(), /with failures/)
+
+		assert.deepStrictEqual(
+			locks.order.filter((o) => o.startsWith('release')),
+			['release:5000'],
+		)
+		assert.deepStrictEqual((producer as ProducerFake).stoppedPorts, [5000])
+		assert.strictEqual((producer as ProducerFake).shutdownCalls, 1)
+	})
+
+	/**
+	 * An additive transport that fails part-way must not leave its ports claimed.
+	 *
+	 * Its failure is isolated - the service carries on without it - so unlike the
+	 * primary there is no process exit to end what it claimed. Stopping only its
+	 * listener left a port that took traffic during the failing start holding its lock
+	 * and running its producer until the inactivity timeout noticed.
+	 */
+	void it('releases what a half-bound additive transport claimed', async () => {
+		const srtpListener = new ListenerFake()
+		srtpListener.deliverBeforeFailing = [6000, 6001]
+		srtpListener.failOnStart = new Error('EADDRINUSE on 6002')
+		const srtpProducer = new ProducerFake()
+		const { service, locks, healthServer } = build({
+			extraTransports: [
+				{
+					name: 'srtp',
+					portRange: { start: 6000, end: 6009 },
+					listener: srtpListener,
+					producer: srtpProducer,
+				},
+			],
+		})
+
+		await service.start()
+		await settle()
+
+		assert.deepStrictEqual(
+			locks.order.filter((o) => o.startsWith('acquire')),
+			['acquire:6000', 'acquire:6001'],
+			'the test only means anything if those ports really did take locks',
+		)
+		assert.deepStrictEqual(
+			locks.order.filter((o) => o.startsWith('release')),
+			['release:6000', 'release:6001'],
+		)
+		assert.deepStrictEqual(
+			srtpProducer.stoppedPorts.sort((a, b) => a - b),
+			[6000, 6001],
+		)
+		assert.strictEqual(srtpProducer.shutdownCalls, 1)
+		assert.strictEqual(srtpListener.stopped, true)
+		// And the service itself carries on, which is the point of isolating it.
+		assert.strictEqual((healthServer as HealthFake).started, true)
+		assert.strictEqual(service.stateFor(5000), 'Idle')
+	})
+
 	void it('shuts every transport down', async () => {
 		const srtpListener = new ListenerFake()
 		const { service, listener, srtpProducer } = buildWithSrtp(srtpListener)

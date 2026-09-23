@@ -265,12 +265,7 @@ export class IngestionService {
 					err instanceof Error ? err : new Error(String(err)),
 					{ transport: transport.name },
 				)
-				// Leave nothing half bound behind.
-				try {
-					await transport.listener.stop()
-				} catch {
-					// Nothing more to do.
-				}
+				await this.abandon(transport)
 			}
 		}
 
@@ -305,25 +300,115 @@ export class IngestionService {
 	 * The order matters: closing the health port first takes this instance out of the
 	 * load balancer, and stopping the listener means no new packet can re-arm a port
 	 * that is being torn down.
+	 *
+	 * Every phase runs whatever happened in the ones before it, and only then does a
+	 * failure surface. The phases that matter most come last - releasing locks and
+	 * reaping producers - so a health port or a socket that would not close used to
+	 * skip exactly those, and a failed-start rollback that hit one left the lock held
+	 * and the GStreamer child running: the two-writers case the rollback is for.
 	 */
 	async shutdown(): Promise<void> {
-		await this.options.healthServer.stop()
+		const failures: unknown[] = []
+		const attempt = async (phase: string, work: () => Promise<unknown>) => {
+			try {
+				await work()
+			} catch (err) {
+				failures.push(err)
+				this.logger.error(
+					'Shutdown step failed; carrying on with the rest',
+					err instanceof Error ? err : new Error(String(err)),
+					{ phase },
+				)
+			}
+		}
+
+		await attempt('health port', async () => this.options.healthServer.stop())
 		for (const transport of this.options.transports) {
-			await transport.listener.stop()
+			await attempt(`${transport.name} listener`, async () =>
+				transport.listener.stop(),
+			)
 			this.options.traffic?.setServing(transport.name, false)
 		}
 		// Once no listener can add to them, report the counters one last time so the
 		// final period is not lost - and stop first, so the interval cannot race it.
 		this.options.traffic?.stop()
-		await this.options.traffic?.publishNow()
-		this.options.activity.stop()
-		await Promise.all(
-			[...this.machines.values()].map(async (m) => m.shutdown()),
+		await attempt('traffic metrics', async () =>
+			this.options.traffic?.publishNow(),
+		)
+		await attempt('activity tracker', async () => this.options.activity.stop())
+		await attempt('ports', async () =>
+			this.shutDownMachines([...this.machines.values()]),
 		)
 		for (const transport of this.options.transports) {
-			await transport.producer?.shutdown()
+			await attempt(`${transport.name} producer`, async () =>
+				transport.producer?.shutdown(),
+			)
+		}
+
+		if (failures.length > 0) {
+			throw new AggregateError(failures, 'Ingestion stopped with failures')
 		}
 		this.logger.info('Ingestion stopped')
+	}
+
+	/** Shuts every one down, and reports a failure only once all have been tried. */
+	private async shutDownMachines(machines: PortIngestion[]): Promise<void> {
+		const results = await Promise.allSettled(
+			machines.map(async (machine) => machine.shutdown()),
+		)
+		const failed = results.filter(
+			(result): result is PromiseRejectedResult => result.status === 'rejected',
+		)
+		if (failed.length > 0) {
+			throw new AggregateError(
+				failed.map((result): unknown => result.reason),
+				`${String(failed.length)} of ${String(machines.length)} ports did not shut down`,
+			)
+		}
+	}
+
+	/**
+	 * Gives up on an additive transport that failed to start, leaving nothing of it.
+	 *
+	 * Not just its listener. The listener binds its ports one at a time, so a failure
+	 * part-way leaves the earlier ones bound - and they are wired to their machines, so
+	 * a datagram on one can take a lock and start a producer before the failure
+	 * arrives. Stopping only the listener leaves that lock and that producer in place,
+	 * with nothing left to deliver the traffic whose absence would end them sooner
+	 * than the inactivity timeout. The service carries on without this transport, so
+	 * its machines and producer are shut down for good rather than reset.
+	 */
+	private async abandon(transport: IngestionTransport): Promise<void> {
+		const steps: [string, () => Promise<unknown>][] = [
+			['listener', async () => transport.listener.stop()],
+			[
+				'ports',
+				async () => {
+					const machines: PortIngestion[] = []
+					for (
+						let port = transport.portRange.start;
+						port <= transport.portRange.end;
+						port++
+					) {
+						const machine = this.machines.get(port)
+						if (machine !== undefined) machines.push(machine)
+					}
+					await this.shutDownMachines(machines)
+				},
+			],
+			['producer', async () => transport.producer?.shutdown()],
+		]
+		for (const [step, work] of steps) {
+			try {
+				await work()
+			} catch (err) {
+				this.logger.error(
+					'Could not fully abandon an additive transport',
+					err instanceof Error ? err : new Error(String(err)),
+					{ transport: transport.name, step },
+				)
+			}
+		}
 	}
 }
 
