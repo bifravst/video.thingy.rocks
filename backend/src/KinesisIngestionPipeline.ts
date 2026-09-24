@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import * as fs from 'node:fs'
+import * as net from 'node:net'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import type { Writable } from 'node:stream'
@@ -27,8 +28,11 @@ export type KinesisIngestionPipelineConfig = {
 	stopDrainMs?: number
 	/** How long SIGTERM gets before SIGKILL follows it; see stop(). */
 	stopSigkillAfterMs?: number
-	/** How long GStreamer gets to open its input before the start fails; see openInput. */
-	inputOpenTimeoutMs?: number
+	/**
+	 * How long GStreamer gets to open its input and take the initial data before the
+	 * start fails; see openInput.
+	 */
+	inputTimeoutMs?: number
 	/** Replaces child_process.spawn, so tests can stand in for GStreamer. */
 	spawn?: typeof spawn
 }
@@ -68,14 +72,18 @@ const STOP_DRAIN_MS = 15_000
 /** How long SIGTERM gets to end the stream cleanly before SIGKILL follows it. */
 const STOP_SIGKILL_AFTER_MS = 8_000
 /**
- * How long GStreamer gets to open its input once spawned.
+ * How long GStreamer gets, once spawned, to open its input and take the initial data.
  *
  * Generous, because it is not just process start: a pipeline changes state from its
  * sink upwards, so kvssink sets itself up - its Kinesis Video client included - before
- * filesrc opens the FIFO. It only has to be finite, so that a child stuck short of
- * opening its input cannot hold the port, its lock and a threadpool thread for good.
+ * filesrc opens the FIFO, and the initial data is the whole startup buffer, megabytes
+ * against a pipe that holds 64 KiB. It only has to be finite, so that a child that
+ * never opens its input, or opens it and stops reading, cannot hold the port and its
+ * lock for good.
  */
-const INPUT_OPEN_TIMEOUT_MS = 30_000
+const INPUT_TIMEOUT_MS = 30_000
+/** How often the FIFO is tried while GStreamer has not opened its end yet. */
+const INPUT_OPEN_POLL_MS = 20
 /** Throttle repeated GStreamer stderr warnings (same category) per port. */
 const GST_STDERR_THROTTLE_MS = 60_000
 /** Throttle noisy stdout (CONTINUITY, KVS 0x30000005, "Could not write to resource") per port. */
@@ -281,7 +289,7 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			process.env.KVS_LOG_CONFIG_PATH ??
 			'/opt/video-streaming/kvs_log_configuration'
 
-		// Use a FIFO so GStreamer reads via filesrc (real path). filesrc blocks until we open for write, so data is ready when it reads; avoids fdsrc "not-linked" / stream error with pipes.
+		// Use a FIFO so GStreamer reads via filesrc (real path). filesrc's open blocks until we open for write, so data is ready when it reads; avoids fdsrc "not-linked" / stream error with pipes.
 		const fifoPath = path.join(
 			os.tmpdir(),
 			`kinesis-${port}-${process.pid}-${Date.now()}.fifo`,
@@ -358,12 +366,12 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		}
 		watch.cancel()
 
-		// A child that died after opening its input - while the initial data was being
-		// written - has already had its exit handled, and handled as expected, because
-		// the port was not registered yet. Registering it now would leave a dead
-		// pipeline counted as running that nothing ever reports. Checked with nothing
-		// awaited between here and the registration, so no exit can fall in between:
-		// from the registration on, the exit handler sees the port and reports it.
+		// A child that died just as its initial data was taken has already had its exit
+		// handled, and handled as expected, because the port was not registered yet.
+		// Registering it now would leave a dead pipeline counted as running that nothing
+		// ever reports. Checked with nothing awaited between here and the registration,
+		// so no exit can fall in between: from the registration on, the exit handler
+		// sees the port and reports it.
 		if (gst.exitCode !== null || gst.signalCode !== null) {
 			inputStream.destroy()
 			try {
@@ -398,17 +406,20 @@ export class KinesisIngestionPipeline extends EventEmitter {
 	}
 
 	/**
-	 * Opens the FIFO for writing and hands it the initial data.
+	 * Opens the FIFO for writing and hands it the initial data, within one deadline.
 	 *
-	 * The open blocks until GStreamer's filesrc opens the other end, and it blocks on
-	 * one of libuv's threadpool threads - four by default, shared with everything else
-	 * that uses the pool, dns.lookup among them, which every AWS SDK call goes through.
-	 * So the wait ends not only when the open does but when the child dies or the
-	 * deadline passes, and in either case the pending open is released by opening the
-	 * read end ourselves: a writer-open completes as soon as any reader exists.
-	 * Without that, a child that failed before opening its input left the open
-	 * blocked for good, the port in Starting with its lock held, and after four such
-	 * failures every AWS call in the process stalled with it.
+	 * Nothing here waits on a threadpool thread. The FIFO is opened non-blocking, which
+	 * fails at once until GStreamer's filesrc has the other end open, so it is retried
+	 * until it succeeds, the child dies or the deadline passes; and it is written
+	 * through a net.Socket, which waits for a full pipe on the event loop. The blocking
+	 * alternative held one of libuv's four pool threads - shared with dns.lookup, which
+	 * every AWS SDK call goes through - for as long as GStreamer did not read, and a
+	 * write can wait on it for good: the initial data is megabytes, the pipe holds
+	 * 64 KiB, and a GStreamer that opened its input and stalled reads nothing more.
+	 *
+	 * The deadline covers the write as well as the open, because a start that ends only
+	 * once the open has succeeded is not bounded: it held the port in Starting, with
+	 * its lock, for as long as the child held its input open without reading.
 	 */
 	private async openInput(
 		port: number,
@@ -417,83 +428,84 @@ export class KinesisIngestionPipeline extends EventEmitter {
 		initialData: Buffer | undefined,
 		childGone: Promise<void>,
 	): Promise<Writable> {
-		const opening = new Promise<number>((resolve, reject) => {
-			fs.open(fifoPath, 'w', (err, fd) => {
-				if (err) reject(err)
-				else resolve(fd)
-			})
-		})
-		const timeoutMs = this.config.inputOpenTimeoutMs ?? INPUT_OPEN_TIMEOUT_MS
+		const timeoutMs = this.config.inputTimeoutMs ?? INPUT_TIMEOUT_MS
 		let timer: NodeJS.Timeout | undefined
-		const outcome = await Promise.race([
-			opening.then((fd) => ({ fd })),
-			childGone.then(() => ({ fd: undefined, why: 'exited' as const })),
-			new Promise<{ fd: undefined; why: 'timed out' }>((resolve) => {
-				timer = setTimeout(
-					() => resolve({ fd: undefined, why: 'timed out' }),
-					timeoutMs,
-				)
-			}),
-		])
-		clearTimeout(timer)
-
-		if (outcome.fd === undefined) {
-			await this.releasePendingOpen(fifoPath, opening)
-			throw new Error(
-				outcome.why === 'exited'
-					? `GStreamer exited before opening its input for port ${String(port)}`
-					: `GStreamer did not open its input for port ${String(port)} within ${String(timeoutMs)}ms`,
-			)
-		}
-
-		const input = fs.createWriteStream('', { fd: outcome.fd, autoClose: true })
-		// On the stream before the first write, not after it: a write that fails - a
-		// child that opened its input and died - otherwise emits 'error' with no
-		// listener, and Node rethrows that, ending the process.
-		input.on('error', (err: NodeJS.ErrnoException) => {
-			if (err.code !== 'EPIPE') {
-				this.logger.warn('GStreamer FIFO write error', {
-					port,
-					streamName,
-					code: err.code,
-					message: err.message,
-				})
-			}
+		const expired = new Promise<'timed out'>((resolve) => {
+			timer = setTimeout(() => resolve('timed out'), timeoutMs)
 		})
-		const data = initialData ?? Buffer.alloc(0)
-		if (data.length > 0) {
-			await new Promise<void>((resolve, reject) => {
-				input.write(data, (err) => (err ? reject(err) : resolve()))
+		const exited = childGone.then(() => 'exited' as const)
+		try {
+			const fd = await this.openWhenRead(fifoPath, exited, expired)
+			if (typeof fd !== 'number') {
+				throw new Error(
+					fd === 'exited'
+						? `GStreamer exited before opening its input for port ${String(port)}`
+						: `GStreamer did not open its input for port ${String(port)} within ${String(timeoutMs)}ms`,
+				)
+			}
+
+			const input = new net.Socket({ fd, readable: false, writable: true })
+			// On the stream before the first write, not after it: a write that fails - a
+			// child that opened its input and died - otherwise emits 'error' with no
+			// listener, and Node rethrows that, ending the process.
+			input.on('error', (err: NodeJS.ErrnoException) => {
+				if (err.code !== 'EPIPE') {
+					this.logger.warn('GStreamer FIFO write error', {
+						port,
+						streamName,
+						code: err.code,
+						message: err.message,
+					})
+				}
 			})
+			const data = initialData ?? Buffer.alloc(0)
+			if (data.length === 0) return input
+			const written = await Promise.race([
+				new Promise<'written' | Error>((resolve) => {
+					input.write(data, (err) => resolve(err ?? 'written'))
+				}),
+				exited,
+				expired,
+			])
+			if (written === 'written') return input
+			input.destroy()
+			if (written instanceof Error) throw written
+			throw new Error(
+				written === 'exited'
+					? `GStreamer exited before taking its initial data for port ${String(port)}`
+					: `GStreamer did not take its initial data for port ${String(port)} within ${String(timeoutMs)}ms`,
+			)
+		} finally {
+			clearTimeout(timer)
 		}
-		return input
 	}
 
-	/**
-	 * Lets a write-open still waiting on a reader complete, and closes both ends.
-	 *
-	 * The read end is opened synchronously, on this thread, and that is deliberate. An
-	 * asynchronous open needs a threadpool thread of its own, and when every pool
-	 * thread is already held by a blocked write-open - the very condition this exists
-	 * to recover from - it queues behind them and never runs. Non-blocking, so it
-	 * returns at once whether or not a writer is waiting, and costs this thread
-	 * nothing.
-	 */
-	private async releasePendingOpen(
+	/** The FIFO's write end, once a reader has the other end open. */
+	private async openWhenRead(
 		fifoPath: string,
-		opening: Promise<number>,
-	): Promise<void> {
-		let reader: number | undefined
-		try {
-			reader = fs.openSync(
-				fifoPath,
-				fs.constants.O_RDONLY | fs.constants.O_NONBLOCK,
-			)
-			fs.closeSync(await opening)
-		} catch {
-			// The open failed outright, or the FIFO is already gone: nothing is waiting.
-		} finally {
-			if (reader !== undefined) fs.closeSync(reader)
+		exited: Promise<'exited'>,
+		expired: Promise<'timed out'>,
+	): Promise<number | 'exited' | 'timed out'> {
+		for (;;) {
+			try {
+				return fs.openSync(
+					fifoPath,
+					fs.constants.O_WRONLY | fs.constants.O_NONBLOCK,
+				)
+			} catch (err) {
+				// ENXIO is "no reader yet"; anything else will not change by waiting.
+				if ((err as NodeJS.ErrnoException).code !== 'ENXIO') throw err
+			}
+			let poll: NodeJS.Timeout | undefined
+			const outcome = await Promise.race([
+				new Promise<'retry'>((resolve) => {
+					poll = setTimeout(() => resolve('retry'), INPUT_OPEN_POLL_MS)
+				}),
+				exited,
+				expired,
+			])
+			clearTimeout(poll)
+			if (outcome !== 'retry') return outcome
 		}
 	}
 

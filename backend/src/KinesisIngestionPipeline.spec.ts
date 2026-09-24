@@ -25,6 +25,8 @@ type Behaviour =
 	| 'opens its input'
 	/** Opens its input, then closes it and exits before reading anything. */
 	| 'opens its input and dies'
+	/** Opens its input and never reads it: kvssink stalled on the network. */
+	| 'opens its input and stops reading'
 
 /**
  * Stands in for gst-launch-1.0, behind the `sh -c` the pipeline spawns.
@@ -40,6 +42,7 @@ class GstFake extends EventEmitter {
 	exitCode: number | null = null
 	signalCode: NodeJS.Signals | null = null
 	received = ''
+	private reader: number | undefined
 
 	constructor(
 		command: string,
@@ -72,6 +75,12 @@ class GstFake extends EventEmitter {
 					this.exit(1)
 				})
 				return
+			case 'opens its input and stops reading':
+				this.reader = fs.openSync(
+					fifo,
+					fs.constants.O_RDONLY | fs.constants.O_NONBLOCK,
+				)
+				return
 		}
 	}
 
@@ -86,6 +95,7 @@ class GstFake extends EventEmitter {
 		signal: NodeJS.Signals | null = null,
 	): void {
 		if (this.exitCode !== null || this.signalCode !== null) return
+		if (this.reader !== undefined) fs.closeSync(this.reader)
 		this.exitCode = code
 		this.signalCode = signal
 		this.emit('exit', code, signal)
@@ -94,7 +104,7 @@ class GstFake extends EventEmitter {
 
 const pipeline = (
 	behaviour: Behaviour,
-	options: { inputOpenTimeoutMs?: number } = {},
+	options: { inputTimeoutMs?: number } = {},
 ): { kinesis: KinesisIngestionPipeline; children: GstFake[] } => {
 	const children: GstFake[] = []
 	const kinesis = new KinesisIngestionPipeline({
@@ -103,7 +113,7 @@ const pipeline = (
 		portRange: { start: 5000, end: 5009 },
 		stopDrainMs: 1_000,
 		stopSigkillAfterMs: 1_000,
-		inputOpenTimeoutMs: options.inputOpenTimeoutMs,
+		inputTimeoutMs: options.inputTimeoutMs,
 		spawn: ((_command: string, args: string[]) => {
 			const child = new GstFake(args[1] ?? '', behaviour)
 			children.push(child)
@@ -125,9 +135,10 @@ void describe('KinesisIngestionPipeline', () => {
 	/**
 	 * A start has to end, however GStreamer fails.
 	 *
-	 * The pipeline spawns GStreamer and then opens the FIFO for writing, which blocks
-	 * until GStreamer's filesrc opens the other end. Every listener on the child used
-	 * to be attached only after that open, so a GStreamer that failed before opening
+	 * The pipeline spawns GStreamer and then opens the FIFO for writing, which cannot
+	 * complete until GStreamer's filesrc opens the other end. Every listener on the
+	 * child used to be attached only after a blocking open of it, so a GStreamer that
+	 * failed before opening
 	 * its input - kvssink missing, a pipeline that does not parse - had its exit
 	 * missed and left the open blocked for good: the port stuck in Starting with its
 	 * lock held, and shutdown queued behind it.
@@ -188,7 +199,7 @@ void describe('KinesisIngestionPipeline', () => {
 			{ timeout: 10_000 },
 			async () => {
 				const { kinesis, children } = pipeline('never opens its input', {
-					inputOpenTimeoutMs: 200,
+					inputTimeoutMs: 200,
 				})
 				await assert.rejects(
 					async () => kinesis.start(5000),
@@ -198,6 +209,41 @@ void describe('KinesisIngestionPipeline', () => {
 				assert.deepStrictEqual(children[0]?.signals, ['SIGTERM'])
 				assert.strictEqual(kinesis.isActive(5000), false)
 				assert.deepStrictEqual(fifosFor(5000), [])
+			},
+		)
+
+		/**
+		 * GStreamer that opened its input and then read nothing more.
+		 *
+		 * The deadline used to cover only the open. The initial data - the whole
+		 * startup buffer, megabytes against a 64 KiB pipe - was then written with no
+		 * deadline at all, so a kvssink stalled on the network left the start pending
+		 * for as long as GStreamer held its input open, with the port in Starting and
+		 * its lock held. Measured with a real FIFO before the change: no write
+		 * callback until the reader went away.
+		 */
+		void it(
+			'fails, and ends GStreamer, when it opens its input and stops reading',
+			{ timeout: 10_000 },
+			async () => {
+				const { kinesis, children } = pipeline(
+					'opens its input and stops reading',
+					{ inputTimeoutMs: 300 },
+				)
+				await assert.rejects(
+					async () => kinesis.start(5000, Buffer.alloc(1024 * 1024)),
+					/did not take its initial data .* within 300ms/,
+				)
+				assert.deepStrictEqual(children[0]?.signals, ['SIGTERM'])
+				assert.strictEqual(kinesis.isActive(5000), false)
+				assert.deepStrictEqual(fifosFor(5000), [])
+
+				const read = fs.promises.readFile('/proc/self/stat')
+				const outcome = await Promise.race([
+					read.then(() => 'read'),
+					delay(2_000).then(() => 'stalled'),
+				])
+				assert.strictEqual(outcome, 'read', 'a threadpool thread is still held')
 			},
 		)
 
@@ -216,7 +262,8 @@ void describe('KinesisIngestionPipeline', () => {
 			async () => {
 				const { kinesis } = pipeline('opens its input and dies')
 				await assert.rejects(async () =>
-					kinesis.start(5000, Buffer.alloc(64 * 1024)),
+					// More than the pipe holds, so the write cannot finish before it dies.
+					kinesis.start(5000, Buffer.alloc(1024 * 1024)),
 				)
 				assert.strictEqual(kinesis.isActive(5000), false)
 				assert.deepStrictEqual(fifosFor(5000), [])
