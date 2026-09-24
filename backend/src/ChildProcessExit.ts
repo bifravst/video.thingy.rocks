@@ -41,7 +41,7 @@ const hasExited = (child: ExitingChild): boolean =>
 	child.exitCode !== null || child.signalCode !== null
 
 /**
- * Resolves true once the child is gone, or false if `ms` passes first.
+ * Watches for the child being gone, for as long as the caller needs to know.
  *
  * Waiting for 'exit' alone is not enough to know a child is gone, because there is a
  * case where it is never emitted: a spawn that failed. Node reports that as 'error',
@@ -53,6 +53,45 @@ const hasExited = (child: ExitingChild): boolean =>
  * delivered to a child that is very much alive, so it counts only when the exit fields
  * agree with it.
  *
+ * Exported for anything else that has to notice a child going away while it waits on
+ * something else - a producer's start, for one, which can wait on the child to be
+ * ready and must not go on waiting after it has died. `cancel` detaches the listeners,
+ * so racing this against something that wins leaves nothing behind to fire later or
+ * hold the child's emitter.
+ */
+export const watchForExit = (
+	child: ExitingChild,
+): { gone: Promise<void>; cancel: () => void } => {
+	let settle: () => void = () => undefined
+	const gone = new Promise<void>((resolve) => {
+		settle = resolve
+	})
+	const onExit = (): void => done()
+	const onError = (): void => {
+		if (hasExited(child)) done()
+	}
+	const cancel = (): void => {
+		child.removeListener('exit', onExit)
+		child.removeListener('error', onError)
+	}
+	const done = (): void => {
+		cancel()
+		settle()
+	}
+	child.on('exit', onExit)
+	child.on('error', onError)
+	// Checked once the listeners are attached, not before them. A real ChildProcess
+	// sets its exit fields in the same turn it emits 'exit', so the two cannot fall
+	// either side of a check taken just before - but ExitingChild is a shape rather
+	// than that one class, and anything that sets the fields first and emits later
+	// would otherwise be waited on for an event already past.
+	if (hasExited(child)) done()
+	return { gone, cancel }
+}
+
+/**
+ * Resolves true once the child is gone, or false if `ms` passes first.
+ *
  * Both the timer and the listeners are always cleaned up, so a caller that races these
  * repeatedly leaves nothing behind to hold the event loop open or to fire twice.
  */
@@ -61,28 +100,19 @@ const waitForExit = async (
 	ms?: number,
 ): Promise<boolean> => {
 	if (hasExited(child)) return true
-	return new Promise<boolean>((resolve) => {
-		let timer: NodeJS.Timeout | undefined
-		const settle = (gone: boolean): void => {
-			if (timer !== undefined) clearTimeout(timer)
-			child.removeListener('exit', onExit)
-			child.removeListener('error', onError)
-			resolve(gone)
-		}
-		const onExit = (): void => settle(true)
-		const onError = (): void => {
-			if (hasExited(child)) settle(true)
-		}
-		child.on('exit', onExit)
-		child.on('error', onError)
-		if (ms !== undefined) timer = setTimeout(() => settle(false), ms)
-		// Checked again now the listeners are attached, not only before them. A real
-		// ChildProcess sets its exit fields in the same turn it emits 'exit', so the
-		// two cannot fall either side of the check above - but ExitingChild is a shape
-		// rather than that one class, and anything that sets the fields first and
-		// emits later would otherwise be waited on for an event already past.
-		if (hasExited(child)) settle(true)
+	const watch = watchForExit(child)
+	if (ms === undefined) {
+		await watch.gone
+		return true
+	}
+	let timer: NodeJS.Timeout | undefined
+	const timedOut = new Promise<false>((resolve) => {
+		timer = setTimeout(() => resolve(false), ms)
 	})
+	const gone = await Promise.race([watch.gone.then(() => true), timedOut])
+	clearTimeout(timer)
+	watch.cancel()
+	return gone
 }
 
 /**
