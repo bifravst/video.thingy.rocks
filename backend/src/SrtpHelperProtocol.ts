@@ -11,7 +11,14 @@
 
 export const SRTP_HELPER_PROTOCOL_VERSION = 1
 
-/** Lines longer than this are discarded rather than buffered indefinitely. */
+/**
+ * Lines longer than this are discarded - neither buffered indefinitely nor parsed.
+ *
+ * Both halves matter. A line that never ends is cut off once the buffer passes this,
+ * and a line that does end is measured before it reaches JSON.parse, however it was
+ * chunked. Measured in characters, which for this protocol are bytes: everything the
+ * helper writes to stdout goes through json.dumps, which escapes anything non-ASCII.
+ */
 export const MAX_LINE_BYTES = 64 * 1024
 
 export type SrtpHelperMessage =
@@ -231,6 +238,11 @@ const parseMessage = (line: string): SrtpHelperMessage => {
 	}
 }
 
+const overlongLine = (length: number): SrtpHelperMessage => ({
+	t: 'unparsed',
+	raw: `discarded an over-long line (${String(length)} bytes)`,
+})
+
 /**
  * Accumulates helper stdout and yields whole messages.
  *
@@ -248,22 +260,29 @@ export class SrtpHelperProtocol {
 		for (;;) {
 			const newline = this.buffer.indexOf('\n')
 			if (newline === -1) break
-			const line = this.buffer.slice(0, newline).trim()
+			const raw = this.buffer.slice(0, newline)
 			this.buffer = this.buffer.slice(newline + 1)
 			if (this.overlong) {
 				// The tail of a line already reported as too long.
 				this.overlong = false
 				continue
 			}
+			// Measured here, before parsing, and not only in the check below: that one
+			// sees only what is left once every complete line has been taken out, so a
+			// long line arriving with its newline in the same chunk passed it and went
+			// to JSON.parse whole - up to about twice the limit in 64 KiB pipe reads,
+			// and without bound in a single larger chunk.
+			if (raw.length > MAX_LINE_BYTES) {
+				messages.push(overlongLine(raw.length))
+				continue
+			}
+			const line = raw.trim()
 			if (line.length > 0) messages.push(parseMessage(line))
 		}
 
 		// A line that never ends must not grow the buffer without bound.
 		if (this.buffer.length > MAX_LINE_BYTES) {
-			messages.push({
-				t: 'unparsed',
-				raw: `discarded an over-long line (${String(this.buffer.length)} bytes)`,
-			})
+			messages.push(overlongLine(this.buffer.length))
 			this.buffer = ''
 			this.overlong = true
 		}

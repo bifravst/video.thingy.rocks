@@ -173,6 +173,51 @@ void describe('SrtpHelperProtocol', () => {
 			assert.deepStrictEqual(protocol.push('still the same line\n'), [])
 			assert.deepStrictEqual(protocol.push(line({ t: 'eos' })), [{ t: 'eos' }])
 		})
+
+		/**
+		 * A line that does end is bounded too, not only one that does not.
+		 *
+		 * The test above sends a line with no newline, which is the one shape the limit
+		 * used to cover: it was checked only on what was left once every complete line
+		 * had been taken out. A long line arriving with its newline went to JSON.parse
+		 * whole - in one chunk without bound, and in the 64 KiB reads a pipe really
+		 * delivers, up to about twice the limit. Both are checked here, with a message
+		 * that would otherwise parse, so parsing it is visible as a failure.
+		 */
+		const oversized = (chars: number): string =>
+			line({ t: 'warning', message: 'x'.repeat(chars) })
+
+		void it('discards a complete over-long line arriving in one chunk', () => {
+			const messages = parse(oversized(MAX_LINE_BYTES * 3), line({ t: 'eos' }))
+			assert.deepStrictEqual(
+				messages.map((m) => m.t),
+				['unparsed', 'eos'],
+			)
+		})
+
+		void it('discards a complete over-long line arriving in 64 KiB reads', () => {
+			const read = 64 * 1024
+			// Longer than the limit but under two reads: exactly what used to get through.
+			const whole = oversized(MAX_LINE_BYTES + read / 2) + line({ t: 'eos' })
+			const chunks: string[] = []
+			for (let i = 0; i < whole.length; i += read) {
+				chunks.push(whole.slice(i, i + read))
+			}
+			assert.deepStrictEqual(
+				parse(...chunks).map((m) => m.t),
+				['unparsed', 'eos'],
+			)
+		})
+
+		void it('still parses a line exactly at the limit', () => {
+			const overhead = oversized(0).length - 1
+			const atLimit = oversized(MAX_LINE_BYTES - overhead)
+			assert.strictEqual(atLimit.length - 1, MAX_LINE_BYTES)
+			assert.deepStrictEqual(
+				parse(atLimit).map((m) => m.t),
+				['warning'],
+			)
+		})
 	})
 
 	void describe('malformed input', () => {
