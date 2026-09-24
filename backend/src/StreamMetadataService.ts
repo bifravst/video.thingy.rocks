@@ -40,6 +40,46 @@ export type StreamMetadata = {
 export type StreamMetadataServiceConfig = {
 	tableName: string
 	region?: string
+	/** For tests: where requests go instead of the regional endpoint. */
+	endpoint?: string
+	/** For tests: replaces DYNAMODB_REQUEST_TIMEOUT_MS; see there. */
+	requestTimeoutMs?: number
+}
+
+/**
+ * How long one DynamoDB request may take, and how long its socket may sit idle.
+ *
+ * Every call here is awaited inside a port's serialized event queue, so a request that
+ * never completes holds that port - its lock, its shutdown - for as long as it does not.
+ * The SDK sets no limit by default: its request timeout is 0, and even a configured
+ * one only logs unless throwOnRequestTimeout is set. DynamoDB answers in milliseconds,
+ * so this is only reached when something is wrong, and with the SDK's three attempts a
+ * call gives up after roughly three times this.
+ */
+const DYNAMODB_REQUEST_TIMEOUT_MS = 3_000
+const DYNAMODB_CONNECTION_TIMEOUT_MS = 2_000
+
+const createDocumentClient = (
+	config: StreamMetadataServiceConfig,
+): DynamoDBDocumentClient => {
+	const requestTimeout = config.requestTimeoutMs ?? DYNAMODB_REQUEST_TIMEOUT_MS
+	return DynamoDBDocumentClient.from(
+		new DynamoDBClient({
+			region: config.region ?? 'eu-central-1',
+			...(config.endpoint === undefined ? {} : { endpoint: config.endpoint }),
+			requestHandler: {
+				connectionTimeout: Math.min(
+					DYNAMODB_CONNECTION_TIMEOUT_MS,
+					requestTimeout,
+				),
+				// Until the response headers arrive...
+				requestTimeout,
+				throwOnRequestTimeout: true,
+				// ...and after them, while the body is read.
+				socketTimeout: requestTimeout,
+			},
+		}),
+	)
 }
 
 /**
@@ -70,11 +110,7 @@ export class StreamMetadataService {
 		config: StreamMetadataServiceConfig,
 		deps?: { docClient?: DynamoDBDocumentClient },
 	) {
-		this.docClient =
-			deps?.docClient ??
-			DynamoDBDocumentClient.from(
-				new DynamoDBClient({ region: config.region ?? 'eu-central-1' }),
-			)
+		this.docClient = deps?.docClient ?? createDocumentClient(config)
 		this.tableName = config.tableName
 	}
 

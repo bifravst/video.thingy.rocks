@@ -1,6 +1,7 @@
 import type { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb'
 import assert from 'node:assert/strict'
-import { describe, it } from 'node:test'
+import net from 'node:net'
+import { after, before, describe, it } from 'node:test'
 
 import { StreamMetadataService } from './StreamMetadataService.ts'
 
@@ -254,4 +255,129 @@ void describe('StreamMetadataService SRTP rollover hint', () => {
 		const { subject } = service(['error'])
 		await subject.putSrtpRocHint(6000, 9, 42, FINGERPRINT)
 	})
+})
+
+/**
+ * No call can hang its port.
+ *
+ * Every method here is awaited inside a port's serialized event queue, so one request
+ * that never completes holds that port - its lock, its shutdown - for as long as it
+ * does not. The SDK sets no limit of its own, and this client used to be built with
+ * its defaults: a request to an endpoint that never answered was still pending when
+ * these tests gave up on it.
+ *
+ * Driven through the real client against a local endpoint that accepts connections
+ * and then says nothing, or starts a response and stops. Every method on the class is
+ * called, found by enumerating the prototype rather than listed here, so a method
+ * added later is covered without anyone remembering to add it.
+ */
+void describe('StreamMetadataService against an endpoint that stops answering', () => {
+	process.env.AWS_ACCESS_KEY_ID ??= 'AKIAEXAMPLEEXAMPLE00'
+	process.env.AWS_SECRET_ACCESS_KEY ??= 'example-secret-for-tests-only'
+
+	const REQUEST_TIMEOUT_MS = 200
+	/** Three attempts, each bounded, plus the SDK's backoff between them. */
+	const BOUND_MS = 3 * REQUEST_TIMEOUT_MS + 2_000
+
+	const endpoints: {
+		name: string
+		respond: (socket: net.Socket) => void
+	}[] = [
+		{ name: 'never responds', respond: () => undefined },
+		{
+			name: 'starts a response and stalls',
+			respond: (socket) => {
+				socket.once('data', () => {
+					socket.write(
+						'HTTP/1.1 200 OK\r\nContent-Type: application/x-amz-json-1.0\r\nContent-Length: 100\r\n\r\n{',
+					)
+				})
+			},
+		},
+	]
+
+	for (const endpoint of endpoints) {
+		void describe(endpoint.name, () => {
+			const sockets = new Set<net.Socket>()
+			let connections = 0
+			let url = ''
+			const server = net.createServer((socket) => {
+				connections += 1
+				sockets.add(socket)
+				socket.on('error', () => undefined)
+				endpoint.respond(socket)
+			})
+			before(async () => {
+				await new Promise<void>((resolve) =>
+					server.listen(0, '127.0.0.1', resolve),
+				)
+				const address = server.address() as net.AddressInfo
+				url = `http://127.0.0.1:${String(address.port)}`
+			})
+			after(async () => {
+				for (const socket of sockets) socket.destroy()
+				await new Promise((resolve) => server.close(resolve))
+			})
+
+			const methods = Object.getOwnPropertyNames(
+				StreamMetadataService.prototype,
+			).filter(
+				(name) =>
+					name !== 'constructor' &&
+					typeof (
+						StreamMetadataService.prototype as unknown as Record<
+							string,
+							unknown
+						>
+					)[name] === 'function',
+			)
+
+			void it('finds the methods to call', () => {
+				assert.ok(methods.includes('tryAcquireKinesisLock'), methods.join(', '))
+			})
+
+			for (const method of methods) {
+				void it(
+					`${method} settles`,
+					{ timeout: BOUND_MS + 5_000 },
+					async () => {
+						const subject = new StreamMetadataService({
+							tableName: 'StreamMetadata',
+							region: 'eu-central-1',
+							endpoint: url,
+							requestTimeoutMs: REQUEST_TIMEOUT_MS,
+						})
+						const before = connections
+						const call = (
+							subject as unknown as Record<
+								string,
+								(...args: unknown[]) => Promise<unknown>
+							>
+						)[method]
+						const started = Date.now()
+						const outcome = await Promise.race([
+							// Arguments of every shape the methods take; each one sends a
+							// request whatever it makes of them.
+							call!.call(subject, 6000, 'i-test', 42, 'abcdef0123456789').then(
+								() => 'settled',
+								() => 'settled',
+							),
+							new Promise((resolve) =>
+								setTimeout(() => resolve('pending'), BOUND_MS),
+							),
+						])
+						assert.strictEqual(
+							outcome,
+							'settled',
+							`still pending after ${String(Date.now() - started)} ms`,
+						)
+						assert.ok(
+							connections > before,
+							'the call has to reach the endpoint, or this proves nothing',
+						)
+					},
+				)
+			}
+		})
+	}
 })
