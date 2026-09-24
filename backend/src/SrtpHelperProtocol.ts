@@ -48,6 +48,8 @@ export type SrtpHelperMessage =
 			candidate: number
 			inputs?: number
 			drops?: number
+			/** Where the search's far climb has got to; see Search in the helper. */
+			searchFrom?: number
 	  }
 	| { t: 'auth'; status: 'exhausted'; trials: number }
 	/**
@@ -187,6 +189,7 @@ const parseMessage = (line: string): SrtpHelperMessage => {
 						candidate,
 						inputs: count(value.inputs),
 						drops: count(value.drops),
+						searchFrom: uint32(value.searchFrom),
 					}
 				}
 				case 'exhausted': {

@@ -611,6 +611,88 @@ void describe('SrtpProducer', () => {
 	})
 
 	/**
+	 * Where a search got to, handed to the next session's helper.
+	 *
+	 * A session that authenticates nothing is ended when its provisional window
+	 * closes, and each new helper used to search from scratch - so no session got
+	 * further than one window allowed. The real search across real sessions is in
+	 * SrtpSearchAcrossSessions.spec.ts; these pin what the producer carries.
+	 */
+	void describe('search progress across sessions', () => {
+		const sessions = (floors: (number | undefined)[]) => {
+			const helpers: HelperFake[] = []
+			const producer = new SrtpProducer({
+				keyStore: {
+					getKeyForPort: () => ({
+						keyHex: KEY,
+						ssrc: 42,
+						cipher: 'aes-128-icm',
+						auth: 'hmac-sha1-80',
+						keyFingerprint: 'abcdef0123456789',
+					}),
+				} as unknown as SrtpKeyStore,
+				floors: {
+					getSrtpIndexFloor: async () => floors.shift(),
+					raiseSrtpIndexFloor: async () => undefined,
+				},
+				region: 'eu-central-1',
+				streamNameForPort: (port) => `test-video-${String(port)}`,
+				kvsLogConfigPath: '/dev/null',
+				spawn: (() => {
+					const helper = new HelperFake(45_454)
+					helpers.push(helper)
+					return helper as unknown as ChildProcess
+				}) as unknown as typeof nodeSpawn,
+				logger: new CapturingLogger(),
+			})
+			const session = async (
+				say: Record<string, unknown>[] = [],
+			): Promise<Record<string, unknown>> => {
+				await producer.start(PORT, [], { epoch: 1 })
+				const helper = helpers.at(-1)
+				assert.ok(helper !== undefined)
+				for (const message of say) helper.say(message)
+				await delay(20)
+				await producer.stop(PORT)
+				return helper.inits[0] ?? {}
+			}
+			return { session }
+		}
+		const failed = (searchFrom: number) => ({
+			t: 'auth',
+			status: 'fail',
+			candidate: searchFrom - 1,
+			searchFrom,
+		})
+
+		void it('starts the next session where the last one got to', async () => {
+			const { session } = sessions([undefined, undefined])
+			const first = await session([failed(12), failed(13)])
+			assert.ok(!('searchFrom' in first))
+			const second = await session()
+			assert.strictEqual(second.searchFrom, 13)
+		})
+
+		// Progress above one floor says nothing about the search above another.
+		void it('starts afresh when the floor has moved to another rollover', async () => {
+			const { session } = sessions([undefined, 5 * 65_536])
+			await session([failed(13)])
+			const second = await session()
+			assert.ok(!('searchFrom' in second))
+		})
+
+		void it('starts afresh once the search has found the counter', async () => {
+			const { session } = sessions([undefined, undefined])
+			await session([
+				failed(13),
+				{ t: 'auth', status: 'ok', first: true, roc: 13, trials: 14 },
+			])
+			const second = await session()
+			assert.ok(!('searchFrom' in second))
+		})
+	})
+
+	/**
 	 * A failed start must hand the startup buffer back, not drop it.
 	 *
 	 * PortIngestion puts whatever the producer never sent at the front of the buffer

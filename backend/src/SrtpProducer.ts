@@ -66,6 +66,16 @@ export type SrtpIndexFloorStore = {
 
 type KeyIdentity = { ssrc: number; keyFingerprint: string }
 
+/**
+ * How far a port's rollover-counter search got above a floor, for the next session.
+ *
+ * A session that authenticates nothing is ended when its provisional window closes,
+ * and the next helper used to start the search from scratch - so no session got
+ * further than one window allowed, and a counter beyond that was never found. Kept in
+ * memory only: a restarted backend starts over, which costs time and nothing else.
+ */
+type SearchProgress = KeyIdentity & { base: number; searchFrom: number }
+
 /** The highest index this process has seen accepted for a port, and what it wrote. */
 type KnownIndex = KeyIdentity & {
 	index: number
@@ -110,6 +120,8 @@ type Session = {
 	key: KeyIdentity
 	/** Set once the helper has reported authenticated traffic. */
 	confirmed: boolean
+	/** The rollover counter the search starts from: the floor's. */
+	searchBase: number
 	/**
 	 * The ownership epoch this session was started under. Held on the session rather
 	 * than read from `epochs` when a report goes out, because that map follows the
@@ -146,6 +158,7 @@ export class SrtpProducer implements ExitingProducer {
 	private readonly unsent = new Map<number, Buffer[]>()
 	private readonly epochs = new Map<number, number>()
 	private readonly indexes = new Map<number, KnownIndex>()
+	private readonly searches = new Map<number, SearchProgress>()
 	private exitListener: (port: number) => void = () => undefined
 	private closed = false
 
@@ -191,6 +204,14 @@ export class SrtpProducer implements ExitingProducer {
 			)
 		}
 		const floor = this.floorFor(port, key, stored)
+		const searchBase = floor === undefined ? 0 : Math.floor(floor / 65_536)
+		const progress = this.searches.get(port)
+		const searchFrom =
+			progress?.ssrc === key.ssrc &&
+			progress.keyFingerprint === key.keyFingerprint &&
+			progress.base === searchBase
+				? progress.searchFrom
+				: undefined
 
 		const child = this.spawn(
 			'python3',
@@ -234,6 +255,7 @@ export class SrtpProducer implements ExitingProducer {
 			pendingBytes: datagrams.reduce((sum, d) => sum + d.length, 0),
 			key: { ssrc: key.ssrc, keyFingerprint: key.keyFingerprint },
 			confirmed: false,
+			searchBase,
 			epoch: context.epoch,
 			stopping: false,
 		}
@@ -252,6 +274,7 @@ export class SrtpProducer implements ExitingProducer {
 				auth: key.auth,
 				ssrc: key.ssrc,
 				...(floor === undefined ? {} : { floor }),
+				...(searchFrom === undefined ? {} : { searchFrom }),
 			})}\n`,
 		)
 
@@ -484,6 +507,7 @@ export class SrtpProducer implements ExitingProducer {
 					if (!this.acts(port, session)) return
 					if (message.first) {
 						session.confirmed = true
+						this.searches.delete(port)
 						this.logger.info('SRTP traffic authenticated', {
 							port,
 							roc: message.roc,
@@ -493,6 +517,16 @@ export class SrtpProducer implements ExitingProducer {
 						// authenticated something above the floor, the traffic is
 						// unproven.
 						this.options.onAuthenticated?.(port, session.epoch)
+					}
+				} else if (message.status === 'fail') {
+					// From any session, like the floor: where a search got to only decides
+					// where the next one starts, and cannot promote anything.
+					if (message.searchFrom !== undefined) {
+						this.searches.set(port, {
+							...session.key,
+							base: session.searchBase,
+							searchFrom: message.searchFrom,
+						})
 					}
 				} else if (message.status === 'lost') {
 					this.logger.warn('SRTP traffic stopped authenticating', {

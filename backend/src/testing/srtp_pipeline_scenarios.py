@@ -159,6 +159,11 @@ def nothing_authenticates(s: Scenario) -> None:
         s.tick()
 
 
+def first_candidates(search: object, count: int) -> list[int]:
+    """The order the search offers candidates in, without running a pipeline."""
+    return [next(search) for _ in range(count)]  # type: ignore[call-overload]
+
+
 if __name__ == "__main__":
     print(
         json.dumps(
@@ -171,6 +176,13 @@ if __name__ == "__main__":
                 ),
                 "liveStream": run(5, live_stream),
                 "nothingAuthenticates": run(5, nothing_authenticates),
+                "searchOrder": {
+                    "fresh": first_candidates(sp.Search(5, None, 4), 12),
+                    "carried": first_candidates(sp.Search(5, 20, 4), 12),
+                    "atTheTop": first_candidates(
+                        sp.Search(sp.ROC_MAX - 2, None, 100), 6
+                    ),
+                },
             }
         )
     )

@@ -74,7 +74,10 @@ seeds a candidate, and if `libsrtp` authenticates packets, that candidate was
 right; if not, those packets are counted as dropped and the next candidate is
 tried. The candidates start at the rollover counter of the port's **replay
 floor** - the highest packet index ever accepted under this key and SSRC - and
-climb from there, never below it.
+climb from there, never below it. A session that finds nothing is ended when its
+twenty-second provisional window closes, and the next one picks the climb up
+where it stopped while also retrying the counters just above the floor, so a
+counter out of one session's reach is still found, a few sessions later.
 
 **A sender that carries on counting needs no operator action.** Restarting the
 backend, or a sender that kept counting while ingestion was down, recovers on

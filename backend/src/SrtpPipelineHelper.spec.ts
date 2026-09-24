@@ -174,7 +174,7 @@ void describe('srtp_pipeline.py', { skip }, () => {
 		void it('never searches below the floor', async () => {
 			const helper = await startHelper({
 				floor: indexAt(5, 0),
-				extraArgs: ['--search-max-offset', '2'],
+				extraArgs: ['--floor-every', '2'],
 			})
 			try {
 				const timer = setInterval(() => sendBurst(helper, 4, 3000, 10), 60)
@@ -584,6 +584,41 @@ void describe('srtp_pipeline.py', { skip }, () => {
 			const o = all.liveStream
 			assert.strictEqual(o?.confirmed, true)
 			assert.strictEqual(o.reportedCandidate, 5)
+		})
+
+		/**
+		 * The order candidates come in, which is what decides how far a session gets.
+		 *
+		 * The floor's rollover first and again every so often; above it, a climb that
+		 * starts afresh each session taking turns with one that carries on from where
+		 * the last session left it. Carried over, because a session that finds nothing
+		 * is ended when its provisional window closes - and when each one started from
+		 * scratch, none got further than one window allowed. Across real sessions this
+		 * is SrtpSearchAcrossSessions.spec.ts.
+		 */
+		void it('offers the floor, then takes turns between a fresh climb and a carried one', () => {
+			const order = (
+				all as unknown as { searchOrder: Record<string, number[]> }
+			).searchOrder
+			assert.deepStrictEqual(
+				order.fresh,
+				[5, 6, 7, 8, 9, 5, 10, 11, 12, 13, 5, 14],
+			)
+			assert.deepStrictEqual(
+				order.carried,
+				[5, 20, 6, 21, 7, 5, 22, 8, 23, 9, 5, 24],
+			)
+			// Past the top of the counter space it wraps to just above the floor, and
+			// still never below it.
+			const top = 2 ** 32 - 1
+			assert.deepStrictEqual(order.atTheTop, [
+				top - 2,
+				top - 1,
+				top,
+				top - 1,
+				top,
+				top - 1,
+			])
 		})
 
 		void it('never confirms noise, and keeps searching through it', () => {

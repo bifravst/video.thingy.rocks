@@ -34,9 +34,11 @@ Ports **6000-6009** on the load balancer's address.
   the provisioned one.
 - **Sequence numbering**: a device may have wrapped any number of times while
   ingestion was down, and need not tell the receiver - it establishes the
-  rollover counter by authentication rather than assuming it, so the only cost
-  is the wait for the device's next keyframe. Keep that interval short if fast
-  recovery matters.
+  rollover counter by authentication rather than assuming it. The cost is time:
+  usually just the wait for the device's next keyframe, and for a device that
+  wrapped hundreds of times while nobody was listening, a few provisional
+  windows, because each pipeline session carries on the search where the last
+  one stopped. Keep the keyframe interval short if fast recovery matters.
 
   **A device must never restart its sequence numbering while keeping its key,
   and the receiver will not accept it if it does.** SRTP derives its keystream

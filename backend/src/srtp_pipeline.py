@@ -61,8 +61,8 @@ KEY_SHAPED = re.compile(r"^[0-9a-fA-F]{40,}$")
 MAX_SAFE_GST_DEBUG = 3
 
 
-def candidates(base: int, max_offset: int) -> "object":
-    """Yields rollover-counter candidates to try, in order of likelihood.
+class Search:
+    """The rollover-counter candidates to try, in order of likelihood.
 
     `base` is the rollover counter of the floor: the highest packet index already
     accepted under this key and SSRC. Nothing below it is ever offered, because every
@@ -74,36 +74,61 @@ def candidates(base: int, max_offset: int) -> "object":
     starts a new floor. See the SRTP section of backend/README.md.
 
     The floor comes first, because the common case is that nothing wrapped while
-    ingestion was down, and then the search climbs from it: a sender that kept
-    counting while nobody was listening is above it by however many times it wrapped.
+    ingestion was down, and it is offered again every `floor_every` candidates: it
+    stays the most likely answer however far the search has climbed, and the reason
+    the search climbed is usually traffic that never held the key at all.
 
-    `max_offset` is the width of a band. Each band climbs another `max_offset` above
-    the floor, and the bands keep coming until every counter above it has been offered.
-    Every band re-offers the floor first, because it stays the most likely answer no
-    matter how far the search has climbed, and because the reason a band was
-    exhausted is usually traffic that never held the key at all.
+    Above it, two climbs take turns. The near one starts just above the floor in every
+    session, so the counters a sender most plausibly reached are tried early each time.
+    The far one starts at `search_from` and carries on where the previous session's
+    far climb stopped - `far` is reported with each failed trial so the parent can hand
+    it to the next session. A session is short: the port gives up on one that has not
+    authenticated anything when its provisional window closes, and starts a new
+    helper. When each helper started the search from scratch, no session got further
+    than one window allowed and every later one tried the same candidates again, so a
+    counter beyond that was never found. With the far climb carried over, every
+    counter above the floor is reached eventually, and the near one keeps the likely
+    ones from waiting behind it.
 
-    The sequence repeats rather than ending, so a stream that only becomes
-    decryptable later - a sender that starts long after the search began - is still
-    picked up. Nothing is retried while no datagrams are arriving, so repeating costs
-    nothing when the port is idle.
+    The far climb wraps round to just above the floor once it passes the top of the
+    counter space, so the sequence never ends: a stream that only becomes decryptable
+    later is still picked up. Nothing is retried while no datagrams are arriving, so
+    this costs nothing when the port is idle.
     """
-    base = min(max(base, 0), ROC_MAX)
-    width = max(int(max_offset), 1)
-    band = 0
-    while True:
-        first = band * width + 1
-        if base + first > ROC_MAX:
-            # Every candidate above the floor has been offered; start over rather
-            # than ending, for the same reason each band repeats the floor.
-            band = 0
-            if base == ROC_MAX:
-                yield base
-            continue
-        yield base
-        for k in range(first, min(first + width - 1, ROC_MAX - base) + 1):
-            yield base + k
-        band += 1
+
+    def __init__(self, base: int, search_from: int | None, floor_every: int) -> None:
+        self.base = min(max(base, 0), ROC_MAX)
+        self.floor_every = max(int(floor_every), 1)
+        start = self.base + 1 if search_from is None else search_from
+        #: Where the far climb starts this session; the near one stops short of it.
+        self.far_start = start if self.base < start <= ROC_MAX else self.base + 1
+        #: The next far candidate, which is what the parent carries to the next session.
+        self.far = self.far_start
+        self.near = self.base + 1
+        self.since_floor: int | None = None
+        self.far_turn = False
+
+    def __iter__(self) -> "Search":
+        return self
+
+    def __next__(self) -> int:
+        if self.base == ROC_MAX:
+            return self.base
+        if self.since_floor is None or self.since_floor >= self.floor_every:
+            self.since_floor = 0
+            return self.base
+        self.since_floor += 1
+        for _ in range(2):
+            self.far_turn = not self.far_turn
+            if not self.far_turn:
+                if self.near < self.far_start:
+                    self.near += 1
+                    return self.near - 1
+            else:
+                candidate = self.far
+                self.far = candidate + 1 if candidate < ROC_MAX else self.base + 1
+                return candidate
+        return self.base
 
 
 def rollover_of(roc: int, highest_seq: int, seq: int) -> int:
@@ -167,7 +192,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--kvs-storage-size", type=int, default=128)
     parser.add_argument("--stats-interval-ms", type=int, default=5000)
     parser.add_argument("--auth-loss-ms", type=int, default=3000)
-    parser.add_argument("--search-max-offset", type=int, default=512)
+    parser.add_argument("--floor-every", type=int, default=512)
     parser.add_argument("--trial-drops", type=int, default=4)
     parser.add_argument("--trial-timeout-ms", type=int, default=1500)
     #: Test only. Replaces kvssink, so the helper can run where kvssink is not built.
@@ -281,7 +306,16 @@ class SrtpPipeline:
             else None
         )
         base = 0 if self.floor is None else self.floor >> 16
-        self.candidates = candidates(base, args.search_max_offset)
+        search_from = init.get("searchFrom")
+        self.candidates = Search(
+            base,
+            (
+                int(search_from)
+                if isinstance(search_from, int) and not isinstance(search_from, bool)
+                else None
+            ),
+            args.floor_every,
+        )
         self.candidate = next(self.candidates)
         self.trial_index = 0
         self.trial_started_ms = 0
@@ -712,6 +746,7 @@ class SrtpPipeline:
             candidate=failed,
             inputs=tried_inputs,
             drops=tried_drops,
+            searchFrom=self.candidates.far,
         )
         if self.dec is not None:
             # Resetting the stream is what lets the next candidate be applied without
