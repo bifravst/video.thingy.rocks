@@ -418,12 +418,28 @@ void describe('IngestionService with an additive transport', () => {
 
 	void it('promotes a provisional port when the transport reports authentication', async () => {
 		const srtpListener = new ListenerFake()
-		const { service } = buildWithSrtp(srtpListener)
+		const { service, srtpProducer } = buildWithSrtp(srtpListener)
 		srtpListener.deliver(6000, Buffer.alloc(10), new Date())
 		await settle()
-		service.authenticated(6000)
+		const epoch = srtpProducer?.epochForPort(6000)
+		assert.ok(epoch !== undefined)
+		service.authenticated(6000, epoch)
 		await settle()
 		assert.strictEqual(service.stateFor(6000), 'Running')
+	})
+
+	// The report carries the lifetime it was made under, and the service passes that
+	// through rather than substituting the port's current one.
+	void it('does not promote on a report from an earlier lifetime', async () => {
+		const srtpListener = new ListenerFake()
+		const { service, srtpProducer } = buildWithSrtp(srtpListener)
+		srtpListener.deliver(6000, Buffer.alloc(10), new Date())
+		await settle()
+		const epoch = srtpProducer?.epochForPort(6000)
+		assert.ok(epoch !== undefined)
+		service.authenticated(6000, epoch - 1)
+		await settle()
+		assert.strictEqual(service.stateFor(6000), 'Provisional')
 	})
 
 	// The health port says "this backend is up". An additive transport that cannot

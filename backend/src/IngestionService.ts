@@ -159,9 +159,12 @@ export class IngestionService {
 		})
 	}
 
-	/** Lets a transport report that a port's traffic authenticated. */
-	authenticated(port: number): void {
-		this.machines.get(port)?.onAuthenticated()
+	/**
+	 * Lets a transport report that a port's traffic authenticated, under the epoch
+	 * its producer was started with; see PortIngestion.onAuthenticated.
+	 */
+	authenticated(port: number, epoch: number): void {
+		this.machines.get(port)?.onAuthenticated(epoch)
 	}
 
 	private createMachine(

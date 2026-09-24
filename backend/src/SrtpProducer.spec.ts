@@ -131,6 +131,8 @@ const start = async (
 		rocHint?: number
 		/** Cleared to model a helper that dies before its readiness is handled. */
 		reportReady?: boolean
+		/** The ownership epoch the start is made under, as PortIngestion passes it. */
+		epoch?: number
 	} = {},
 ): Promise<{
 	producer: SrtpProducer
@@ -139,8 +141,8 @@ const start = async (
 	started: Promise<void>
 	/** The arguments the helper was started with. */
 	helperArgs: string[]
-	/** Every authentication the producer reported, as the port it named. */
-	authenticated: number[]
+	/** Every authentication the producer reported, as the port and epoch it named. */
+	authenticated: [number, number][]
 	/** Every rollover counter the producer persisted. */
 	hintsWritten: number[]
 }> => {
@@ -150,7 +152,7 @@ const start = async (
 	helper.ignoreSignals = options.ignoreSignals ?? false
 	helper.reportReadyOnInit = options.reportReady ?? true
 	const helperArgs: string[] = []
-	const authenticated: number[] = []
+	const authenticated: [number, number][] = []
 	const hintsWritten: number[] = []
 	const logger = new CapturingLogger()
 	const producer = new SrtpProducer({
@@ -173,8 +175,8 @@ const start = async (
 		streamNameForPort: (port) => `test-video-${String(port)}`,
 		kvsLogConfigPath: '/dev/null',
 		stopSigkillAfterMs: options.stopSigkillAfterMs,
-		onAuthenticated: (port) => {
-			authenticated.push(port)
+		onAuthenticated: (port, epoch) => {
+			authenticated.push([port, epoch])
 		},
 		spawn: ((_command: string, args: string[]) => {
 			helperArgs.push(...args)
@@ -182,7 +184,9 @@ const start = async (
 		}) as unknown as typeof nodeSpawn,
 		logger,
 	})
-	const started = producer.start(PORT, options.datagrams ?? [], { epoch: 1 })
+	const started = producer.start(PORT, options.datagrams ?? [], {
+		epoch: options.epoch ?? 1,
+	})
 	if (options.awaitStart !== false) await started
 	return {
 		producer,
@@ -385,13 +389,17 @@ void describe('SrtpProducer', () => {
 			)
 		})
 
-		// The ordinary case, so the guard is known not to swallow it.
-		void it('acts for the current session as before', async () => {
-			const { producer, helper, authenticated, hintsWritten } = await start()
+		// The ordinary case, so the guard is known not to swallow it - and the report
+		// names the lifetime the session was started under, so PortIngestion can drop
+		// one that outlived it.
+		void it('acts for the current session, naming the epoch it was started under', async () => {
+			const { producer, helper, authenticated, hintsWritten } = await start({
+				epoch: 7,
+			})
 			try {
 				authOk(helper)
 				await delay(20)
-				assert.deepStrictEqual(authenticated, [PORT])
+				assert.deepStrictEqual(authenticated, [[PORT, 7]])
 				assert.deepStrictEqual(hintsWritten, [7])
 			} finally {
 				await producer.stop(PORT)

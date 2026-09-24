@@ -70,7 +70,12 @@ export type SrtpProducerOptions = {
 	/** How long SIGTERM gets before SIGKILL follows; see stop(). */
 	stopSigkillAfterMs?: number
 	/** Called when the helper reports that libsrtp authenticated traffic. */
-	onAuthenticated?: (port: number) => void
+	/**
+	 * Called when the helper reports that libsrtp authenticated traffic, with the
+	 * epoch the reporting session was started under - so the port can tell a report
+	 * from an earlier lifetime apart from one about the current one.
+	 */
+	onAuthenticated?: (port: number, epoch: number) => void
 	spawn?: typeof nodeSpawn
 	logger?: Logger
 }
@@ -86,6 +91,13 @@ type Session = {
 	confirmedRoc: number | undefined
 	/** Rollover counter this key and SSRC last reached, if it has been seen before. */
 	rocHint: number | undefined
+	/**
+	 * The ownership epoch this session was started under. Held on the session rather
+	 * than read from `epochs` when a report goes out, because that map follows the
+	 * port's current lifetime - and a report from an earlier one would then carry
+	 * the current epoch and pass for current.
+	 */
+	epoch: number
 	stopping: boolean
 }
 
@@ -193,6 +205,7 @@ export class SrtpProducer implements ExitingProducer {
 			pendingBytes: datagrams.reduce((sum, d) => sum + d.length, 0),
 			confirmedRoc: undefined,
 			rocHint,
+			epoch: context.epoch,
 			stopping: false,
 		}
 		this.sessions.set(port, session)
@@ -429,7 +442,7 @@ export class SrtpProducer implements ExitingProducer {
 						this.reportCounterRewind(port, session, key, message.roc)
 						// Only now does this port count as producing: until libsrtp has
 						// authenticated something, the traffic is unproven.
-						this.options.onAuthenticated?.(port)
+						this.options.onAuthenticated?.(port, session.epoch)
 					}
 					if (session.confirmedRoc !== message.roc) {
 						session.confirmedRoc = message.roc

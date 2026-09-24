@@ -854,7 +854,7 @@ void describe('PortIngestion', () => {
 			const h2 = provisional()
 			h2.send()
 			await h2.settle()
-			h2.machine.onAuthenticated()
+			h2.machine.onAuthenticated(h2.machine.currentEpoch)
 			await h2.settle()
 			assert.strictEqual(h2.machine.stateName, 'Running')
 
@@ -902,7 +902,7 @@ void describe('PortIngestion', () => {
 			const h2 = provisional()
 			h2.send()
 			await h2.settle()
-			h2.machine.onAuthenticated()
+			h2.machine.onAuthenticated(h2.machine.currentEpoch)
 			await h2.settle()
 			assert.strictEqual(h2.machine.stateName, 'Running')
 
@@ -944,9 +944,49 @@ void describe('PortIngestion', () => {
 			assert.strictEqual(h2.machine.stateName, 'Cooldown')
 		})
 
+		/**
+		 * An authentication report belongs to the lifetime whose producer made it.
+		 *
+		 * It is a callback that escapes the queue, like an exit, and the class comment's
+		 * rule applies: it carries its epoch and is dropped once that has moved on. It
+		 * used to carry nothing, so a late report from a replaced helper would have
+		 * promoted whichever Provisional lifetime the port was in by then.
+		 */
+		void it('ignores an authentication report from an earlier lifetime', async () => {
+			const h2 = provisional()
+			h2.send()
+			await h2.settle()
+			const first = h2.machine.currentEpoch
+
+			// That lifetime never authenticates, gives the slot back, and cools down...
+			h2.advance(20_000)
+			h2.machine.offer(datagram(5), new Date())
+			await h2.settle()
+			assert.strictEqual(h2.machine.stateName, 'Cooldown')
+
+			// ...and the next one claims the port and is provisional in its turn.
+			h2.advance(60_000)
+			h2.send()
+			await h2.settle()
+			assert.strictEqual(h2.machine.stateName, 'Provisional')
+			assert.notStrictEqual(h2.machine.currentEpoch, first)
+
+			h2.machine.onAuthenticated(first)
+			await h2.settle()
+			assert.strictEqual(
+				h2.machine.stateName,
+				'Provisional',
+				'a report from the earlier lifetime must not promote this one',
+			)
+
+			h2.machine.onAuthenticated(h2.machine.currentEpoch)
+			await h2.settle()
+			assert.strictEqual(h2.machine.stateName, 'Running')
+		})
+
 		void it('ignores an authentication report when not provisional', async () => {
 			const h2 = provisional()
-			h2.machine.onAuthenticated()
+			h2.machine.onAuthenticated(h2.machine.currentEpoch)
 			await h2.settle()
 			assert.strictEqual(h2.machine.stateName, 'Idle')
 		})

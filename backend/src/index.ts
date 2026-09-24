@@ -161,8 +161,8 @@ const buildService = (instanceId: string): IngestionService => {
 			streamNameForPort: (port) =>
 				`${config.kinesisStreamPrefix}-${String(port)}`,
 			kvsLogConfigPath: KVS_LOG_CONFIG_PATH,
-			onAuthenticated: (port: number) => {
-				serviceRef.current?.authenticated(port)
+			onAuthenticated: (port: number, epoch: number) => {
+				serviceRef.current?.authenticated(port, epoch)
 			},
 		})
 

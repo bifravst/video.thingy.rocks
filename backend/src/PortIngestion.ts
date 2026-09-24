@@ -194,8 +194,9 @@ const LOCK_HELD_STATES = new Set([
  * before the next is dequeued, which means no handler can observe an intermediate
  * state and the re-checks are unnecessary rather than merely correct.
  *
- * Callbacks that escape the queue - a producer exiting on its own - carry the
- * ownership epoch they were created under and are dropped if it has moved on.
+ * Callbacks that escape the queue - a producer exiting on its own, or reporting that
+ * its traffic authenticated - carry the ownership epoch they were created under and
+ * are dropped if it has moved on.
  *
  * There are no timers. A cooldown, a restart delay and a provisional deadline are all
  * fields compared against the clock when the next packet arrives; if no packet ever
@@ -344,9 +345,17 @@ export class PortIngestion {
 		void this.enqueue(async () => this.handleProducerExited(epoch))
 	}
 
-	/** The producer reported that traffic authenticated (SRTP). */
-	onAuthenticated(): void {
-		void this.enqueue(async () => this.handleAuthenticated())
+	/**
+	 * The producer reported that traffic authenticated (SRTP), under `epoch`.
+	 *
+	 * Carries the epoch because it is a callback that escapes the queue, and the class
+	 * comment's rule applies to it as much as to an exit: a report from a producer
+	 * started under an earlier ownership lifetime must not promote the current one.
+	 * Without it, a late report from a helper that had already been replaced would
+	 * have promoted whichever Provisional lifetime the port happened to be in.
+	 */
+	onAuthenticated(epoch: number): void {
+		void this.enqueue(async () => this.handleAuthenticated(epoch))
 	}
 
 	/** Stops everything and releases the lock. The machine is unusable afterwards. */
@@ -627,7 +636,9 @@ export class PortIngestion {
 		}
 	}
 
-	private async handleAuthenticated(): Promise<void> {
+	private async handleAuthenticated(epoch: number): Promise<void> {
+		// A late report from a previous ownership lifetime must not touch this one.
+		if (epoch !== this.epoch) return
 		if (this.state.name !== 'Provisional') return
 		this.logger.info('Authenticated traffic confirmed', { port: this.port })
 		this.transition({ name: 'Running' })
