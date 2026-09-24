@@ -90,10 +90,7 @@ class GstFake extends EventEmitter {
 		return true
 	}
 
-	private exit(
-		code: number | null,
-		signal: NodeJS.Signals | null = null,
-	): void {
+	exit(code: number | null, signal: NodeJS.Signals | null = null): void {
 		if (this.exitCode !== null || this.signalCode !== null) return
 		if (this.reader !== undefined) fs.closeSync(this.reader)
 		this.exitCode = code
@@ -288,4 +285,28 @@ void describe('KinesisIngestionPipeline', () => {
 			},
 		)
 	})
+
+	/**
+	 * A GStreamer that exits on its own, after it was running.
+	 *
+	 * stop() is what removes a pipeline's FIFO and closes its input, and it never runs
+	 * for one whose child has already exited, because the exit unregisters it. Every
+	 * such exit used to leave a FIFO in the temporary directory and its write end
+	 * open, and the port restarts after each one.
+	 */
+	void it(
+		'removes the FIFO of a GStreamer that exits on its own',
+		{ timeout: 10_000 },
+		async () => {
+			const { kinesis, children } = pipeline('opens its input')
+			const exited = new Promise((resolve) =>
+				kinesis.once('pipelineExited', resolve),
+			)
+			await kinesis.start(5000, Buffer.from('first-segment'))
+			children[0]?.exit(1)
+			await exited
+			assert.strictEqual(kinesis.isActive(5000), false)
+			assert.deepStrictEqual(fifosFor(5000), [])
+		},
+	)
 })

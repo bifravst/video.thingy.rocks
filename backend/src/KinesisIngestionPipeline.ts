@@ -548,9 +548,10 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			this.activePipelines.delete(port)
 		})
 		gst.on('exit', (code, signal) => {
-			// Emit before delete: if port was in activePipelines, this was an unexpected exit
-			// (intentional stop() removes from map before killing the process)
-			const wasUnexpected = this.activePipelines.has(port)
+			// Still registered means nobody stopped it: stop() unregisters a pipeline
+			// before ending it, and a start that fails never registers one.
+			const pipeline = this.activePipelines.get(port)
+			const wasUnexpected = pipeline?.gst === gst
 			this.logger.info('GStreamer exited', {
 				port,
 				streamName,
@@ -558,10 +559,19 @@ export class KinesisIngestionPipeline extends EventEmitter {
 				signal: signal ?? undefined,
 				unexpected: wasUnexpected,
 			})
+			if (!wasUnexpected) return
 			this.activePipelines.delete(port)
-			if (wasUnexpected) {
-				this.emit('pipelineExited', { port, code, signal })
+			// stop() never runs for this pipeline, since it is no longer registered, so
+			// its input and FIFO are released here or not at all.
+			pipeline.inputStream.destroy()
+			if (pipeline.fifoPath !== undefined) {
+				try {
+					fs.unlinkSync(pipeline.fifoPath)
+				} catch {
+					// Already gone.
+				}
 			}
+			this.emit('pipelineExited', { port, code, signal })
 		})
 		return { gstStderrThrottle, gstStdoutThrottle }
 	}
