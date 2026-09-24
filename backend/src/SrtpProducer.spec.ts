@@ -129,6 +129,8 @@ const start = async (
 		awaitStart?: boolean
 		/** Rollover counter this key and SSRC previously reached, if any. */
 		rocHint?: number
+		/** Cleared to model a helper that dies before its readiness is handled. */
+		reportReady?: boolean
 	} = {},
 ): Promise<{
 	producer: SrtpProducer
@@ -137,12 +139,19 @@ const start = async (
 	started: Promise<void>
 	/** The arguments the helper was started with. */
 	helperArgs: string[]
+	/** Every authentication the producer reported, as the port it named. */
+	authenticated: number[]
+	/** Every rollover counter the producer persisted. */
+	hintsWritten: number[]
 }> => {
 	// Nothing is bound to the default relay port: the fake helper only has to report
 	// one, and most tests do not depend on the datagrams arriving anywhere.
 	const helper = new HelperFake(options.relayPort ?? 45_454)
 	helper.ignoreSignals = options.ignoreSignals ?? false
+	helper.reportReadyOnInit = options.reportReady ?? true
 	const helperArgs: string[] = []
+	const authenticated: number[] = []
+	const hintsWritten: number[] = []
 	const logger = new CapturingLogger()
 	const producer = new SrtpProducer({
 		keyStore: {
@@ -156,12 +165,17 @@ const start = async (
 		} as unknown as SrtpKeyStore,
 		hints: {
 			getSrtpRocHint: async () => options.rocHint,
-			putSrtpRocHint: async () => undefined,
+			putSrtpRocHint: async (_port, roc) => {
+				hintsWritten.push(roc)
+			},
 		},
 		region: 'eu-central-1',
 		streamNameForPort: (port) => `test-video-${String(port)}`,
 		kvsLogConfigPath: '/dev/null',
 		stopSigkillAfterMs: options.stopSigkillAfterMs,
+		onAuthenticated: (port) => {
+			authenticated.push(port)
+		},
 		spawn: ((_command: string, args: string[]) => {
 			helperArgs.push(...args)
 			return helper as unknown as ChildProcess
@@ -170,7 +184,15 @@ const start = async (
 	})
 	const started = producer.start(PORT, options.datagrams ?? [], { epoch: 1 })
 	if (options.awaitStart !== false) await started
-	return { producer, helper, logger, started, helperArgs }
+	return {
+		producer,
+		helper,
+		logger,
+		started,
+		helperArgs,
+		authenticated,
+		hintsWritten,
+	}
 }
 
 void describe('SrtpProducer', () => {
@@ -281,6 +303,98 @@ void describe('SrtpProducer', () => {
 			} finally {
 				await producer.stop(PORT)
 				relay.close()
+			}
+		})
+	})
+
+	/**
+	 * A session that is over can still be heard, but no longer act.
+	 *
+	 * The stdout handler holds its session for as long as frames arrive, and frames
+	 * can arrive after the session is over - Node documents that stdio may still be
+	 * open when 'exit' fires, and the exit handler closes the session at once. I could
+	 * not get Node to deliver them in that order here in 600 tries, so the fake does
+	 * it: it exits, then writes. Acting on such a frame could promote the lifetime that
+	 * replaced the session, or overwrite its rollover counter.
+	 */
+	void describe('frames from a session that is over', () => {
+		const authOk = (helper: HelperFake): void => {
+			helper.stdout.write(
+				`${JSON.stringify({ t: 'auth', status: 'ok', first: true, roc: 7, trials: 1 })}\n`,
+			)
+		}
+
+		void it('neither reports authentication nor persists a counter after exit', async () => {
+			const { helper, authenticated, hintsWritten } = await start()
+			helper.exit(1)
+			authOk(helper)
+			await delay(20)
+			assert.deepStrictEqual(authenticated, [])
+			assert.deepStrictEqual(hintsWritten, [])
+		})
+
+		// A helper that reports ready and dies, with the exit handled first. Its relay
+		// socket is closed by then, and connecting it throws synchronously - from the
+		// stdout handler, where nothing would catch it.
+		void it('ignores a ready that arrives after the helper has exited', async () => {
+			const { helper, started } = await start({
+				reportReady: false,
+				awaitStart: false,
+			})
+			await delay(5)
+			helper.exit(1)
+			await assert.rejects(async () => started)
+			helper.stdout.write(
+				`${JSON.stringify({ t: 'ready', v: SRTP_HELPER_PROTOCOL_VERSION, relayPort: 45_455 })}\n`,
+			)
+			await delay(20)
+		})
+
+		void it('does not act for a session that is stopping', async () => {
+			const { producer, helper, authenticated, hintsWritten } = await start({
+				ignoreSignals: true,
+				stopSigkillAfterMs: 60_000,
+			})
+			const stopping = producer.stop(PORT)
+			try {
+				authOk(helper)
+				await delay(20)
+				assert.deepStrictEqual(authenticated, [])
+				assert.deepStrictEqual(hintsWritten, [])
+			} finally {
+				// The helper ignores signals here, so stop() waits for this; skipping it
+				// on a failed assertion would leave the suite hanging on SIGKILL's timer.
+				helper.exit(0)
+				await stopping
+			}
+		})
+
+		void it('still logs what a dying helper says', async () => {
+			const { helper, logger } = await start()
+			helper.exit(1)
+			helper.stdout.write(
+				`${JSON.stringify({ t: 'warning', element: 'kvssink', message: 'last words' })}\n`,
+			)
+			await delay(20)
+			assert.ok(
+				logger.warnings.some(
+					(w) =>
+						w.message === 'SRTP pipeline warning' &&
+						w.context?.message === 'last words',
+				),
+			)
+		})
+
+		// The ordinary case, so the guard is known not to swallow it.
+		void it('acts for the current session as before', async () => {
+			const { producer, helper, authenticated, hintsWritten } = await start()
+			try {
+				authOk(helper)
+				await delay(20)
+				assert.deepStrictEqual(authenticated, [PORT])
+				assert.deepStrictEqual(hintsWritten, [7])
+			} finally {
+				await producer.stop(PORT)
 			}
 		})
 	})

@@ -374,6 +374,24 @@ export class SrtpProducer implements ExitingProducer {
 		}
 	}
 
+	/**
+	 * Whether a session may still act for its port, rather than only be heard.
+	 *
+	 * A helper's stdout handler holds on to its session for as long as frames arrive,
+	 * and frames can arrive after the session is over: Node documents that stdio may
+	 * still be open when 'exit' fires, and the exit handler closes the session at once.
+	 * A stopping session is over too, as far as the port is concerned. Neither may
+	 * connect a relay, report authentication or persist a rollover counter - that
+	 * could promote or overwrite the lifetime that replaced it. Both may still be
+	 * logged, because a dying helper's last words are the diagnostics worth having.
+	 *
+	 * The cost is a stopping session's last authenticated rollover counter going
+	 * unpersisted, which at most costs the next start a short search.
+	 */
+	private acts(port: number, session: Session): boolean {
+		return this.sessions.get(port) === session && !session.stopping
+	}
+
 	private handleMessage(
 		port: number,
 		session: Session,
@@ -383,6 +401,9 @@ export class SrtpProducer implements ExitingProducer {
 	): void {
 		switch (message.t) {
 			case 'ready':
+				// Its relay socket is already closed once the session has ended, and
+				// connecting a closed socket throws - here, from the stdout handler.
+				if (!this.acts(port, session)) return
 				if (message.v !== SRTP_HELPER_PROTOCOL_VERSION) {
 					settle?.(
 						new Error(
@@ -398,6 +419,7 @@ export class SrtpProducer implements ExitingProducer {
 				return
 			case 'auth':
 				if (message.status === 'ok') {
+					if (!this.acts(port, session)) return
 					if (message.first) {
 						this.logger.info('SRTP traffic authenticated', {
 							port,
@@ -454,7 +476,9 @@ export class SrtpProducer implements ExitingProducer {
 				// here, so that advice pointed at nothing. Afterwards they are routine and
 				// stay out of the log, so a healthy stream adds nothing to it. Bounded
 				// either way: an unauthenticated port holds its slot for one provisional
-				// window at a time.
+				// window at a time. Not for a session that is over: its counts describe a
+				// pipeline the port no longer has.
+				if (!this.acts(port, session)) return
 				if (session.confirmedRoc === undefined) {
 					this.logger.info('SRTP pipeline stats', {
 						port,
