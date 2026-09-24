@@ -217,6 +217,11 @@ export class StreamingStack extends Stack {
 		// Grant read access to the SRTP keys, scoped to this stack's parameters.
 		// The partition comes from the stack rather than being hardcoded as "aws", so
 		// this is still correct in other partitions.
+		// There is deliberately no kms:Decrypt grant: scripts/provision-srtp-key.sh
+		// writes the keys as SecureStrings under the AWS managed key aws/ssm, whose key
+		// policy already lets any principal in the account decrypt through SSM. Keys
+		// under a customer managed key would need kms:Decrypt on that key here (with a
+		// kms:ViaService condition for SSM) and a key policy that allows this role.
 		this.ec2Role.addToPolicy(
 			new iam.PolicyStatement({
 				effect: iam.Effect.ALLOW,

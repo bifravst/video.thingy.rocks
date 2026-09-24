@@ -111,6 +111,9 @@ trap 'exit 143' TERM
 # value is a JSON string containing JSON, hence the escaped quotes; every part of it is
 # either a fixed literal or already validated above as hex or decimal digits, so there is
 # nothing here that could need further escaping.
+# There is no KeyId, so SSM encrypts with the AWS managed key aws/ssm. The instance role
+# can decrypt that without a KMS grant; a customer managed key would need one (see the
+# SRTP key grant in cdk/StreamingStack.ts).
 printf '{"Name":"%s","Type":"SecureString","Overwrite":true,"Value":"{\\"key\\":\\"%s\\",\\"ssrc\\":%s,\\"cipher\\":\\"%s\\",\\"auth\\":\\"%s\\"}"}' \
   "$PARAMETER_NAME" "$HEX_KEY" "$SSRC" "$CIPHER" "$AUTH" >"$REQUEST_FILE"
 

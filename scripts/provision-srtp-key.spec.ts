@@ -110,14 +110,24 @@ void describe('provision-srtp-key.sh', () => {
 			Name: string
 			Type: string
 			Value: string
+			KeyId?: string
 		}
 		assert.strictEqual(request.Type, 'SecureString')
 		assert.strictEqual((JSON.parse(request.Value) as { key: string }).key, key)
 
+		const argv = readFileSync(`${log}.argv`, 'utf8')
 		assert.ok(
-			!readFileSync(`${log}.argv`, 'utf8').includes(key),
+			!argv.includes(key),
 			'the key must reach the AWS CLI through the request file only',
 		)
+		// The instance role has no kms:Decrypt grant, which only works for parameters
+		// encrypted with the AWS managed key (see the SRTP key grant in StreamingStack).
+		assert.strictEqual(
+			request.KeyId,
+			undefined,
+			'the parameter must be encrypted with aws/ssm, which the instance role can use without a KMS grant',
+		)
+		assert.doesNotMatch(argv, /--key-id/)
 		assert.strictEqual(
 			readFileSync(`${log}.mode`, 'utf8').trim(),
 			'600',
