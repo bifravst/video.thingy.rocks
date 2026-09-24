@@ -172,6 +172,12 @@ type PortState =
 	| { name: 'Running' }
 	| { name: 'Restarting'; restartAt: number }
 	| { name: 'Stopping' }
+	/**
+	 * A stop failed, so the producer may still be running: the lock is kept, and the
+	 * stop is tried again on the next packet after `retryAt`, on inactivity and on
+	 * shutdown. See stopProducer.
+	 */
+	| { name: 'StopFailed'; retryAt: number }
 	| { name: 'Terminated' }
 
 /** States in which this instance holds the port's DynamoDB lock. */
@@ -181,6 +187,7 @@ const LOCK_HELD_STATES = new Set([
 	'Running',
 	'Restarting',
 	'Stopping',
+	'StopFailed',
 ])
 
 /**
@@ -358,10 +365,19 @@ export class PortIngestion {
 		void this.enqueue(async () => this.handleAuthenticated(epoch))
 	}
 
-	/** Stops everything and releases the lock. The machine is unusable afterwards. */
+	/**
+	 * Stops everything and releases the lock. The machine is unusable afterwards.
+	 *
+	 * Rejects if the producer could not be stopped. The lock is then still held, and
+	 * left to go stale rather than released under a producer that may be running, and
+	 * the machine stays in StopFailed so that calling this again tries again.
+	 */
 	async shutdown(): Promise<void> {
-		const done = this.enqueue(async () => this.handleShutdown())
-		await done
+		let failure: Error | undefined
+		await this.enqueue(async () => {
+			failure = await this.handleShutdown()
+		})
+		if (failure !== undefined) throw failure
 	}
 
 	/** Resolves when every queued event has run; for tests and for shutdown ordering. */
@@ -454,6 +470,10 @@ export class PortIngestion {
 				await this.startProducer(this.pending.take())
 				return
 			}
+			case 'StopFailed':
+				if (this.now() < this.state.retryAt) return
+				await this.teardown([], this.startRetryBackoffMs)
+				return
 			case 'Provisional':
 				if (this.now() >= this.state.expiresAt) {
 					this.logger.warn(
@@ -613,7 +633,7 @@ export class PortIngestion {
 				port: this.port,
 			})
 			this.transition({ name: 'Stopping' })
-			await this.stopProducer()
+			if (!(await this.stopProducer())) return
 			this.transition({
 				name: 'Cooldown',
 				retryAt: this.now() + this.startRetryBackoffMs,
@@ -661,8 +681,9 @@ export class PortIngestion {
 			case 'Provisional':
 			case 'Running':
 			case 'Restarting':
-				await this.teardown([], undefined)
-				this.transition({ name: 'Idle' })
+			case 'StopFailed':
+				if (await this.teardown([], undefined))
+					this.transition({ name: 'Idle' })
 				return
 			case 'Acquiring':
 			case 'Starting':
@@ -685,7 +706,7 @@ export class PortIngestion {
 		// Reap the exited child and release any transport resources it held before
 		// announcing Restarting: that state asserts there is no producer, so tearing
 		// it down afterwards would leave a window where both were true at once.
-		await this.stopProducer()
+		if (!(await this.stopProducer())) return
 		// The lock stays held: this instance is still the owner, and releasing it here
 		// would hand the stream to another instance for the length of a restart.
 		this.transition({
@@ -694,13 +715,16 @@ export class PortIngestion {
 		})
 	}
 
-	private async handleShutdown(): Promise<void> {
-		if (this.state.name === 'Terminated') return
-		if (this.ownsSlot) {
-			await this.teardown([], undefined)
+	private async handleShutdown(): Promise<Error | undefined> {
+		if (this.state.name === 'Terminated') return undefined
+		if (this.ownsSlot && !(await this.teardown([], undefined))) {
+			return new Error(
+				`The producer for port ${String(this.port)} did not stop; its lock is left to go stale`,
+			)
 		}
 		this.pending.clear()
 		this.transition({ name: 'Terminated' })
+		return undefined
 	}
 
 	/**
@@ -708,14 +732,20 @@ export class PortIngestion {
 	 *
 	 * The order is the point. Releasing first lets another instance acquire the port and
 	 * start writing to the same Kinesis stream while this producer is still alive, so
-	 * the producer always dies first.
+	 * the producer always dies first - and a producer that could not be stopped is
+	 * not known to have died, so the lock is not released at all. Returns false in
+	 * that case, with the machine in StopFailed.
 	 */
 	private async teardown(
 		datagramsToRearm: Buffer[],
 		cooldownMs: number | undefined,
-	): Promise<void> {
+	): Promise<boolean> {
 		this.transition({ name: 'Stopping' })
-		await this.stopProducer()
+		if (!(await this.stopProducer())) {
+			this.pending.prependAll(datagramsToRearm)
+			this.pending.evictTo(this.maxQueuedBytes)
+			return false
+		}
 		await this.releaseLock()
 
 		this.pending.prependAll(datagramsToRearm)
@@ -724,20 +754,36 @@ export class PortIngestion {
 		if (cooldownMs === undefined) {
 			this.pending.clear()
 			this.transition({ name: 'Idle' })
-			return
+			return true
 		}
 		this.transition({ name: 'Cooldown', retryAt: this.now() + cooldownMs })
+		return true
 	}
 
-	private async stopProducer(): Promise<void> {
+	/**
+	 * Stops the producer, or holds the port in StopFailed if that fails.
+	 *
+	 * A stop that rejected says nothing about whether the producer is gone, and the
+	 * safe reading is that it is not. Carrying on as if it were used to release the
+	 * lock under it, letting another instance start a second writer to the same
+	 * stream. Keeping the lock instead costs at most the lease: if the stop never
+	 * succeeds, the row goes stale and another instance takes the port over then.
+	 */
+	private async stopProducer(): Promise<boolean> {
 		try {
 			await this.producer.stop(this.port)
+			return true
 		} catch (err) {
 			this.logger.error(
-				'Failed to stop the producer',
+				'Failed to stop the producer; keeping the lock until it stops',
 				err instanceof Error ? err : new Error(String(err)),
 				{ port: this.port },
 			)
+			this.transition({
+				name: 'StopFailed',
+				retryAt: this.now() + this.startRetryBackoffMs,
+			})
+			return false
 		}
 	}
 

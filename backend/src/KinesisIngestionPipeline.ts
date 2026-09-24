@@ -661,11 +661,14 @@ export class KinesisIngestionPipeline extends EventEmitter {
 			try {
 				fs.unlinkSync(fifoPath)
 			} catch (e) {
-				this.logger.warn('Failed to unlink FIFO', {
-					port,
-					fifoPath,
-					message: e instanceof Error ? e.message : String(e),
-				})
+				// Gone already when this is a retry of a stop that failed.
+				if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+					this.logger.warn('Failed to unlink FIFO', {
+						port,
+						fifoPath,
+						message: e instanceof Error ? e.message : String(e),
+					})
+				}
 			}
 		}
 
@@ -681,10 +684,16 @@ export class KinesisIngestionPipeline extends EventEmitter {
 				},
 			})
 		} catch (err) {
+			// Not known to be gone, so this must not return as if it were: the caller
+			// releases the lock when it does. Registered again so that a retry reaches
+			// the child, and so that its exit, whenever it comes, is still reported.
 			this.logger.warn('Error waiting for pipeline stop', {
 				port,
 				error: err instanceof Error ? err.message : String(err),
 			})
+			if (!this.activePipelines.has(port))
+				this.activePipelines.set(port, pipeline)
+			throw err
 		}
 		this.logger.info('Kinesis ingestion stopped', { port })
 	}

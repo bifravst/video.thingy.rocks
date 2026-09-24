@@ -43,6 +43,8 @@ class GstFake extends EventEmitter {
 	signalCode: NodeJS.Signals | null = null
 	received = ''
 	private reader: number | undefined
+	/** Models a kill that cannot be delivered, so the child cannot be ended. */
+	killThrows = false
 
 	constructor(
 		command: string,
@@ -86,6 +88,7 @@ class GstFake extends EventEmitter {
 
 	kill(signal: NodeJS.Signals = 'SIGTERM'): boolean {
 		this.signals.push(signal)
+		if (this.killThrows) throw new Error('EPERM')
 		this.exit(null, signal)
 		return true
 	}
@@ -101,14 +104,14 @@ class GstFake extends EventEmitter {
 
 const pipeline = (
 	behaviour: Behaviour,
-	options: { inputTimeoutMs?: number } = {},
+	options: { inputTimeoutMs?: number; stopDrainMs?: number } = {},
 ): { kinesis: KinesisIngestionPipeline; children: GstFake[] } => {
 	const children: GstFake[] = []
 	const kinesis = new KinesisIngestionPipeline({
 		streamNamePrefix: 'test-video',
 		region: 'eu-central-1',
 		portRange: { start: 5000, end: 5009 },
-		stopDrainMs: 1_000,
+		stopDrainMs: options.stopDrainMs ?? 1_000,
 		stopSigkillAfterMs: 1_000,
 		inputTimeoutMs: options.inputTimeoutMs,
 		spawn: ((_command: string, args: string[]) => {
@@ -306,6 +309,38 @@ void describe('KinesisIngestionPipeline', () => {
 			children[0]?.exit(1)
 			await exited
 			assert.strictEqual(kinesis.isActive(5000), false)
+			assert.deepStrictEqual(fifosFor(5000), [])
+		},
+	)
+
+	/**
+	 * A stop that cannot end GStreamer does not report that it did.
+	 *
+	 * The caller releases the port's lock when stop() resolves, so resolving while the
+	 * child may still be running hands the stream to a second writer. It used to log
+	 * the failure and resolve anyway, with the pipeline already unregistered, so a
+	 * retry had nothing left to stop.
+	 */
+	void it(
+		'fails a stop that cannot end GStreamer, and can be retried',
+		{ timeout: 10_000 },
+		async () => {
+			const { kinesis, children } = pipeline(
+				'opens its input and stops reading',
+				{ stopDrainMs: 50 },
+			)
+			await kinesis.start(5000, Buffer.from('first-segment'))
+			const gst = children[0]
+			assert.ok(gst !== undefined)
+			gst.killThrows = true
+
+			await assert.rejects(async () => kinesis.stop(5000), /EPERM/)
+			assert.strictEqual(kinesis.isActive(5000), true, 'still registered')
+
+			gst.killThrows = false
+			await kinesis.stop(5000)
+			assert.strictEqual(kinesis.isActive(5000), false)
+			assert.strictEqual(gst.signalCode, 'SIGTERM')
 			assert.deepStrictEqual(fifosFor(5000), [])
 		},
 	)

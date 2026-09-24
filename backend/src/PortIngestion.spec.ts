@@ -78,6 +78,8 @@ class ProducerFake {
 	active = false
 	startGate?: Promise<void>
 	startBehaviour: 'ok' | 'throw' | 'inactive' = 'ok'
+	/** 'throw' models a stop that fails and leaves the producer running. */
+	stopBehaviour: 'ok' | 'throw' = 'ok'
 	/** Datagrams start() "did not send", handed back on a failed start. */
 	unsent: Buffer[] = []
 	takeUnsentCount = 0
@@ -95,6 +97,7 @@ class ProducerFake {
 
 	async stop() {
 		this.stopCount += 1
+		if (this.stopBehaviour === 'throw') throw new Error('stop failed')
 		this.active = false
 	}
 
@@ -202,7 +205,7 @@ const harness = (config: Partial<PortIngestionConfig> = {}): Harness => {
 				// I2: an active producer only exists in these states.
 				if (producer.isActive()) {
 					assert.ok(
-						['Provisional', 'Running', 'Stopping'].includes(to),
+						['Provisional', 'Running', 'Stopping', 'StopFailed'].includes(to),
 						`I2 violated: producer active in ${to}`,
 					)
 				}
@@ -466,6 +469,110 @@ void describe('PortIngestion', () => {
 
 			assert.strictEqual(h.machine.stateName, 'Running')
 			assert.strictEqual(h.producer.stopCount, 0)
+		})
+	})
+
+	/**
+	 * A producer that could not be stopped keeps the lock.
+	 *
+	 * A stop that rejects says nothing about whether the producer is gone, and every
+	 * path used to log the failure and carry on as if it were - teardown then released
+	 * the lock under a producer that may still be writing, and another instance could
+	 * acquire the stream and start a second writer. The I1 and release-while-producing
+	 * checks in the harness hold throughout; these pin what happens instead.
+	 */
+	void describe('a stop that fails', () => {
+		const running = async (): Promise<void> => {
+			h.send()
+			await h.settle()
+			h.producer.stopBehaviour = 'throw'
+		}
+
+		void it('keeps the lock on inactivity when the stop fails', async () => {
+			await running()
+			h.activity.goInactive()
+			h.machine.onInactive()
+			await h.settle()
+
+			assert.strictEqual(h.machine.stateName, 'StopFailed')
+			assert.strictEqual(h.machine.ownsSlot, true)
+			assert.deepStrictEqual(h.locks.calls, ['acquire'])
+		})
+
+		void it('tries again after the backoff, and releases once the stop works', async () => {
+			await running()
+			h.activity.goInactive()
+			h.machine.onInactive()
+			await h.settle()
+
+			h.producer.stopBehaviour = 'ok'
+			h.send(5)
+			await h.settle()
+			assert.strictEqual(
+				h.machine.stateName,
+				'StopFailed',
+				'not before the backoff',
+			)
+			assert.strictEqual(h.producer.stopCount, 1)
+
+			h.advance(30_000)
+			h.send(5)
+			await h.settle()
+			assert.strictEqual(h.producer.stopCount, 2)
+			assert.strictEqual(h.machine.stateName, 'Cooldown')
+			assert.deepStrictEqual(h.locks.calls, ['acquire', 'release'])
+		})
+
+		void it('tries again on inactivity', async () => {
+			await running()
+			h.activity.goInactive()
+			h.machine.onInactive()
+			await h.settle()
+
+			h.producer.stopBehaviour = 'ok'
+			h.machine.onInactive()
+			await h.settle()
+			assert.strictEqual(h.machine.stateName, 'Idle')
+			assert.deepStrictEqual(h.locks.calls, ['acquire', 'release'])
+		})
+
+		void it('keeps the lock when the stop after a lost lease fails', async () => {
+			await running()
+			h.locks.heartbeatOutcomes = ['lostLock']
+			h.send(5)
+			await h.settle()
+			assert.strictEqual(h.machine.stateName, 'StopFailed')
+		})
+
+		void it('does not announce a restart when reaping an exited producer fails', async () => {
+			await running()
+			h.machine.onProducerExited(h.machine.currentEpoch)
+			await h.settle()
+			assert.strictEqual(h.machine.stateName, 'StopFailed')
+			assert.deepStrictEqual(h.locks.calls, ['acquire'])
+		})
+
+		void it('keeps the lock, and the datagrams, when a failed start cannot be stopped', async () => {
+			h.producer.startBehaviour = 'throw'
+			h.producer.stopBehaviour = 'throw'
+			h.producer.unsent = [datagram(30, 7)]
+			h.send()
+			await h.settle()
+			assert.strictEqual(h.machine.stateName, 'StopFailed')
+			assert.deepStrictEqual(h.locks.calls, ['acquire'])
+			assert.strictEqual(h.machine.bufferedBytes, 30)
+		})
+
+		void it('fails shutdown without releasing, and succeeds when called again', async () => {
+			await running()
+			await assert.rejects(async () => h.machine.shutdown(), /did not stop/)
+			assert.strictEqual(h.machine.stateName, 'StopFailed')
+			assert.deepStrictEqual(h.locks.calls, ['acquire'])
+
+			h.producer.stopBehaviour = 'ok'
+			await h.machine.shutdown()
+			assert.strictEqual(h.machine.stateName, 'Terminated')
+			assert.deepStrictEqual(h.locks.calls, ['acquire', 'release'])
 		})
 	})
 
