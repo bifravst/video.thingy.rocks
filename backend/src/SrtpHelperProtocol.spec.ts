@@ -90,6 +90,22 @@ void describe('SrtpHelperProtocol', () => {
 			)
 		})
 
+		// The one number that is persisted and handed to the next helper as its floor,
+		// so it is taken only as a whole packet index: 32 bits of rollover counter and
+		// 16 of sequence number.
+		void it('parses the highest accepted packet index', () => {
+			assert.deepStrictEqual(parse(line({ t: 'index', index: 2 ** 48 - 1 })), [
+				{ t: 'index', index: 2 ** 48 - 1 },
+			])
+			for (const index of [-1, 1.5, 2 ** 48, '7', undefined]) {
+				assert.strictEqual(
+					parse(line({ t: 'index', index }))[0]?.t,
+					'unparsed',
+					String(index),
+				)
+			}
+		})
+
 		void it('parses stats, keeping an unreported rollover counter null', () => {
 			assert.deepStrictEqual(
 				parse(

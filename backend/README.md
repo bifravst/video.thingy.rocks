@@ -38,30 +38,37 @@ Ports **6000-6009** on the load balancer's address.
   is the wait for the device's next keyframe. Keep that interval short if fast
   recovery matters.
 
-  **A device must not restart its sequence numbering while keeping its key.**
-  SRTP derives its keystream from the master key, the SSRC and the packet index
+  **A device must never restart its sequence numbering while keeping its key,
+  and the receiver will not accept it if it does.** SRTP derives its keystream
+  from the master key, the SSRC and the packet index
   ([RFC 3711 §9.1](https://www.rfc-editor.org/rfc/rfc3711#section-9.1)), and on
   this path the key is static and the SSRC fixed per port - so rewinding the
   index encrypts new payloads under a keystream that has already been used, and
   XORing two such packets cancels the keystream and leaves the XOR of the two
-  plaintexts. It also puts packets captured before the restart back inside the
-  receiver's replay window, so an attacker who recorded them can have them
-  accepted again.
+  plaintexts.
+
+  The receiver keeps a replay floor for each port: the highest packet index it
+  has ever accepted under the port's key and SSRC, stored in DynamoDB and only
+  ever raised. Nothing at or below it is accepted, whichever instance receives
+  it and however often the pipeline restarts. That is what stops a recording of
+  earlier traffic from authenticating again - `libsrtp`'s own replay window
+  lives in the pipeline process and starts empty every time - and it means a
+  device that rewinds its index under the same key is refused too, because from
+  the receiver the two are indistinguishable. Such a device's traffic is counted
+  and dropped
+  (`dropped N authenticated datagrams at or below the highest packet index already accepted under this key`),
+  or, if it rewound by a whole rollover or more, simply never authenticates.
 
   So whenever a device restarts its numbering - on reboot, re-session or factory
   reset - provision a fresh key for its port first
   (`scripts/provision-srtp-key.sh`), and restart the instances so the new key is
-  read. A device that cannot guarantee a monotonic index across reboots needs a
-  new key on every boot.
+  read. A new key starts a new floor. A device that cannot guarantee a monotonic
+  index across reboots needs a new key on every boot.
 
-  The receiver cannot enforce this; only provisioning can. What it does do is
-  notice: the rollover counter each key reaches is persisted, so a stream that
-  authenticates below the counter its own key previously reached is logged as
-  `SRTP sender restarted its packet index under a key it has already used`.
-  Treat that as a signal to rotate the port's key. The check is one-sided - a
-  counter that went backwards proves reuse, while a rewind within a single
-  rollover epoch leaves the counter unchanged and goes unseen - and ingestion
-  continues regardless, since refusing the stream would not undo the reuse.
+  The floor is written from the pipeline's reports every few seconds and when
+  the pipeline ends, so what a replay can still reach is the traffic since the
+  last write before an instance died without warning - seconds of it, not the
+  whole history. A start that cannot read the floor does not start.
 
 - **Keyframes**: send SPS/PPS regularly (for example `config-interval=1` in
   GStreamer), so a receiver that joins mid-stream can start decoding.

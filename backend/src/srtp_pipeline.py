@@ -16,6 +16,12 @@ three reasons, each of which removes a whole class of problem rather than mitiga
 * srtpdec reports which packets it authenticated, so the parent can tell traffic that
   holds the key from traffic that merely reached a public UDP port.
 
+Authenticated is not the same as fresh. libsrtp's replay window lives in this process
+and starts empty, so on its own it would accept a recording of earlier traffic again
+after every restart. The parent therefore hands over a floor - the highest packet index
+ever accepted under this key and SSRC - and nothing at or below it gets through; see
+SrtpPipeline._record_authenticated.
+
 The parent speaks to it with one JSON line on stdin (the key material) and reads
 line-delimited JSON on stdout. See SrtpHelperProtocol.ts for the consuming side.
 """
@@ -35,8 +41,10 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import GLib, Gst  # noqa: E402
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 SUPERVISOR_TICK_MS = 50
+#: How often the highest accepted packet index is reported while it moves; see _tick.
+INDEX_REPORT_MS = 1000
 #: Half the 16-bit RTP sequence number space: a jump of more than this is read as the
 #: short way round in the other direction, per RFC 3711 appendix A.
 SEQ_MIDPOINT = 1 << 15
@@ -44,6 +52,8 @@ SEQ_MIDPOINT = 1 << 15
 #: trying and the modulus the counter wraps at.
 ROC_MODULO = 1 << 32
 ROC_MAX = ROC_MODULO - 1
+#: A packet index is the rollover counter and the sequence number side by side.
+INDEX_MAX = (ROC_MODULO << 16) - 1
 #: Anything this long and hexadecimal in argv would be key material.
 KEY_SHAPED = re.compile(r"^[0-9a-fA-F]{40,}$")
 #: GST_DEBUG at this level or above makes GStreamer log element caps, which would
@@ -51,75 +61,49 @@ KEY_SHAPED = re.compile(r"^[0-9a-fA-F]{40,}$")
 MAX_SAFE_GST_DEBUG = 3
 
 
-def candidates(hint: int, max_offset: int) -> "object":
+def candidates(base: int, max_offset: int) -> "object":
     """Yields rollover-counter candidates to try, in order of likelihood.
 
-    The hint comes first, because the common case is that nothing wrapped while
-    ingestion was down. Zero comes second, because the next most likely explanation
-    is a sender that restarted its SRTP session - which used to leave the port stuck
-    until an operator edited the database by hand.
+    `base` is the rollover counter of the floor: the highest packet index already
+    accepted under this key and SSRC. Nothing below it is ever offered, because every
+    packet it could authenticate would be below the floor and be dropped anyway - and
+    that is the point. A stream below the floor is either a recording of traffic this
+    port already accepted, or a sender that restarted its packet index under a key it
+    had already used, which reuses its keystream. The two look identical from here,
+    and neither may be accepted; the second is fixed by provisioning a new key, which
+    starts a new floor. See the SRTP section of backend/README.md.
 
-    Recovering from that is not the same as endorsing it. A sender that rewinds its
-    packet index while keeping its key reuses the keystream, and the operator still
-    has to rotate the key; this search exists for the case where *ingestion* was down
-    while the sender kept counting. SrtpProducer reports the rewind when it can see
-    one - see its reportCounterRewind, and the SRTP section of backend/README.md.
+    The floor comes first, because the common case is that nothing wrapped while
+    ingestion was down, and then the search climbs from it: a sender that kept
+    counting while nobody was listening is above it by however many times it wrapped.
 
-    After that the search walks outwards from the hint in *both* directions, and
-    downwards is not optional: a hint one above the actual counter is what a stale
-    value left by a longer previous session looks like, and an upwards-only search
-    can never reach it.
-
-    `max_offset` is the width of a band, not the end of the search. Each band moves
-    another `max_offset` away from the hint and from zero, and the bands keep coming
-    until the whole uint32 counter space has been offered - so no reachable value is
-    permanently excluded by a fixed offset cycle. Every band re-offers the hint and
-    zero first, because they stay the two most likely answers no matter how far the
-    search has wandered, and because the reason a band was exhausted is usually
-    traffic that never held the key at all.
+    `max_offset` is the width of a band. Each band climbs another `max_offset` above
+    the floor, and the bands keep coming until every counter above it has been offered.
+    Every band re-offers the floor first, because it stays the most likely answer no
+    matter how far the search has climbed, and because the reason a band was
+    exhausted is usually traffic that never held the key at all.
 
     The sequence repeats rather than ending, so a stream that only becomes
     decryptable later - a sender that starts long after the search began - is still
     picked up. Nothing is retried while no datagrams are arriving, so repeating costs
     nothing when the port is idle.
     """
-    hint = min(max(hint, 0), ROC_MAX)
+    base = min(max(base, 0), ROC_MAX)
     width = max(int(max_offset), 1)
     band = 0
     while True:
         first = band * width + 1
-        if first > ROC_MAX:
-            # Every candidate in the counter space has been offered; start over rather
-            # than ending, for the same reason each band repeats the hint.
+        if base + first > ROC_MAX:
+            # Every candidate above the floor has been offered; start over rather
+            # than ending, for the same reason each band repeats the floor.
             band = 0
+            if base == ROC_MAX:
+                yield base
             continue
-        seen: set[int] = set()
-        for value in _candidate_band(hint, first, first + width - 1):
-            if value in seen:
-                continue
-            seen.add(value)
-            yield value
+        yield base
+        for k in range(first, min(first + width - 1, ROC_MAX - base) + 1):
+            yield base + k
         band += 1
-
-
-def _candidate_band(hint: int, first: int, last: int) -> "object":
-    """One band of candidates: the hint, zero, then `first`..`last` either side."""
-    yield hint
-    yield 0
-    for k in range(first, last + 1):
-        # One step further than the hint: that many rollovers happened while
-        # ingestion was down.
-        if hint + k <= ROC_MAX:
-            yield hint + k
-        # One step below the hint: the persisted value outlived the session it was
-        # written for, so the stream is *behind* it. This is the branch that makes a
-        # hint which is too high recoverable at all.
-        if hint - k >= 0:
-            yield hint - k
-        # One step further from zero: the sender restarted its session and has
-        # wrapped that many times since.
-        if k <= ROC_MAX:
-            yield k
 
 
 def rollover_of(roc: int, highest_seq: int, seq: int) -> int:
@@ -247,8 +231,17 @@ class Counters:
         self.access_units = 0
         #: Highest authenticated sequence number, i.e. the s_l of RFC 3711 appendix A.
         #: With roc it forms the highest authenticated packet index, which is what a
-        #: wrap has to be judged against - not the previous arrival.
+        #: wrap has to be judged against - not the previous arrival. It follows
+        #: everything libsrtp authenticated, stale packets included, because it has to
+        #: agree with libsrtp's own estimate of the next packet's index.
         self.highest_seq: int | None = None
+        #: Highest packet index accepted - authenticated and above the floor. This, not
+        #: the tracker above, is what the parent persists as the next floor.
+        self.highest_index: int | None = None
+        #: Authenticated datagrams dropped for being at or below the floor, since the
+        #: last report. Counted, like foreign_ssrc, so a replay cannot write to the logs
+        #: at line rate.
+        self.stale = 0
         self.last_auth_ms = 0
         #: Rollover counter of the authenticated stream, tracked from authenticated
         #: packets only - never from the plaintext headers of traffic that failed to
@@ -279,9 +272,16 @@ class SrtpPipeline:
         self.cipher = str(init.get("cipher") or "aes-128-icm")
         self.auth = str(init.get("auth") or "hmac-sha1-80")
         self.ssrc = int(init.get("ssrc") or args.ssrc)
-        hint = init.get("rocHint")
-        self.hint = int(hint) if isinstance(hint, (int, float)) else 0
-        self.candidates = candidates(self.hint, args.search_max_offset)
+        floor = init.get("floor")
+        #: Nothing at or below this packet index is accepted; None when this key and
+        #: SSRC have never been accepted anywhere.
+        self.floor: int | None = (
+            int(floor)
+            if isinstance(floor, int) and not isinstance(floor, bool) and 0 <= floor <= INDEX_MAX
+            else None
+        )
+        base = 0 if self.floor is None else self.floor >> 16
+        self.candidates = candidates(base, args.search_max_offset)
         self.candidate = next(self.candidates)
         self.trial_index = 0
         self.trial_started_ms = 0
@@ -292,6 +292,8 @@ class SrtpPipeline:
         self.loop = GLib.MainLoop()
         self.shutting_down = False
         self.key_requests = 0
+        self.reported_index: int | None = None
+        self.index_reported_ms = 0
         self.pipeline: Gst.Pipeline | None = None
         self.dec: Gst.Element | None = None
         self.src: Gst.Element | None = None
@@ -380,24 +382,45 @@ class SrtpPipeline:
                         seq = (mapped.data[2] << 8) | mapped.data[3]
                 finally:
                     buffer.unmap(mapped)
-        self._record_authenticated(seq)
-        return Gst.PadProbeReturn.OK
+        if self._record_authenticated(seq):
+            return Gst.PadProbeReturn.OK
+        return Gst.PadProbeReturn.DROP
 
-    def _record_authenticated(self, seq: int | None) -> None:
-        """Counts one packet libsrtp authenticated, under the key srtpdec holds."""
+    def _record_authenticated(self, seq: int | None) -> bool:
+        """Decides whether one packet libsrtp authenticated is accepted.
+
+        Accepted means above the floor. A packet at or below it authenticated only
+        because libsrtp's replay window starts empty in every new process, and after
+        every remove-key: it is a copy of something this port already accepted, or a
+        sender reusing its packet index under this key. It is dropped before the
+        depayloader, and it counts for nothing - not as authenticated, not towards
+        confirming a candidate, and not as the traffic that keeps the stream alive.
+        """
+        if seq is None:
+            # Too short to carry a sequence number, so its index cannot be shown to be
+            # above the floor. libsrtp does not authenticate such a packet in practice.
+            return False
         with self.counters.lock:
             c = self.counters
+            if c.highest_seq is None:
+                roc = c.roc
+                c.highest_seq = seq
+            else:
+                roc = rollover_of(c.roc, c.highest_seq, seq)
+                advanced, c.highest_seq = advance_index(c.roc, c.highest_seq, seq)
+                if advanced != c.roc:
+                    c.roc = advanced
+                    c.roc_changed = True
+            index = (roc << 16) | seq
+            if self.floor is not None and index <= self.floor:
+                c.stale += 1
+                return False
             c.authenticated += 1
             c.key_authenticated += 1
             c.last_auth_ms = now_ms()
-            if seq is not None:
-                if c.highest_seq is None:
-                    c.highest_seq = seq
-                else:
-                    roc, c.highest_seq = advance_index(c.roc, c.highest_seq, seq)
-                    if roc != c.roc:
-                        c.roc = roc
-                        c.roc_changed = True
+            if c.highest_index is None or index > c.highest_index:
+                c.highest_index = index
+            return True
 
     def _on_access_unit(
         self, _pad: Gst.Pad, _info: Gst.PadProbeInfo
@@ -518,6 +541,10 @@ class SrtpPipeline:
         return True
 
     def _stop(self, code: int) -> int:
+        # The last word on the floor, however the helper ends, so the parent's next
+        # start begins from everything this one accepted rather than from the last
+        # periodic report.
+        self._report_index(force=True)
         if self.pipeline is not None:
             self.pipeline.set_state(Gst.State.NULL)
         self.exit_code = code
@@ -618,7 +645,25 @@ class SrtpPipeline:
             # recover this pipeline in place.
             self._stop(5)
             return False
+        if self.confirmed:
+            self._report_index(force=False)
         return True
+
+    def _report_index(self, force: bool) -> None:
+        """Reports the highest accepted packet index, if it moved.
+
+        At most once an interval while it moves, and once more on the way out. The
+        parent persists it as the floor for the next start, here or on another instance.
+        """
+        with self.counters.lock:
+            index = self.counters.highest_index
+        if index is None or index == self.reported_index:
+            return
+        if not force and now_ms() - self.index_reported_ms < INDEX_REPORT_MS:
+            return
+        self.reported_index = index
+        self.index_reported_ms = now_ms()
+        emit(t="index", index=index)
 
     def _begin_trial(self) -> None:
         """Snapshots what decides whether this trial was actually tried.
@@ -706,6 +751,7 @@ class SrtpPipeline:
                 drops=self._drop_count(),
             )
             foreign, c.foreign_ssrc = c.foreign_ssrc, 0
+            stale, c.stale = c.stale, 0
         # One line per interval however many there were, so what reaches the logs is
         # bounded by the clock rather than by whoever is sending. The SSRCs themselves
         # are left out: they are the sender's choice, and nothing here needs them.
@@ -714,6 +760,16 @@ class SrtpPipeline:
                 t="warning",
                 element="srtpdec",
                 message=f"ignored {foreign} datagrams for SSRCs other than {self.ssrc}",
+            )
+        if stale > 0:
+            emit(
+                t="warning",
+                element="srtpdec",
+                message=(
+                    f"dropped {stale} authenticated datagrams at or below the highest"
+                    " packet index already accepted under this key: a replay, or a"
+                    " sender that restarted its packet index without a new key"
+                ),
             )
         return True
 

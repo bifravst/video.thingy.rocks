@@ -9,7 +9,7 @@
  * Only `auth` with status 'ok' grants anything. Every other message is advisory.
  */
 
-export const SRTP_HELPER_PROTOCOL_VERSION = 1
+export const SRTP_HELPER_PROTOCOL_VERSION = 2
 
 /**
  * Lines longer than this are discarded - neither buffered indefinitely nor parsed.
@@ -50,6 +50,11 @@ export type SrtpHelperMessage =
 			drops?: number
 	  }
 	| { t: 'auth'; status: 'exhausted'; trials: number }
+	/**
+	 * The highest packet index accepted so far - authenticated, and above the floor
+	 * the helper was started with. Safe to persist as the next floor.
+	 */
+	| { t: 'index'; index: number }
 	| { t: 'auth'; status: 'lost'; sinceMs?: number; drops?: number }
 	| {
 			t: 'stats'
@@ -100,14 +105,16 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 const UINT16_MAX = 0xffff
 const UINT32_MAX = 0xffffffff
+/** A packet index is a 32-bit rollover counter and a 16-bit sequence number. */
+export const SRTP_INDEX_MAX = 2 ** 48 - 1
 
 /**
  * An integer within [min, max], or undefined.
  *
  * Being finite is not enough for what these numbers are used as. relayPort goes
  * straight to dgram.connect, which throws synchronously for 0, 1.5 or 70000 - and it
- * is called from the stdout handler, where a throw ends the process. roc is persisted
- * and handed back to the next helper as its hint. So a value outside its field's range
+ * is called from the stdout handler, where a throw ends the process. index is persisted
+ * and handed back to the next helper as its floor. So a value outside its field's range
  * is treated as if it had not been sent: a required field makes the line unparsed, an
  * optional one is dropped.
  */
@@ -197,6 +204,11 @@ const parseMessage = (line: string): SrtpHelperMessage => {
 				default:
 					return unparsed
 			}
+		}
+		case 'index': {
+			const index = int(value.index, 0, SRTP_INDEX_MAX)
+			if (index === undefined) return unparsed
+			return { t: 'index', index }
 		}
 		case 'stats': {
 			const inputs = count(value.inputs)

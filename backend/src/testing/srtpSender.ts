@@ -6,7 +6,7 @@ import { createCipheriv, createHmac } from 'node:crypto'
  * Exists so tests can send authentic SRTP packets at an *arbitrary* rollover counter.
  * A real encoder always starts a session at ROC 0, which would mean sending 65536
  * packets to reach ROC 1 - so the cases that matter most for the rollover-counter
- * search (a persisted hint that is too low, a stream that wraps) would be untestable.
+ * search (a stream above its replay floor, a stream that wraps) would be untestable.
  *
  * It cannot make a test pass that should fail: if any of this is wrong, srtpdec simply
  * does not authenticate and the assertions fail loudly.

@@ -156,7 +156,7 @@ const buildService = (instanceId: string): IngestionService => {
 		const serviceRef: { current?: IngestionService } = {}
 		const producer = new SrtpProducer({
 			keyStore,
-			hints: streamMetadataService,
+			floors: streamMetadataService,
 			region: config.awsRegion,
 			streamNameForPort: (port) =>
 				`${config.kinesisStreamPrefix}-${String(port)}`,

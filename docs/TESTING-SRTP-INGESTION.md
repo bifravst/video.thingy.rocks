@@ -71,29 +71,24 @@ wraps every 65536 packets, which is a minute or two of video.
 
 The pipeline resolves this by asking the authenticator instead of guessing. It
 seeds a candidate, and if `libsrtp` authenticates packets, that candidate was
-right and is stored as a hint for next time; if not, those packets are counted
-as dropped and the next candidate is tried. The candidates are the stored hint
-first, then zero, then outwards in both directions.
+right; if not, those packets are counted as dropped and the next candidate is
+tried. The candidates start at the rollover counter of the port's **replay
+floor** - the highest packet index ever accepted under this key and SSRC - and
+climb from there, never below it.
 
-**Recovery needs no operator action.** Re-running the test sender below,
-rebooting a camera, or restarting the backend all recover on their own,
-typically within a few tens of datagrams. You do not need to pick a new SSRC,
-clear anything in DynamoDB, or restart the backend.
+**A sender that carries on counting needs no operator action.** Restarting the
+backend, or a sender that kept counting while ingestion was down, recovers on
+its own, typically within a few tens of datagrams.
 
-**Recovering is not the same as being safe, though.** If the sender restarts its
-sequence numbering rather than carrying on from where it was, it has to be given
-a fresh key before it does: the keystream is derived from the key, the SSRC and
-the packet index, so rewinding the index with the same key encrypts new video
-under a keystream already used, and XORing two such packets cancels it. The
-search here exists for the case where the _receiver_ lost track of a sender that
-kept counting - it is not permission for a sender to rewind. See the SRTP
-section of `backend/README.md`, and note the receiver logs
-`SRTP sender restarted its packet index under a key it has already used` when it
-can tell.
+**A sender that restarts its numbering needs a new key, and is refused without
+one.** Nothing at or below the replay floor is accepted, because a recording of
+earlier traffic and a sender that rewound its index under the same key look the
+same to the receiver - and both are unsafe: one is a replay, the other reuses
+the keystream. See the SRTP section of `backend/README.md`.
 
-The one visible cost of a wrong hint is that the datagrams spent on failed
-candidates are lost, so video resumes at the sender's **next keyframe**. With a
-long keyframe interval that can be several seconds.
+The one visible cost of a counter far above the floor is that the datagrams
+spent on failed candidates are lost, so video resumes at the sender's **next
+keyframe**. With a long keyframe interval that can be several seconds.
 
 ## 1. Unit tests
 
@@ -160,7 +155,8 @@ downstream, and GStreamer logs caps at those levels.
    fragments are arriving.
 2. **Application log** - `/var/log/video-streaming/application.log` should show
    `SRTP traffic authenticated` with the rollover counter and how many
-   candidates were tried. `trials: 1` means the hint was right first time.
+   candidates were tried. `trials: 1` means the stream was still in the replay
+   floor's rollover.
 3. **Unencrypted path unaffected** - port 5000 keeps ingesting into
    `{stackName}-video-5000` throughout.
 
@@ -169,25 +165,24 @@ downstream, and GStreamer logs caps at those levels.
 - **Restart the sender.** Provision a fresh key for the port first, restart the
   backend so it reads the new one, and only then run the script again with the
   new key. Ingestion recovers by itself and the log shows a second
-  `SRTP traffic authenticated`, with `trials: 1` - the fresh key has no stored
-  hint, so the search starts at zero, which is where a new session begins.
+  `SRTP traffic authenticated`, with `trials: 1` - the fresh key has no replay
+  floor, so the search starts at zero, which is where a new session begins.
 
   The key rotation is not optional here, and it is the sender restart that makes
   it necessary rather than the backend one. `srtpenc` starts a new session at
   rollover counter zero, so relaunching it under the key it was already using
-  rewinds the packet index and reuses the keystream - the thing the SRTP section
-  of `backend/README.md` says must not happen. Doing it anyway is visible: the
-  backend logs
-  `SRTP sender restarted its packet index under a key it has already used`, and
-  the `trials: 2` that a reused key produces is the search falling back to zero
-  because the stored hint described the previous session.
+  rewinds the packet index - reusing the keystream, and putting its traffic
+  below the floor. The backend refuses it: the port never authenticates, gives
+  its slot back after the provisional deadline, and the pipeline warnings say
+  `dropped N authenticated datagrams at or below the highest packet index already accepted under this key`
+  while the new session is still within the old one's last rollover.
 
 - **Restart the backend.** `systemctl restart video-streaming` on the instance
-  while the sender runs. The stored hint is tried first, so this usually
-  recovers with `trials: 1`.
+  while the sender runs. The search starts at the replay floor's rollover, so
+  this usually recovers with `trials: 1`.
 - **Send noise.** Anything that is not authentic SRTP is dropped. The port may
   briefly claim its slot while the pipeline starts, but it never refreshes its
-  lease or stores a rollover counter while it does.
+  lease or raises the replay floor while it does.
 
   Two different things end that window, and which one applies depends on whether
   the noise keeps coming. A sender that keeps going hits the twenty-second
@@ -235,9 +230,8 @@ downstream, and GStreamer logs caps at those levels.
 
 - **A device that picks a new SSRC per session will not work.** `srtpdec` is
   pinned to the provisioned SSRC, so a stable SSRC per port is required.
-  Sequence numbering need not be continuous for the receiver to recover, but a
-  device that rewinds it must be given a fresh key at the same time - see the
-  SRTP section of `backend/README.md`.
+  Sequence numbering may jump forward, but a device that rewinds it is refused
+  until it is given a fresh key - see the SRTP section of `backend/README.md`.
 
 ## What cannot be tested locally
 
@@ -248,4 +242,5 @@ receiver and checks both that it authenticates and that no command line on the
 machine holds its key while it does. What needs a deployed stack: `kvssink` fed
 from the in-process pipeline, the Python bindings being present on the instance
 AMI, load balancer UDP forwarding and dual-stack translation, lock handoff
-between instances, and rollover-counter recovery across a real restart.
+between instances, the replay floor in the real table, and rollover-counter
+recovery across a real restart.

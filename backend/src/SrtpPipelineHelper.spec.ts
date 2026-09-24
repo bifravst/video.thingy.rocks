@@ -19,11 +19,27 @@ const skip = hasGstElements(['srtpdec'])
 	: 'requires python3 GStreamer bindings with the srtp plugin'
 
 const startHelper = async (
-	options: { rocHint?: number; extraArgs?: string[] } = {},
+	options: { floor?: number; extraArgs?: string[] } = {},
 ): Promise<Helper> => startHelperFor({ key: KEY, ssrc: SSRC, ...options })
 
 const packetAt = (roc: number, seq: number): Buffer =>
 	srtpPacket({ keyHex: KEY, ssrc: SSRC, seq, roc, payload: h264Payload() })
+
+/** The packet index of RFC 3711: rollover counter above, sequence number below. */
+const indexAt = (roc: number, seq: number): number => roc * 65_536 + seq
+
+/** How many authenticated datagrams the helper has said it dropped as stale. */
+const staleDropped = (helper: Helper): number =>
+	helper.messages.reduce(
+		(sum, m) =>
+			sum +
+			Number(
+				m.t === 'warning'
+					? (/dropped (\d+) authenticated/.exec(m.message)?.[1] ?? 0)
+					: 0,
+			),
+		0,
+	)
 
 /** Sends `count` authentic packets at `roc`, starting from `startSeq`. */
 const sendBurst = (
@@ -88,8 +104,8 @@ void describe('srtp_pipeline.py', { skip }, () => {
 	})
 
 	void describe('rollover counter confirmation', () => {
-		void it('confirms on the first trial when the hint is exact', async () => {
-			const helper = await startHelper({ rocHint: 0 })
+		void it('confirms on the first trial with no floor', async () => {
+			const helper = await startHelper()
 			try {
 				sendBurst(helper, 0, 1000, 20)
 				const confirmed = await helper.waitFor(
@@ -107,11 +123,30 @@ void describe('srtp_pipeline.py', { skip }, () => {
 			}
 		})
 
-		// A real encoder always starts at ROC 0, so only a synthetic sender can put a
-		// stream above the hint - which is exactly the case a restart after a wrap
-		// produces.
-		void it('climbs to a rollover counter above the hint', async () => {
-			const helper = await startHelper({ rocHint: 0 })
+		void it('confirms on the first trial when the stream is in the floor’s rollover', async () => {
+			const helper = await startHelper({ floor: indexAt(3, 999) })
+			try {
+				sendBurst(helper, 3, 1000, 20)
+				const confirmed = await helper.waitFor(
+					(m) => confirmation(m) !== undefined,
+				)
+				assert.deepStrictEqual(
+					{
+						roc: rocOf(confirmed),
+						trials: confirmation(confirmed)?.trials,
+					},
+					{ roc: 3, trials: 1 },
+				)
+			} finally {
+				await helper.stop()
+			}
+		})
+
+		// A sender that kept counting while ingestion was down is above the floor by
+		// however many times it wrapped. A real encoder always starts at ROC 0, so only
+		// a synthetic sender can put a stream there.
+		void it('climbs to a rollover counter above the floor', async () => {
+			const helper = await startHelper({ floor: indexAt(0, 500) })
 			try {
 				const timer = setInterval(() => sendBurst(helper, 2, 1000, 10), 60)
 				try {
@@ -127,55 +162,49 @@ void describe('srtp_pipeline.py', { skip }, () => {
 			}
 		})
 
-		// The regression test for a search that only counts upwards: a hint left over
-		// from a longer previous session, or a sender that restarted its session, is
-		// *below* the hint and would otherwise never be reached.
-		void it('recovers when the hint is far too high', async () => {
-			const helper = await startHelper({ rocHint: 9 })
-			try {
-				const timer = setInterval(() => sendBurst(helper, 0, 2000, 10), 60)
-				try {
-					const confirmed = await helper.waitFor(
-						(m) => confirmation(m) !== undefined,
-					)
-					assert.strictEqual(rocOf(confirmed), 0)
-					// Second candidate tried: the hint, then zero.
-					assert.strictEqual(confirmation(confirmed)?.trials, 2)
-				} finally {
-					clearInterval(timer)
-				}
-			} finally {
-				await helper.stop()
-			}
-		})
-
-		// The other direction of the same regression: a hint *one* above the actual
-		// counter is what a value left over from a longer previous session looks like,
-		// and it is not reachable by counting up from zero either. The band is narrowed
-		// to two so a search that only walks up from the hint and up from zero runs out
-		// of reachable candidates quickly and never offers four.
-		void it('recovers when the hint is just above the counter', async () => {
+		/**
+		 * Below the floor is not searched, by design.
+		 *
+		 * The search used to walk down from its starting point and fall back to zero, so
+		 * that a sender which restarted its packet index under the same key recovered on
+		 * its own. That is precisely a stream below the highest index already accepted,
+		 * and so is a recording of earlier traffic: the two cannot be told apart, and
+		 * neither may be accepted. The band is narrowed so the search cycles quickly.
+		 */
+		void it('never searches below the floor', async () => {
 			const helper = await startHelper({
-				rocHint: 5,
+				floor: indexAt(5, 0),
 				extraArgs: ['--search-max-offset', '2'],
 			})
 			try {
 				const timer = setInterval(() => sendBurst(helper, 4, 3000, 10), 60)
 				try {
-					const confirmed = await helper.waitFor(
-						(m) => confirmation(m) !== undefined,
+					await helper.waitFor(
+						(m) =>
+							helper.messages.filter((n) => n.t === 'searching').length >= 6 &&
+							m.t === 'searching',
 					)
-					assert.strictEqual(rocOf(confirmed), 4)
 				} finally {
 					clearInterval(timer)
 				}
+				const tried = helper.messages.flatMap((m) =>
+					m.t === 'searching' ? [m.candidate] : [],
+				)
+				assert.ok(
+					tried.every((candidate) => candidate >= 5),
+					`tried ${JSON.stringify(tried)}`,
+				)
+				assert.ok(
+					!helper.messages.some((m) => confirmation(m) !== undefined),
+					'a stream below the floor must never be confirmed',
+				)
 			} finally {
 				await helper.stop()
 			}
 		})
 
 		void it('reports a rollover while running', async () => {
-			const helper = await startHelper({ rocHint: 0 })
+			const helper = await startHelper()
 			try {
 				sendBurst(helper, 0, 65_500, 30)
 				await helper.waitFor((m) => confirmation(m) !== undefined)
@@ -190,10 +219,10 @@ void describe('srtp_pipeline.py', { skip }, () => {
 			}
 		})
 
-		// Reordering across the wrap must not inflate the counter: the persisted hint
-		// would then be above the stream, and the next start would pay for a search.
+		// Reordering across the wrap must not inflate the counter: the persisted floor
+		// would then be above the stream, and the next start would never find it.
 		void it('counts one rollover when packets arrive reordered across the wrap', async () => {
-			const helper = await startHelper({ rocHint: 0 })
+			const helper = await startHelper()
 			try {
 				sendBurst(helper, 0, 65_530, 5)
 				await helper.waitFor((m) => confirmation(m) !== undefined)
@@ -226,9 +255,92 @@ void describe('srtp_pipeline.py', { skip }, () => {
 		})
 	})
 
+	/**
+	 * Authenticated is not the same as fresh.
+	 *
+	 * libsrtp keeps its replay window in the helper's memory, and it starts empty in
+	 * every new helper - so a recording of traffic this port already accepted used to
+	 * authenticate again after any restart, promote the port, persist its counter and
+	 * go into the stream as if it were live. The floor is the highest index ever
+	 * accepted under this key, and nothing at or below it gets through.
+	 */
+	void describe('traffic that was already accepted', () => {
+		void it('rejects a recording of an earlier session after a restart', async () => {
+			const recording = Array.from({ length: 30 }, (_, i) =>
+				packetAt(0, 1000 + i),
+			)
+
+			const first = await startHelper()
+			let floor: number
+			try {
+				for (const packet of recording) first.send(packet)
+				await first.waitFor((m) => confirmation(m) !== undefined)
+				const reported = await first.waitFor((m) => m.t === 'index')
+				floor = reported.t === 'index' ? reported.index : -1
+			} finally {
+				await first.stop()
+			}
+			// The last word on the way out, which is what the parent persists.
+			const last = first.messages.filter((m) => m.t === 'index').at(-1)
+			assert.deepStrictEqual(last, { t: 'index', index: indexAt(0, 1029) })
+			floor = last.t === 'index' ? last.index : floor
+
+			const second = await startHelper({ floor })
+			try {
+				for (const packet of recording) second.send(packet)
+				await second.waitFor(() => staleDropped(second) === 30)
+				const stats = await second.waitFor(
+					(m) => m.t === 'stats' && m.inputs >= 30,
+				)
+				assert.strictEqual(
+					stats.t === 'stats' ? stats.authenticated : -1,
+					0,
+					'none of it counts as authenticated',
+				)
+				assert.ok(
+					!second.messages.some((m) => confirmation(m) !== undefined),
+					`the recording was accepted: ${JSON.stringify(second.messages)}`,
+				)
+
+				// The sender carrying on from where it was is still welcome...
+				sendBurst(second, 0, 1030, 10)
+				const confirmed = await second.waitFor(
+					(m) => confirmation(m) !== undefined,
+				)
+				assert.strictEqual(rocOf(confirmed), 0)
+
+				// ...and the recording is still refused alongside it.
+				for (const packet of recording) second.send(packet)
+				const after = await second.waitFor(
+					(m) => m.t === 'stats' && m.inputs >= 70,
+				)
+				assert.strictEqual(after.t === 'stats' ? after.authenticated : -1, 10)
+			} finally {
+				await second.stop()
+			}
+		})
+
+		void it('accepts only what is above the floor within one burst', async () => {
+			const helper = await startHelper({ floor: indexAt(0, 1009) })
+			try {
+				sendBurst(helper, 0, 1000, 20)
+				await helper.waitFor((m) => confirmation(m) !== undefined)
+				await helper.waitFor(() => staleDropped(helper) === 10)
+				const stats = await helper.waitFor(
+					(m) => m.t === 'stats' && m.authenticated === 10,
+				)
+				assert.ok(stats.t === 'stats')
+				const index = await helper.waitFor((m) => m.t === 'index')
+				assert.deepStrictEqual(index, { t: 'index', index: indexAt(0, 1019) })
+			} finally {
+				await helper.stop()
+			}
+		})
+	})
+
 	void describe('traffic that does not hold the key', () => {
 		void it('never confirms for forged packets, and counts them as dropped', async () => {
-			const helper = await startHelper({ rocHint: 0 })
+			const helper = await startHelper()
 			try {
 				// Correct RTP version and SSRC - both public - with a random payload and
 				// tag. This is what anyone able to reach the public port can produce.
@@ -279,7 +391,6 @@ void describe('srtp_pipeline.py', { skip }, () => {
 		void it('ends within its loss window while forged traffic keeps arriving', async () => {
 			const lossMs = 600
 			const helper = await startHelper({
-				rocHint: 0,
 				extraArgs: ['--auth-loss-ms', String(lossMs)],
 			})
 			try {
@@ -345,7 +456,7 @@ void describe('srtp_pipeline.py', { skip }, () => {
 		 * SSRC was fixed or new each time.
 		 */
 		void it('reports datagrams for other SSRCs as a count per interval', async () => {
-			const helper = await startHelper({ rocHint: 0 })
+			const helper = await startHelper()
 			try {
 				const started = Date.now()
 				for (let i = 0; i < 200; i++) {
@@ -393,7 +504,7 @@ void describe('srtp_pipeline.py', { skip }, () => {
 		// Stepping on a timer alone would burn through the candidate list whenever a
 		// port is simply idle.
 		void it('does not step candidates while no traffic arrives', async () => {
-			const helper = await startHelper({ rocHint: 5 })
+			const helper = await startHelper({ floor: indexAt(5, 0) })
 			try {
 				await new Promise((resolve) => setTimeout(resolve, 1500))
 				const searches = helper.messages.filter((m) => m.t === 'searching')
@@ -452,8 +563,8 @@ void describe('srtp_pipeline.py', { skip }, () => {
 		void it('credits a new key that authenticates before its trial begins', () => {
 			const o = all.newKeyAuthenticatesBeforeTheTrialBaseline
 			assert.strictEqual(o?.confirmed, true)
-			assert.strictEqual(o.reportedCandidate, 0)
-			assert.strictEqual(o.reportedRoc, 0)
+			assert.strictEqual(o.reportedCandidate, 6)
+			assert.strictEqual(o.reportedRoc, 6)
 		})
 
 		// The other side, which the earlier fix claimed and did not hold: the right key
@@ -488,7 +599,7 @@ void describe('srtp_pipeline.py', { skip }, () => {
 
 	void describe('lifecycle', () => {
 		void it('ends the stream and exits cleanly on SIGTERM', async () => {
-			const helper = await startHelper({ rocHint: 0 })
+			const helper = await startHelper()
 			sendBurst(helper, 0, 1000, 10)
 			await helper.waitFor((m) => confirmation(m) !== undefined)
 			const code = await helper.stop()
@@ -500,7 +611,7 @@ void describe('srtp_pipeline.py', { skip }, () => {
 		// If the parent dies without stopping the child, the child must not survive
 		// holding the Kinesis stream.
 		void it('exits when its parent closes stdin', async () => {
-			const helper = await startHelper({ rocHint: 0 })
+			const helper = await startHelper()
 			try {
 				helper.child.stdin.end()
 				const code = await new Promise<number | null>((resolve) => {

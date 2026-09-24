@@ -6,6 +6,7 @@ import {
 import dgram from 'node:dgram'
 
 import {
+	SRTP_HELPER_PROTOCOL_VERSION,
 	SrtpHelperProtocol,
 	type SrtpHelperMessage,
 } from '../SrtpHelperProtocol.ts'
@@ -81,7 +82,8 @@ export type Helper = {
 export const startHelper = async (options: {
 	key: string
 	ssrc: number
-	rocHint?: number
+	/** Highest packet index already accepted; nothing at or below it is. */
+	floor?: number
 	extraArgs?: string[]
 }): Promise<Helper> => {
 	const child = spawn(
@@ -142,12 +144,12 @@ export const startHelper = async (options: {
 	child.stdin.write(
 		`${JSON.stringify({
 			type: 'init',
-			v: 1,
+			v: SRTP_HELPER_PROTOCOL_VERSION,
 			key: options.key,
 			ssrc: options.ssrc,
 			cipher: 'aes-128-icm',
 			auth: 'hmac-sha1-80',
-			...(options.rocHint === undefined ? {} : { rocHint: options.rocHint }),
+			...(options.floor === undefined ? {} : { floor: options.floor }),
 		})}\n`,
 	)
 

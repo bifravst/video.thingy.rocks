@@ -49,14 +49,25 @@ class HelperFake extends EventEmitter {
 	ignoreSignals = false
 	/** Cleared to model a helper that dies before it can report a relay port. */
 	reportReadyOnInit = true
+	/** The init frames the parent wrote, parsed. */
+	readonly inits: Record<string, unknown>[] = []
 
 	constructor(private readonly relayPort: number) {
 		super()
 		// The real helper reports readiness once it has the key, so readiness is
 		// triggered by the init frame here too.
-		this.stdin.on('data', () => {
+		this.stdin.on('data', (chunk: Buffer) => {
+			for (const line of chunk.toString().split('\n')) {
+				if (line.trim() !== '')
+					this.inits.push(JSON.parse(line) as Record<string, unknown>)
+			}
 			if (this.reportReadyOnInit) this.reportReady()
 		})
+	}
+
+	/** Writes one protocol line, as the helper would. */
+	say(message: Record<string, unknown>): void {
+		this.stdout.write(`${JSON.stringify(message)}\n`)
 	}
 
 	kill(signal?: NodeJS.Signals): boolean {
@@ -127,8 +138,10 @@ const start = async (
 		datagrams?: Buffer[]
 		/** Leaves the start pending, so a test can act during the replay. */
 		awaitStart?: boolean
-		/** Rollover counter this key and SSRC previously reached, if any. */
-		rocHint?: number
+		/** The stored replay floor for this key and SSRC, if any. */
+		floor?: number
+		/** Models a floor that cannot be read. */
+		floorReadFails?: boolean
 		/** Cleared to model a helper that dies before its readiness is handled. */
 		reportReady?: boolean
 		/** The ownership epoch the start is made under, as PortIngestion passes it. */
@@ -143,8 +156,9 @@ const start = async (
 	helperArgs: string[]
 	/** Every authentication the producer reported, as the port and epoch it named. */
 	authenticated: [number, number][]
-	/** Every rollover counter the producer persisted. */
-	hintsWritten: number[]
+	/** Every replay floor the producer raised. */
+	floorsRaised: number[]
+	spawned: () => number
 }> => {
 	// Nothing is bound to the default relay port: the fake helper only has to report
 	// one, and most tests do not depend on the datagrams arriving anywhere.
@@ -153,7 +167,8 @@ const start = async (
 	helper.reportReadyOnInit = options.reportReady ?? true
 	const helperArgs: string[] = []
 	const authenticated: [number, number][] = []
-	const hintsWritten: number[] = []
+	const floorsRaised: number[] = []
+	let spawns = 0
 	const logger = new CapturingLogger()
 	const producer = new SrtpProducer({
 		keyStore: {
@@ -165,10 +180,14 @@ const start = async (
 				keyFingerprint: 'abcdef0123456789',
 			}),
 		} as unknown as SrtpKeyStore,
-		hints: {
-			getSrtpRocHint: async () => options.rocHint,
-			putSrtpRocHint: async (_port, roc) => {
-				hintsWritten.push(roc)
+		floors: {
+			getSrtpIndexFloor: async () => {
+				if (options.floorReadFails === true)
+					throw new Error('dynamo unavailable')
+				return options.floor
+			},
+			raiseSrtpIndexFloor: async (_port, index) => {
+				floorsRaised.push(index)
 			},
 		},
 		region: 'eu-central-1',
@@ -179,6 +198,7 @@ const start = async (
 			authenticated.push([port, epoch])
 		},
 		spawn: ((_command: string, args: string[]) => {
+			spawns += 1
 			helperArgs.push(...args)
 			return helper as unknown as ChildProcess
 		}) as unknown as typeof nodeSpawn,
@@ -195,7 +215,8 @@ const start = async (
 		started,
 		helperArgs,
 		authenticated,
-		hintsWritten,
+		floorsRaised,
+		spawned: () => spawns,
 	}
 }
 
@@ -328,13 +349,23 @@ void describe('SrtpProducer', () => {
 			)
 		}
 
-		void it('neither reports authentication nor persists a counter after exit', async () => {
-			const { helper, authenticated, hintsWritten } = await start()
+		void it('does not report authentication after exit', async () => {
+			const { helper, authenticated } = await start()
 			helper.exit(1)
 			authOk(helper)
 			await delay(20)
 			assert.deepStrictEqual(authenticated, [])
-			assert.deepStrictEqual(hintsWritten, [])
+		})
+
+		// The one thing such a session may still do: raising the floor cannot harm the
+		// lifetime that replaced it, and a dying helper's last index is the one worth
+		// having - it is written once the helper is already on its way out.
+		void it('still raises the replay floor after exit', async () => {
+			const { helper, floorsRaised } = await start()
+			helper.exit(1)
+			helper.say({ t: 'index', index: 70_000 })
+			await delay(20)
+			assert.deepStrictEqual(floorsRaised, [70_000])
 		})
 
 		// A helper that reports ready and dies, with the exit handled first. Its relay
@@ -355,7 +386,7 @@ void describe('SrtpProducer', () => {
 		})
 
 		void it('does not act for a session that is stopping', async () => {
-			const { producer, helper, authenticated, hintsWritten } = await start({
+			const { producer, helper, authenticated } = await start({
 				ignoreSignals: true,
 				stopSigkillAfterMs: 60_000,
 			})
@@ -364,7 +395,6 @@ void describe('SrtpProducer', () => {
 				authOk(helper)
 				await delay(20)
 				assert.deepStrictEqual(authenticated, [])
-				assert.deepStrictEqual(hintsWritten, [])
 			} finally {
 				// The helper ignores signals here, so stop() waits for this; skipping it
 				// on a failed assertion would leave the suite hanging on SIGKILL's timer.
@@ -393,14 +423,13 @@ void describe('SrtpProducer', () => {
 		// names the lifetime the session was started under, so PortIngestion can drop
 		// one that outlived it.
 		void it('acts for the current session, naming the epoch it was started under', async () => {
-			const { producer, helper, authenticated, hintsWritten } = await start({
+			const { producer, helper, authenticated } = await start({
 				epoch: 7,
 			})
 			try {
 				authOk(helper)
 				await delay(20)
 				assert.deepStrictEqual(authenticated, [[PORT, 7]])
-				assert.deepStrictEqual(hintsWritten, [7])
 			} finally {
 				await producer.stop(PORT)
 			}
@@ -478,70 +507,103 @@ void describe('SrtpProducer', () => {
 	})
 
 	/**
-	 * A sender that rewinds its packet index under a key it has already used.
+	 * The replay floor: the highest packet index ever accepted under this key and SSRC.
 	 *
-	 * The keys here are static and the SSRC fixed per port, so SRTP's keystream
-	 * depends only on those and the packet index. Restarting the index reuses the
-	 * keystream, and two packets sharing one reveal the XOR of their plaintexts. Only
-	 * provisioning can prevent it; the receiver can at least say it happened, which
-	 * the persisted rollover counter makes cheap.
+	 * libsrtp's replay window starts empty in every new helper, so on its own a
+	 * recording of earlier traffic authenticates again after any restart, promotes the
+	 * port and ends up in the stream. The helper drops everything at or below the
+	 * floor it is given; these pin the producer's half - which floor it is given, and
+	 * that the floor keeps up with what was accepted.
 	 */
-	void describe('a reused keystream', () => {
-		const confirm = (helper: HelperFake, roc: number): void => {
-			helper.stdout.write(
-				`${JSON.stringify({
-					t: 'auth',
-					status: 'ok',
-					first: true,
-					roc,
-					trials: 1,
-					candidate: roc,
-					authenticated: 1,
-				})}\n`,
-			)
-		}
+	void describe('the replay floor', () => {
+		const floorIn = (helper: HelperFake): unknown => helper.inits[0]?.floor
 
-		const rewinds = async (
-			rocHint: number | undefined,
-			confirmedRoc: number,
-		): Promise<CapturingLogger> => {
-			const { producer, helper, logger } = await start({ rocHint })
+		void it('hands the helper the stored floor', async () => {
+			const { producer, helper } = await start({ floor: 123_456 })
 			try {
-				confirm(helper, confirmedRoc)
-				await delay(20)
-				return logger
+				assert.strictEqual(floorIn(helper), 123_456)
 			} finally {
 				await producer.stop(PORT)
 			}
-		}
-
-		void it('reports a counter below the one this key already reached', async () => {
-			const logger = await rewinds(7, 0)
-			assert.deepStrictEqual(
-				logger.errors.map((e): unknown[] => [
-					e.context?.previousRoc,
-					e.context?.roc,
-				]),
-				[[7, 0]],
-			)
 		})
 
-		void it('says nothing when the counter carried on from where it was', async () => {
-			assert.deepStrictEqual((await rewinds(7, 7)).errors, [])
-			assert.deepStrictEqual((await rewinds(7, 9)).errors, [])
-		})
-
-		// A key this port has never confirmed anything under cannot have been reused.
-		void it('says nothing when there is no counter to compare against', async () => {
-			assert.deepStrictEqual((await rewinds(undefined, 0)).errors, [])
-		})
-
-		void it('keeps ingesting, because refusing would not undo the reuse', async () => {
-			const { producer, helper } = await start({ rocHint: 7 })
+		void it('starts without a floor when nothing was ever accepted', async () => {
+			const { producer, helper } = await start()
 			try {
-				confirm(helper, 0)
-				await delay(20)
-				assert.strictEqual(producer.isActive(PORT), true)
+				assert.ok(!('floor' in (helper.inits[0] ?? {})))
+			} finally {
+				await producer.stop(PORT)
+			}
+		})
+
+		// "No floor" admits every recording there is, so a floor that could not be read
+		// must not be mistaken for one that does not exist.
+		void it('does not start when the floor cannot be read', async () => {
+			const { started, spawned } = await start({
+				floorReadFails: true,
+				awaitStart: false,
+			})
+			await assert.rejects(async () => started, /replay floor/)
+			assert.strictEqual(spawned(), 0, 'no helper without a floor')
+		})
+
+		void it('raises the stored floor as the helper reports progress, and when it ends', async () => {
+			const { producer, helper, floorsRaised } = await start()
+			helper.say({ t: 'index', index: 100 })
+			helper.say({ t: 'index', index: 200 })
+			await delay(20)
+			// Spaced out while the session runs...
+			assert.deepStrictEqual(floorsRaised, [100])
+			await producer.stop(PORT)
+			// ...and whatever the spacing held back is written when it ends.
+			assert.deepStrictEqual(floorsRaised, [100, 200])
+		})
+
+		void it('never lowers it', async () => {
+			const { producer, helper, floorsRaised } = await start()
+			helper.say({ t: 'index', index: 500 })
+			helper.say({ t: 'index', index: 400 })
+			await delay(20)
+			await producer.stop(PORT)
+			assert.deepStrictEqual(floorsRaised, [500])
+		})
+
+		// The stored floor lags: its writes are spaced out, and best effort. A port's own
+		// restart must not reopen what this process already saw accepted.
+		void it('restarts from the higher of the stored floor and the one it saw', async () => {
+			const helpers: HelperFake[] = []
+			const producer = new SrtpProducer({
+				keyStore: {
+					getKeyForPort: () => ({
+						keyHex: KEY,
+						ssrc: 42,
+						cipher: 'aes-128-icm',
+						auth: 'hmac-sha1-80',
+						keyFingerprint: 'abcdef0123456789',
+					}),
+				} as unknown as SrtpKeyStore,
+				floors: {
+					getSrtpIndexFloor: async () => 1_000,
+					raiseSrtpIndexFloor: async () => undefined,
+				},
+				region: 'eu-central-1',
+				streamNameForPort: (port) => `test-video-${String(port)}`,
+				kvsLogConfigPath: '/dev/null',
+				spawn: (() => {
+					const helper = new HelperFake(45_454)
+					helpers.push(helper)
+					return helper as unknown as ChildProcess
+				}) as unknown as typeof nodeSpawn,
+				logger: new CapturingLogger(),
+			})
+			await producer.start(PORT, [], { epoch: 1 })
+			helpers[0]?.say({ t: 'index', index: 9_000 })
+			await delay(20)
+			helpers[0]?.exit(5)
+
+			await producer.start(PORT, [], { epoch: 1 })
+			try {
+				assert.strictEqual(floorIn(helpers[1] ?? new HelperFake(0)), 9_000)
 			} finally {
 				await producer.stop(PORT)
 			}
@@ -575,9 +637,9 @@ void describe('SrtpProducer', () => {
 						keyFingerprint: 'abcdef0123456789',
 					}),
 				} as unknown as SrtpKeyStore,
-				hints: {
-					getSrtpRocHint: async () => undefined,
-					putSrtpRocHint: async () => undefined,
+				floors: {
+					getSrtpIndexFloor: async () => undefined,
+					raiseSrtpIndexFloor: async () => undefined,
 				},
 				region: 'eu-central-1',
 				streamNameForPort: (port) => `test-video-${String(port)}`,

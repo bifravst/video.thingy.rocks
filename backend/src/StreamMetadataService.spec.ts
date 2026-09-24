@@ -154,106 +154,108 @@ void describe('StreamMetadataService.updateLastPacketTime', () => {
 
 const FINGERPRINT = 'abc123def4567890'
 
-void describe('StreamMetadataService SRTP rollover hint', () => {
+void describe('StreamMetadataService SRTP replay floor', () => {
 	const stored = (overrides: Record<string, unknown> = {}) => ({
 		port: 6000,
-		srtpRocHint: 7,
-		srtpRocSsrc: 42,
-		srtpRocKeyFingerprint: FINGERPRINT,
+		srtpIndex: 7 * 65_536 + 1_000,
+		srtpIndexSsrc: 42,
+		srtpIndexKeyFingerprint: FINGERPRINT,
 		...overrides,
 	})
 
-	void it('round-trips a confirmed hint', async () => {
+	void it('reads the floor reached under this key and SSRC', async () => {
 		const { subject, sent } = service(undefined, stored())
-		assert.strictEqual(await subject.getSrtpRocHint(6000, 42, FINGERPRINT), 7)
+		assert.strictEqual(
+			await subject.getSrtpIndexFloor(6000, 42, FINGERPRINT),
+			7 * 65_536 + 1_000,
+		)
 		assert.deepStrictEqual(sent[0]?.input.Key, { port: 6000 })
 	})
 
-	// Zero is a real rollover counter, so "no idea" has to be a different value -
-	// conflating them is what seeded fresh decoders incorrectly before.
-	void it('returns undefined, not zero, when there is nothing usable', async () => {
+	// A stale read is a lower floor, and a lower floor is a replay window.
+	void it('reads it strongly consistently', async () => {
+		const { subject, sent } = service(undefined, stored())
+		await subject.getSrtpIndexFloor(6000, 42, FINGERPRINT)
+		assert.strictEqual(
+			(sent[0]?.input as { ConsistentRead?: boolean }).ConsistentRead,
+			true,
+		)
+	})
+
+	void it('has no floor when nothing usable is stored', async () => {
 		for (const item of [
 			undefined,
-			stored({ srtpRocHint: undefined }),
-			stored({ srtpRocHint: 'seven' }),
-			stored({ srtpRocHint: 1.5 }),
-			stored({ srtpRocHint: -1 }),
+			stored({ srtpIndex: undefined }),
+			stored({ srtpIndex: 'seven' }),
+			stored({ srtpIndex: 1.5 }),
+			stored({ srtpIndex: -1 }),
 		]) {
 			const { subject } = service(undefined, item)
 			assert.strictEqual(
-				await subject.getSrtpRocHint(6000, 42, FINGERPRINT),
+				await subject.getSrtpIndexFloor(6000, 42, FINGERPRINT),
 				undefined,
 				JSON.stringify(item),
 			)
 		}
 	})
 
-	void it('returns a hint of zero when zero was confirmed', async () => {
-		const { subject } = service(undefined, stored({ srtpRocHint: 0 }))
-		assert.strictEqual(await subject.getSrtpRocHint(6000, 42, FINGERPRINT), 0)
-	})
-
-	// A different sender or a rotated key means the hint describes another session.
-	void it('ignores a hint confirmed for another sender or key', async () => {
-		const wrongSsrc = service(undefined, stored({ srtpRocSsrc: 43 }))
+	void it('has a floor of zero when index zero was accepted', async () => {
+		const { subject } = service(undefined, stored({ srtpIndex: 0 }))
 		assert.strictEqual(
-			await wrongSsrc.subject.getSrtpRocHint(6000, 42, FINGERPRINT),
-			undefined,
-		)
-		const rotated = service(
-			undefined,
-			stored({ srtpRocKeyFingerprint: 'other' }),
-		)
-		assert.strictEqual(
-			await rotated.subject.getSrtpRocHint(6000, 42, FINGERPRINT),
-			undefined,
-		)
-		const missing = service(
-			undefined,
-			stored({ srtpRocKeyFingerprint: undefined }),
-		)
-		assert.strictEqual(
-			await missing.subject.getSrtpRocHint(6000, 42, FINGERPRINT),
-			undefined,
+			await subject.getSrtpIndexFloor(6000, 42, FINGERPRINT),
+			0,
 		)
 	})
 
-	void it('treats a read failure as having no hint', async () => {
+	// Another sender, or a key provisioned since, is a different index space.
+	void it('ignores a floor reached by another sender or under another key', async () => {
+		for (const overrides of [
+			{ srtpIndexSsrc: 43 },
+			{ srtpIndexKeyFingerprint: 'other' },
+			{ srtpIndexKeyFingerprint: undefined },
+		]) {
+			const { subject } = service(undefined, stored(overrides))
+			assert.strictEqual(
+				await subject.getSrtpIndexFloor(6000, 42, FINGERPRINT),
+				undefined,
+				JSON.stringify(overrides),
+			)
+		}
+	})
+
+	// "No floor" admits everything, so a read that failed must not look like one.
+	void it('rejects when the read fails, rather than reporting no floor', async () => {
 		const { subject } = service(['error'], stored())
-		assert.strictEqual(
-			await subject.getSrtpRocHint(6000, 42, FINGERPRINT),
-			undefined,
+		await assert.rejects(
+			async () => subject.getSrtpIndexFloor(6000, 42, FINGERPRINT),
+			/throughput exceeded/,
 		)
 	})
 
-	// No ownership condition, no throttle: losing this value costs a short search on
-	// the next start and nothing else, and the machinery those guarantees needed was
-	// itself a source of bugs.
-	void it('writes the hint unconditionally and unthrottled', async () => {
+	void it('raises the floor only if it goes up, or the key or SSRC changed', async () => {
 		const { subject, sent } = service()
-		await subject.putSrtpRocHint(6000, 9, 42, FINGERPRINT)
-		await subject.putSrtpRocHint(6000, 10, 42, FINGERPRINT)
-
-		assert.strictEqual(sent.length, 2)
-		assert.strictEqual(sent[0]?.input.ConditionExpression, undefined)
-		assert.deepStrictEqual(sent[0]?.input.Key, { port: 6000 })
+		await subject.raiseSrtpIndexFloor(6000, 9, 42, FINGERPRINT)
+		const input = sent[0]?.input
+		assert.deepStrictEqual(input?.Key, { port: 6000 })
 		assert.strictEqual(
-			sent[1]?.input.ExpressionAttributeValues?.[':roc'],
-			10 as unknown as string,
+			input?.ConditionExpression,
+			'attribute_not_exists(srtpIndex) OR srtpIndex < :index OR srtpIndexSsrc <> :ssrc OR srtpIndexKeyFingerprint <> :fingerprint',
 		)
-	})
-
-	void it('records the identity the hint was confirmed under', async () => {
-		const { subject, sent } = service()
-		await subject.putSrtpRocHint(6000, 9, 42, FINGERPRINT)
-		const values = sent[0]?.input.ExpressionAttributeValues ?? {}
+		const values = input?.ExpressionAttributeValues ?? {}
+		assert.strictEqual(values[':index'], 9 as unknown as string)
 		assert.strictEqual(values[':ssrc'], 42 as unknown as string)
 		assert.strictEqual(values[':fingerprint'], FINGERPRINT)
 	})
 
-	void it('swallows a write failure, because the next start can search again', async () => {
+	// A lower index than the stored one is the condition doing its job.
+	void it('treats a refused raise as nothing to do', async () => {
+		const { subject } = service(['conditional'])
+		await subject.raiseSrtpIndexFloor(6000, 9, 42, FINGERPRINT)
+	})
+
+	void it('swallows a failed raise, which leaves the floor where it was', async () => {
 		const { subject } = service(['error'])
-		await subject.putSrtpRocHint(6000, 9, 42, FINGERPRINT)
+		await subject.raiseSrtpIndexFloor(6000, 9, 42, FINGERPRINT)
 	})
 })
 

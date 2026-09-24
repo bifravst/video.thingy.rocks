@@ -40,24 +40,42 @@ const REPLAY_PAUSE_MS = 10
  * slower than the replay sends, so this is only reached by a flood.
  */
 const REPLAY_MAX_MS = 5_000
+/**
+ * How often a moving replay floor is written, at most. Each session's last index is
+ * written when it ends as well, so what this spaces out is only the writes in between:
+ * the floor another instance would start from if this one died without warning.
+ */
+const INDEX_PERSIST_INTERVAL_MS = 5_000
 
-export type SrtpRocHintStore = {
-	getSrtpRocHint(
+/** Where the replay floor for each port lives; see StreamMetadata.srtpIndex. */
+export type SrtpIndexFloorStore = {
+	/** Rejects when the floor cannot be read, rather than claiming there is none. */
+	getSrtpIndexFloor(
 		port: number,
 		expectedSsrc: number,
 		expectedKeyFingerprint: string,
 	): Promise<number | undefined>
-	putSrtpRocHint(
+	/** Only ever raises the floor for a key and SSRC; best effort. */
+	raiseSrtpIndexFloor(
 		port: number,
-		roc: number,
+		index: number,
 		ssrc: number,
 		keyFingerprint: string,
 	): Promise<void>
 }
 
+type KeyIdentity = { ssrc: number; keyFingerprint: string }
+
+/** The highest index this process has seen accepted for a port, and what it wrote. */
+type KnownIndex = KeyIdentity & {
+	index: number
+	persisted: number
+	persistedAt: number
+}
+
 export type SrtpProducerOptions = {
 	keyStore: SrtpKeyStore
-	hints: SrtpRocHintStore
+	floors: SrtpIndexFloorStore
 	region: string
 	streamNameForPort: (port: number) => string
 	kvsLogConfigPath: string
@@ -88,9 +106,10 @@ type Session = {
 	/** Datagrams not yet sent: replayed on ready, handed back on a failed start. */
 	pending: Buffer[]
 	pendingBytes: number
-	confirmedRoc: number | undefined
-	/** Rollover counter this key and SSRC last reached, if it has been seen before. */
-	rocHint: number | undefined
+	/** The key and SSRC this session was started with. */
+	key: KeyIdentity
+	/** Set once the helper has reported authenticated traffic. */
+	confirmed: boolean
 	/**
 	 * The ownership epoch this session was started under. Held on the session rather
 	 * than read from `epochs` when a report goes out, because that map follows the
@@ -126,6 +145,7 @@ export class SrtpProducer implements ExitingProducer {
 	 */
 	private readonly unsent = new Map<number, Buffer[]>()
 	private readonly epochs = new Map<number, number>()
+	private readonly indexes = new Map<number, KnownIndex>()
 	private exitListener: (port: number) => void = () => undefined
 	private closed = false
 
@@ -155,13 +175,22 @@ export class SrtpProducer implements ExitingProducer {
 		}
 		this.epochs.set(port, context.epoch)
 
-		// A hint, not a requirement: the helper confirms it by authentication and
-		// searches if it was wrong, so a missing or stale value costs a short search.
-		const rocHint = await this.options.hints.getSrtpRocHint(
-			port,
-			key.ssrc,
-			key.keyFingerprint,
-		)
+		// Not optional: without a floor the helper accepts anything that
+		// authenticates, recordings of earlier sessions included.
+		let stored: number | undefined
+		try {
+			stored = await this.options.floors.getSrtpIndexFloor(
+				port,
+				key.ssrc,
+				key.keyFingerprint,
+			)
+		} catch (err) {
+			throw new Error(
+				`could not read the SRTP replay floor for port ${String(port)}; not starting without it`,
+				{ cause: err },
+			)
+		}
+		const floor = this.floorFor(port, key, stored)
 
 		const child = this.spawn(
 			'python3',
@@ -203,14 +232,14 @@ export class SrtpProducer implements ExitingProducer {
 			ready: false,
 			pending: [...datagrams],
 			pendingBytes: datagrams.reduce((sum, d) => sum + d.length, 0),
-			confirmedRoc: undefined,
-			rocHint,
+			key: { ssrc: key.ssrc, keyFingerprint: key.keyFingerprint },
+			confirmed: false,
 			epoch: context.epoch,
 			stopping: false,
 		}
 		this.sessions.set(port, session)
 
-		const ready = this.attachHelper(port, session, key)
+		const ready = this.attachHelper(port, session)
 
 		// The key travels here and nowhere else: not in the argument vector above, not
 		// in the environment, not in any log line.
@@ -222,7 +251,7 @@ export class SrtpProducer implements ExitingProducer {
 				cipher: key.cipher,
 				auth: key.auth,
 				ssrc: key.ssrc,
-				...(rocHint === undefined ? {} : { rocHint }),
+				...(floor === undefined ? {} : { floor }),
 			})}\n`,
 		)
 
@@ -263,11 +292,7 @@ export class SrtpProducer implements ExitingProducer {
 	 * its output.
 	 */
 	// eslint-disable-next-line @typescript-eslint/promise-function-async
-	private attachHelper(
-		port: number,
-		session: Session,
-		key: { ssrc: number; keyFingerprint: string },
-	): Promise<void> {
+	private attachHelper(port: number, session: Session): Promise<void> {
 		const protocol = new SrtpHelperProtocol()
 		let settle: ((err?: Error) => void) | undefined
 		const ready = new Promise<void>((resolve, reject) => {
@@ -298,7 +323,7 @@ export class SrtpProducer implements ExitingProducer {
 		session.child.stdout?.setEncoding('utf8')
 		session.child.stdout?.on('data', (chunk: string) => {
 			for (const message of protocol.push(chunk)) {
-				this.handleMessage(port, session, key, message, settle)
+				this.handleMessage(port, session, message, settle)
 			}
 		})
 		session.child.stderr?.setEncoding('utf8')
@@ -323,43 +348,67 @@ export class SrtpProducer implements ExitingProducer {
 	}
 
 	/**
-	 * Reports a sender that has gone backwards through its packet index.
+	 * The floor to start a helper with: the stored one, or the highest index this
+	 * process has seen accepted under the same key and SSRC, whichever is higher.
 	 *
-	 * SRTP derives its keystream from the master key, the SSRC and the packet index,
-	 * and the keys here are static and the SSRC fixed per port. A sender that restarts
-	 * its sequence numbering therefore encrypts new payloads under a keystream it has
-	 * already used, and two packets sharing one keystream reveal the XOR of their
-	 * plaintexts. It also makes packets captured before the restart authenticate
-	 * again, because their index is back inside the receiver's window.
-	 *
-	 * Only the operator can prevent this, by provisioning a fresh key before a device
-	 * restarts its numbering - see backend/README.md. All the receiver can do is say
-	 * that it happened, which is still worth more than accepting it in silence, and is
-	 * cheap because the counter this key last reached is already persisted.
-	 *
-	 * Detection is one-sided: a counter that went backwards proves reuse, while one
-	 * that did not prove nothing, since a rewind within a single rollover epoch leaves
-	 * the counter unchanged. Ingestion continues either way - refusing would not undo
-	 * the reuse, and would strand a device that had merely rebooted.
+	 * The stored floor can lag the one this process knows - its writes are spaced out,
+	 * and best effort - so the port's own restarts start from what it actually saw.
 	 */
-	private reportCounterRewind(
+	private floorFor(
 		port: number,
-		session: Session,
-		key: { ssrc: number; keyFingerprint: string },
-		roc: number,
-	): void {
-		if (session.rocHint === undefined || roc >= session.rocHint) return
-		this.logger.error(
-			'SRTP sender restarted its packet index under a key it has already used; its keystream is being reused, so rotate this port key with scripts/provision-srtp-key.sh',
-			new Error('SRTP rollover counter went backwards'),
-			{
-				port,
-				ssrc: key.ssrc,
-				keyFingerprint: key.keyFingerprint,
-				previousRoc: session.rocHint,
-				roc,
-			},
-		)
+		key: KeyIdentity,
+		stored: number | undefined,
+	): number | undefined {
+		const known = this.indexes.get(port)
+		const seen =
+			known?.ssrc === key.ssrc && known.keyFingerprint === key.keyFingerprint
+				? known.index
+				: undefined
+		if (stored === undefined) return seen
+		if (seen === undefined) return stored
+		return Math.max(stored, seen)
+	}
+
+	/**
+	 * Takes the helper's report of the highest index it accepted, and persists it.
+	 *
+	 * From any session, including one that is over: unlike everything acts() guards,
+	 * raising the floor cannot harm the lifetime that replaced it - the index was
+	 * authenticated, and the floor only goes up - and an ending helper's last report is
+	 * exactly the one worth having. For the same reason a session that no longer acts
+	 * is written at once, since nothing later will come to carry it.
+	 */
+	private recordIndex(port: number, session: Session, index: number): void {
+		const known = this.indexes.get(port)
+		const same =
+			known?.ssrc === session.key.ssrc &&
+			known.keyFingerprint === session.key.keyFingerprint
+		if (same && index <= known.index) return
+		const entry: KnownIndex = same
+			? known
+			: { ...session.key, index, persisted: -1, persistedAt: 0 }
+		entry.index = index
+		this.indexes.set(port, entry)
+		if (
+			!this.acts(port, session) ||
+			Date.now() - entry.persistedAt >= INDEX_PERSIST_INTERVAL_MS
+		) {
+			this.persistIndex(port, entry)
+		}
+	}
+
+	private persistIndex(port: number, entry: KnownIndex): void {
+		if (entry.index <= entry.persisted) return
+		entry.persisted = entry.index
+		entry.persistedAt = Date.now()
+		this.options.floors
+			.raiseSrtpIndexFloor(port, entry.index, entry.ssrc, entry.keyFingerprint)
+			.catch((err: unknown) => {
+				this.logger.warn('Could not persist the SRTP replay floor', {
+					port,
+					error: err instanceof Error ? err.message : String(err),
+				})
+			})
 	}
 
 	/**
@@ -394,12 +443,10 @@ export class SrtpProducer implements ExitingProducer {
 	 * and frames can arrive after the session is over: Node documents that stdio may
 	 * still be open when 'exit' fires, and the exit handler closes the session at once.
 	 * A stopping session is over too, as far as the port is concerned. Neither may
-	 * connect a relay, report authentication or persist a rollover counter - that
-	 * could promote or overwrite the lifetime that replaced it. Both may still be
-	 * logged, because a dying helper's last words are the diagnostics worth having.
-	 *
-	 * The cost is a stopping session's last authenticated rollover counter going
-	 * unpersisted, which at most costs the next start a short search.
+	 * connect a relay or report authentication - that could promote the lifetime that
+	 * replaced it. Both may still be logged, because a dying helper's last words are
+	 * the diagnostics worth having, and their index reports are still recorded; see
+	 * recordIndex.
 	 */
 	private acts(port: number, session: Session): boolean {
 		return this.sessions.get(port) === session && !session.stopping
@@ -408,11 +455,13 @@ export class SrtpProducer implements ExitingProducer {
 	private handleMessage(
 		port: number,
 		session: Session,
-		key: { ssrc: number; keyFingerprint: string },
 		message: SrtpHelperMessage,
 		settle: ((err?: Error) => void) | undefined,
 	): void {
 		switch (message.t) {
+			case 'index':
+				this.recordIndex(port, session, message.index)
+				return
 			case 'ready':
 				// Its relay socket is already closed once the session has ended, and
 				// connecting a closed socket throws - here, from the stdout handler.
@@ -434,25 +483,16 @@ export class SrtpProducer implements ExitingProducer {
 				if (message.status === 'ok') {
 					if (!this.acts(port, session)) return
 					if (message.first) {
+						session.confirmed = true
 						this.logger.info('SRTP traffic authenticated', {
 							port,
 							roc: message.roc,
 							trials: message.trials,
 						})
-						this.reportCounterRewind(port, session, key, message.roc)
 						// Only now does this port count as producing: until libsrtp has
-						// authenticated something, the traffic is unproven.
+						// authenticated something above the floor, the traffic is
+						// unproven.
 						this.options.onAuthenticated?.(port, session.epoch)
-					}
-					if (session.confirmedRoc !== message.roc) {
-						session.confirmedRoc = message.roc
-						// Written only because authentication confirmed it.
-						void this.options.hints.putSrtpRocHint(
-							port,
-							message.roc,
-							key.ssrc,
-							key.keyFingerprint,
-						)
 					}
 				} else if (message.status === 'lost') {
 					this.logger.warn('SRTP traffic stopped authenticating', {
@@ -492,7 +532,7 @@ export class SrtpProducer implements ExitingProducer {
 				// window at a time. Not for a session that is over: its counts describe a
 				// pipeline the port no longer has.
 				if (!this.acts(port, session)) return
-				if (session.confirmedRoc === undefined) {
+				if (!session.confirmed) {
 					this.logger.info('SRTP pipeline stats', {
 						port,
 						inputs: message.inputs,
@@ -629,6 +669,14 @@ export class SrtpProducer implements ExitingProducer {
 
 	private closeSession(port: number, session: Session): void {
 		if (this.sessions.get(port) === session) this.sessions.delete(port)
+		// Whatever the interval held back, now: no later report will carry it.
+		const known = this.indexes.get(port)
+		if (
+			known?.ssrc === session.key.ssrc &&
+			known.keyFingerprint === session.key.keyFingerprint
+		) {
+			this.persistIndex(port, known)
+		}
 		// Whatever it never sent outlives it, so a failed start can hand it back.
 		if (session.pending.length > 0) this.unsent.set(port, session.pending)
 		session.pending = []

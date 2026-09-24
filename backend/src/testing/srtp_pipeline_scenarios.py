@@ -52,9 +52,11 @@ class FakeDecoder:
 
 
 class Scenario:
-    def __init__(self, hint: int) -> None:
+    def __init__(self, floor_roc: int) -> None:
         args = sp.parse_args(["--ssrc", str(SSRC), "--fake-sink", "--trial-drops", "4"])
-        init = {"key": KEY, "ssrc": SSRC, "rocHint": hint}
+        # The floor at sequence number 0 of that rollover, so the search starts there
+        # and every packet below from sequence number 1 on is above it.
+        init = {"key": KEY, "ssrc": SSRC, "floor": floor_roc << 16}
         self.pipeline = sp.SrtpPipeline(args, init)
         self.decoder = FakeDecoder()
         self.pipeline.dec = self.decoder
@@ -87,8 +89,8 @@ class Scenario:
         }
 
 
-def run(hint: int, script: Callable[[Scenario], None]) -> dict[str, object]:
-    scenario = Scenario(hint)
+def run(floor_roc: int, script: Callable[[Scenario], None]) -> dict[str, object]:
+    scenario = Scenario(floor_roc)
     captured = io.StringIO()
     with contextlib.redirect_stdout(captured):
         scenario.pipeline._begin_trial()
@@ -98,7 +100,8 @@ def run(hint: int, script: Callable[[Scenario], None]) -> dict[str, object]:
 
 
 def new_key_authenticates_before_the_trial_baseline(s: Scenario) -> None:
-    """The hint is wrong, zero is right, and zero's only packet lands in the switch.
+    """The floor's rollover is wrong, the next one is right, and its only packet lands
+    in the switch.
 
     The next datagram asks for a key and authenticates under the new candidate before
     the new trial is set up. A baseline snapshotted when the trial begins absorbs that
@@ -118,7 +121,8 @@ def new_key_authenticates_before_the_trial_baseline(s: Scenario) -> None:
 
 
 def old_key_authenticates_after_the_switch(s: Scenario) -> None:
-    """The hint is right, but noise ends its trial just as its first real packet lands.
+    """The floor's rollover is right, but noise ends its trial just as its first real
+    packet lands.
 
     The search decides the trial failed and steps on, and a packet authenticates under
     the old key - still installed - before remove-key takes effect. Credited to the
@@ -141,7 +145,7 @@ def old_key_authenticates_after_the_switch(s: Scenario) -> None:
 def live_stream(s: Scenario) -> None:
     """The ordinary case: the right candidate, and packets that keep authenticating."""
     s.request_key()
-    for seq in range(5):
+    for seq in range(1, 6):
         s.authenticate(seq)
     s.tick()
 
