@@ -111,6 +111,33 @@ export const fleetInstanceIds = async (
 }
 
 /**
+ * The bucket the CDK deployment puts the backend code in.
+ *
+ * Found through the stack's resources rather than an output so this works against
+ * stacks deployed before one existed - the bucket's physical name is generated,
+ * and its logical ID (`CodeBucket`) is the stable handle.
+ */
+export const codeBucketFor = async (
+	region: string,
+	stackName: string,
+): Promise<string> => {
+	const { CloudFormationClient, DescribeStackResourcesCommand } =
+		await import('@aws-sdk/client-cloudformation')
+	const cfn = new CloudFormationClient({ region })
+	const resources = await cfn.send(
+		new DescribeStackResourcesCommand({ StackName: stackName }),
+	)
+	const bucket = (resources.StackResources ?? []).find(
+		(r) => r.LogicalResourceId === 'CodeBucket',
+	)?.PhysicalResourceId
+	assert.ok(
+		bucket !== undefined,
+		'the stack has no CodeBucket resource - was it deployed from the srtp-ingest-v3 branch?',
+	)
+	return bucket
+}
+
+/**
  * Provisions one port's key as a SecureString, exactly as the ops script does:
  * no KeyId, so the parameter is encrypted under the AWS-managed aws/ssm key,
  * which the instance role can read without a KMS grant. The value shape is the
@@ -272,31 +299,61 @@ export const lockRow = async (
 }
 
 /**
- * Restarts the backend service on the given instances and waits for the SSM
- * command to complete. The cases' own assertions then wait for the service to
- * come back (by streaming and watching it authenticate).
+ * Puts the deployed backend code on the instances and restarts the service.
+ *
+ * This is the step a plain `systemctl restart` cannot stand in for: instances
+ * receive code only at boot (the user-data `aws s3 sync`), so a fleet that
+ * predates a deploy keeps running whatever it booted with - which is how an e2e
+ * run against a freshly deployed stack can find no SRTP listener at all. So
+ * this does what boot does, on every instance, idempotently:
+ *
+ * 1. `aws s3 sync` the deployed `backend/` from the CDK code bucket - the same
+ *    command user-data runs at boot.
+ * 2. Install the SRTP helper's Python bindings, the way the new user-data does -
+ *    non-fatally, because on instances that already have them it is a no-op.
+ * 3. `npm install --production` for any new dependencies.
+ * 4. `systemctl restart` the service.
+ *
+ * The runner then waits for the service's own startup log line before running
+ * any case (see run.ts), so a fleet that still cannot run the backend fails
+ * fast with the reason instead of three minutes into a streaming case.
  */
 export const restartBackend = async (
 	region: string,
 	instanceIds: string[],
+	codeBucket: string,
 ): Promise<void> => {
 	const ssm = new SSMClient({ region })
 	const command = await ssm.send(
 		new SendCommandCommand({
 			InstanceIds: instanceIds,
 			DocumentName: 'AWS-RunShellScript',
-			Comment: 'video-streaming e2e: restart the backend service',
+			Comment:
+				'video-streaming e2e: deploy backend code and restart the service',
 			Parameters: {
-				commands: ['systemctl restart video-streaming.service'],
+				commands: [
+					'set -e',
+					// The same sync boot performs; idempotent, so instances that
+					// already run this code just confirm it.
+					`aws s3 sync s3://${codeBucket}/backend/ /opt/video-streaming/ --region ${region}`,
+					// The SRTP helper's GObject bindings, installed non-fatally like
+					// the new user-data installs them: an instance that has them
+					// already skips this in seconds, an instance from before the
+					// SRTP deploy gains them now.
+					'yum install -y python3-gobject-base || echo "WARNING: python3-gobject-base not installed; SRTP ingestion will not work"',
+					'cd /opt/video-streaming',
+					'npm install --production',
+					'systemctl restart video-streaming.service',
+				],
 			},
 		}),
 	)
 	const commandId = command.Command?.CommandId
 	assert.ok(commandId !== undefined, 'no SSM command id')
-	const deadline = Date.now() + 120_000
+	const deadline = Date.now() + 15 * 60_000
 	for (const instanceId of instanceIds) {
 		for (;;) {
-			await sleep(3_000)
+			await sleep(5_000)
 			const invocation = await ssm.send(
 				new GetCommandInvocationCommand({
 					CommandId: commandId,
@@ -310,11 +367,13 @@ export const restartBackend = async (
 				invocation.Status === 'TimedOut'
 			) {
 				throw new Error(
-					`restart on ${instanceId}: ${String(invocation.Status)} ${String(invocation.StandardOutputContent)}`,
+					`backend deploy/restart on ${instanceId}: ${String(invocation.Status)}\n${String(invocation.StandardOutputContent)}\n${String(invocation.StandardErrorContent)}`,
 				)
 			}
 			if (Date.now() > deadline) {
-				throw new Error(`restart on ${instanceId} did not complete in time`)
+				throw new Error(
+					`backend deploy/restart on ${instanceId} did not complete in time`,
+				)
 			}
 		}
 	}

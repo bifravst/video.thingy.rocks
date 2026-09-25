@@ -12,9 +12,9 @@ attempts and how this design handles each.
 - A deployed stack: `npm run cdk:prod:deploy`
 - `ffmpeg` locally (the e2e suite's isolation case uses it for the unencrypted
   path)
-- The e2e suite also needs `E2E_STACK_NAME=<stack>` and credentials allowed to
-  provision SSM parameters, query CloudWatch metrics/logs, read DynamoDB, and
-  send SSM commands to the fleet
+- The e2e suite also needs credentials allowed to provision SSM parameters,
+  query CloudWatch metrics/logs, read DynamoDB, and send SSM commands to the
+  fleet
 
 ## How it works
 
@@ -87,14 +87,18 @@ metric, `GetMedia` fragments read back, the application log, and the lock table.
 
 ```bash
 cd backend
-E2E_STACK_NAME=<stack> AWS_REGION=<region> npm run test:e2e
-# one case: E2E_STACK_NAME=<stack> npm run test:e2e -- --only wrap
+npm run test:e2e
+# one case: npm run test:e2e -- --only wrap
 ```
 
-The suite provisions a fresh key per port, restarts the fleet once so the
-service loads them, then runs the cases sequentially. It needs the fleet's
-instances reachable through SSM (the instance role already has it). Ports and
-cases:
+The suite provisions a fresh key per port, then **deploys the backend code to
+the running fleet itself** — `aws s3 sync` from the stack's code bucket, the
+SRTP Python bindings, `npm install`, service restart — so it works against
+instances that predate the deploy (a plain restart cannot do this: instances
+receive code only at boot). It then waits for the service's own log line saying
+the SRTP transport started, and fails fast with the reason if it did not, before
+any case runs. It needs the fleet's instances reachable through SSM (the
+instance role already has it). Ports and cases:
 
 | Port        | Case             | What it proves                                                                                                                |
 | ----------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------- |
