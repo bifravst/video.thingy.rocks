@@ -538,7 +538,15 @@ export const cases: E2eCase[] = [
 					'-f',
 					'lavfi',
 					'-i',
-					'testsrc2=size=320x180:rate=15',
+					// 1280x720, not 320x180: the unencrypted path buffers
+					// KINESIS_MIN_BYTES_BEFORE_START (10 MB) before it starts GStreamer,
+					// so the stream must cross that within its window. At 320x180
+					// ultrafast the source produces ~60 KB/s - 2.7 MB over 45s, never
+					// enough, which is exactly how this case failed on 2026-09-25 while
+					// the path itself was healthy. At 1280x720 the same content produces
+					// ~475 KB/s, crossing 10 MB at about 21s. Measured, not guessed:
+					// ffmpeg -t 5 of each source into mpegts, wc -c.
+					'testsrc2=size=1280x720:rate=15',
 					'-t',
 					'45',
 					'-c:v',
@@ -561,11 +569,14 @@ export const cases: E2eCase[] = [
 				noise.stop()
 				await noiseRun
 				// The unencrypted stream kept ingesting throughout the noise.
+				// The wait covers the pre-start threshold (~21s into the stream),
+				// the pipeline start, the first upload, and - on the aligned
+				// metric windows - a full minute boundary after it.
 				await waitForStreamIngestion(
 					ctx.config.region,
 					streamNameFor(ctx.config, 5000),
 					since,
-					120_000,
+					240_000,
 				)
 				// And the noise port did not ingest.
 				await new Promise((resolve) => setTimeout(resolve, 30_000))
