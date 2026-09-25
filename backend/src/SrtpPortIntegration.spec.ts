@@ -177,6 +177,61 @@ void describe('srtp_port.py against real libsrtp', { skip: !hasSrtp }, () => {
 			}
 		})
 
+		void it(
+			'recovers after unauthenticated traffic has walked the search past the answer',
+			{ timeout: 60_000 },
+			async () => {
+				// The collision case, and the attack it stands in for: traffic that
+				// holds the SSRC and the RTP version but not the key advances the
+				// search one candidate per few drops, past the counter the real
+				// sender is actually on. Without the re-sweep of the counters just
+				// above the floor, the climbing search never comes back down and
+				// the port cannot authenticate the real sender again until the
+				// service restarts - which was a real failure on the deployed
+				// fleet, not a hypothesis.
+				const helper = await startHelper({
+					key: KEY,
+					ssrc: SSRC,
+					extraArgs: ['--floor-every', '8'],
+				})
+				try {
+					// Unauthenticated traffic with the correct public SSRC and
+					// version: the wrong key makes every authentication fail, but
+					// every failure is a drop, and every four drops advance the
+					// search.
+					const wrongKey = KEY.slice(0, 58) + 'ff'
+					for (let i = 0; i < 60; i++) {
+						helper.send(
+							srtpPacket({
+								keyHex: wrongKey,
+								ssrc: SSRC,
+								seq: 30000 + i,
+								roc: 2,
+								payload: h264Payload(),
+							}),
+						)
+						await new Promise((resolve) => setTimeout(resolve, 5))
+					}
+					// The search has been stepped well past rollover 2.
+					await helper.waitFor((m) => m.t === 'searching' && m.candidate > 4)
+
+					// The real sender, still on rollover 2, streams continuously.
+					// The re-sweep after the next floor re-offer must reach 2 and
+					// confirm it - within a bounded number of candidates, not
+					// after the climb has wrapped the whole counter space.
+					await sendBurst(helper, KEY, 2, 31000, 150)
+					const confirmed = await helper.waitFor(
+						(m) => m.t === 'auth' && m.status === 'ok' && m.first,
+						30_000,
+					)
+					assert.ok(confirmed.t === 'auth' && confirmed.status === 'ok')
+					assert.strictEqual(confirmed.roc, 2)
+				} finally {
+					await helper.stop()
+				}
+			},
+		)
+
 		void it('reports a wrap as a later rollover of a confirmed stream', async () => {
 			const helper = await startHelper({ key: KEY, ssrc: SSRC })
 			try {

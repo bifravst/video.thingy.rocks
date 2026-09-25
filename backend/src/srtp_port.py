@@ -81,6 +81,17 @@ KEY_SHAPED = re.compile(r"^[0-9a-fA-F]{40,}$")
 #: GST_DEBUG at this level or above makes GStreamer log element caps, which would
 #: include the SRTP key.
 MAX_SAFE_GST_DEBUG = 3
+#: How many counters just above the floor are re-offered after every floor
+#: re-offer, see Search. A burst of traffic that cannot authenticate - a sender
+#: holding a stale key, an attacker, or another test run against the same port -
+#: advances the climbing search one candidate per few drops, and once the climb has
+#: passed the real counter, only this re-sweep reaches it again: the climb ascends
+#: without descending, and the floor re-offer on its own repeats only the floor
+#: itself. Sixteen covers a sender that wrapped while the receiver was down for
+#: about ten hours (one rollover per ~36 minutes at 30 fps) - far beyond any
+#: plausible drift, at a cost of sixteen candidates per cycle.
+RESWEEP_WINDOW = 16
+
 #: The receive buffer for the port's socket. Its only job is to hold datagrams
 #: while a pipeline is being torn down and rebuilt, so a mode switch does not cost
 #: the keyframe that arrives during it. The kernel caps this at net.core.rmem_max
@@ -135,6 +146,7 @@ class Search:
         self.near = self.base + 1
         self.since_floor: int | None = None
         self.far_turn = False
+        self.resweep = 0
 
     def __iter__(self) -> "Search":
         return self
@@ -144,7 +156,16 @@ class Search:
             return self.base
         if self.since_floor is None or self.since_floor >= self.floor_every:
             self.since_floor = 0
+            self.resweep = RESWEEP_WINDOW
             return self.base
+        # The re-sweep runs before the climbs and does not count towards the
+        # floor interval: these are the counters a sender that kept counting
+        # through the receiver's downtime has most plausibly reached, and they
+        # must be reachable again after traffic that cannot authenticate has
+        # walked the climbing search past them.
+        if self.resweep > 0:
+            self.resweep -= 1
+            return min(self.base + (RESWEEP_WINDOW - self.resweep), ROC_MAX)
         self.since_floor += 1
         for _ in range(2):
             self.far_turn = not self.far_turn
