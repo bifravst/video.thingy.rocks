@@ -81,7 +81,26 @@ const main = async (): Promise<void> => {
 	if (line.includes('has no usable keys') || line.includes('disabled')) {
 		throw new Error(`the SRTP transport did not start: ${line.slice(0, 400)}`)
 	}
-	log('SRTP transport started; running cases')
+
+	// The transport being up is not the helpers being up: a helper reaching
+	// 'searching' proves srtp_port.py actually runs on the fleet - the Python
+	// bindings, the built srtpdec element and the floor read all work. A
+	// 'missing-element' fatal here would otherwise surface three minutes into
+	// the first case as a silent drop.
+	log("waiting for a port's helper to report that it is searching")
+	const helperUp = await waitForLogLines(
+		region,
+		config.logGroup,
+		'Port state.*"from":"starting","to":"searching"',
+		since,
+		5 * 60_000,
+	).catch(() => [] as string[])
+	if (helperUp.length === 0) {
+		throw new Error(
+			"no SRTP helper reached 'searching': the helpers cannot run on the fleet. Check the application log for 'SRTP helper fatal' - on Amazon Linux 2023 that usually means the srtpdec build (install-gst-srtp-plugin.sh) failed.",
+		)
+	}
+	log('SRTP transport started, helpers running; running cases')
 
 	const failures: { name: string; error: unknown }[] = []
 	for (const c of selected) {
