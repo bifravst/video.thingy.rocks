@@ -263,7 +263,7 @@ export const waitForLogLines = async (
 			new StartQueryCommand({
 				logGroupName: logGroup,
 				startTime: Math.floor(since.getTime() / 1000),
-				endTime: Math.floor(Date.now() / 1000),
+				endTime: Math.floor(Date.now() / 1000) + 1,
 				queryString: `fields @message | filter @message like /${filter}/ | sort @timestamp asc`,
 			}),
 		)
@@ -274,12 +274,18 @@ export const waitForLogLines = async (
 				new GetQueryResultsCommand({ queryId: started.queryId }),
 			)
 			if (results.status === 'Running') continue
+			// Only the @message field: CloudWatch also returns @ptr (a base64 event
+			// pointer) and @timestamp per row, which are not log lines and would
+			// make every second returned "line" garbage.
 			const lines = (results.results ?? [])
-				.flatMap((row) => row.map((f) => f.value ?? ''))
+				.flatMap((row) =>
+					row.filter((f) => f.field === '@message').map((f) => f.value ?? ''),
+				)
 				.filter((v) => v.length > 0)
 			if (lines.length > 0) return lines
 			// The query completed with nothing: either the events have not been
-			// indexed yet, or they truly are not there. Re-query until the deadline.
+			// indexed yet, or they truly are not there. Re-query until the deadline,
+			// with a fresh end time so events that arrived meanwhile are in scope.
 			if (Date.now() > deadline) {
 				throw new Error(
 					`no log line matching /${filter}/ since ${since.toISOString()}`,
