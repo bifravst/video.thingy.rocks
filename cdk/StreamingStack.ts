@@ -1,7 +1,6 @@
 import {
 	CfnOutput,
 	Duration,
-	Fn,
 	RemovalPolicy,
 	Size,
 	Stack,
@@ -28,6 +27,17 @@ import type { Construct } from 'constructs'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+// The backend publishes the per-transport traffic metric these alarms read, so the two
+// share the names rather than spelling them out twice; see TrafficMetricNames.
+import {
+	RECEIVED_BYTES_METRIC,
+	SERVING_METRIC,
+	SRTP_TRANSPORT,
+	trafficMetricNamespace,
+	TRANSPORT_DIMENSION,
+	UNENCRYPTED_TRANSPORT,
+} from '../backend/src/TrafficMetricNames.ts'
 
 export class StreamingStack extends Stack {
 	public readonly vpc: ec2.Vpc
@@ -90,15 +100,27 @@ export class StreamingStack extends Stack {
 			removalPolicy: RemovalPolicy.DESTROY,
 		})
 
-		// Kinesis Video Streams: one per UDP port (5000-5009)
-		const kinesisStreamPortStart = 5000
-		const kinesisStreamPortEnd = 5009
+		// Ingest ports. The unencrypted MPEG-TS transport is the original path; SRTP is
+		// additive and uses its own ports, keys and streams.
+		const portRange = (start: number, end: number): number[] =>
+			Array.from({ length: end - start + 1 }, (_, i) => start + i)
+		const unencryptedPorts = portRange(5000, 5009)
+		const srtpPorts = portRange(6000, 6009)
+
+		// Kinesis Video Streams: one per ingest port, on both transports.
+		//
+		// Each transport gets its own streams rather than sharing one set, which keeps
+		// this deployment purely additive: the existing 5000-5009 streams keep both
+		// their construct IDs and their names, so nothing is renamed or replaced.
+		// Kinesis Video has no rename operation, so a changed name replaces the stream
+		// and drops its retained media - and sharing a stream between two transports
+		// would also mean two producers arbitrating over one destination.
 		const kinesisStreamPrefix = `${this.stackName}-video`
-		for (
-			let port = kinesisStreamPortStart;
-			port <= kinesisStreamPortEnd;
-			port++
-		) {
+		for (const port of [
+			...unencryptedPorts,
+			// SRTP ports, whose streams are additions.
+			...srtpPorts,
+		]) {
 			const stream = new kinesisvideo.CfnStream(
 				this,
 				`KinesisVideoStream${port}`,
@@ -128,6 +150,18 @@ export class StreamingStack extends Stack {
 			ec2.Peer.anyIpv6(),
 			ec2.Port.udpRange(5000, 5009),
 			'Allow UDP video ingestion on ports 5000-5009 (IPv6)',
+		)
+		// Allow UDP ingress on the SRTP ports (6000-6009), same dual-stack reasoning
+		// as the unencrypted range above.
+		this.udpSecurityGroup.addIngressRule(
+			ec2.Peer.anyIpv4(),
+			ec2.Port.udpRange(6000, 6009),
+			'Allow SRTP video ingestion on ports 6000-6009',
+		)
+		this.udpSecurityGroup.addIngressRule(
+			ec2.Peer.anyIpv6(),
+			ec2.Port.udpRange(6000, 6009),
+			'Allow SRTP video ingestion on ports 6000-6009 (IPv6)',
 		)
 		// Allow TCP health checks from NLB (originates within VPC)
 		this.udpSecurityGroup.addIngressRule(
@@ -177,6 +211,24 @@ export class StreamingStack extends Stack {
 					'kinesisvideo:PutMedia',
 				],
 				resources: ['*'],
+			}),
+		)
+
+		// Grant read access to the SRTP keys, scoped to this stack's parameters.
+		// The partition comes from the stack rather than being hardcoded as "aws", so
+		// this is still correct in other partitions.
+		// There is deliberately no kms:Decrypt grant: scripts/provision-srtp-key.sh
+		// writes the keys as SecureStrings under the AWS managed key aws/ssm, whose key
+		// policy already lets any principal in the account decrypt through SSM. Keys
+		// under a customer managed key would need kms:Decrypt on that key here (with a
+		// kms:ViaService condition for SSM) and a key policy that allows this role.
+		this.ec2Role.addToPolicy(
+			new iam.PolicyStatement({
+				effect: iam.Effect.ALLOW,
+				actions: ['ssm:GetParameter', 'ssm:GetParameters'],
+				resources: [
+					`arn:${this.partition}:ssm:${this.region}:${this.account}:parameter/${this.stackName}/srtp/*`,
+				],
 			}),
 		)
 
@@ -240,7 +292,11 @@ export class StreamingStack extends Stack {
 		userDataScript = userDataScript
 			.replace(/__AWS_REGION__/g, this.region)
 			.replace(/__TABLE_NAME__/g, this.streamTable.tableName)
+			.replace(/__STACK_NAME__/g, this.stackName)
 			.replace(/__KINESIS_STREAM_PREFIX__/g, kinesisStreamPrefix)
+			.replace(/__SRTP_KEY_PARAMETER_PREFIX__/g, `/${this.stackName}/srtp/port`)
+			.replace(/__SRTP_PORT_RANGE_START__/g, String(srtpPorts[0]))
+			.replace(/__SRTP_PORT_RANGE_END__/g, String(srtpPorts.at(-1)))
 			.replace(/__CODE_BUCKET__/g, this.codeBucket.bucketName)
 
 		const userData = ec2.UserData.custom(userDataScript)
@@ -333,55 +389,71 @@ export class StreamingStack extends Stack {
 			},
 		]
 
-		// Create target groups for UDP ports 5000-5009
-		const targetGroups: elbv2.NetworkTargetGroup[] = []
-		for (let port = 5000; port <= 5009; port++) {
-			const targetGroup = new elbv2.NetworkTargetGroup(
-				this,
-				`TargetGroup${port}`,
-				{
-					vpc: this.vpc,
-					port,
-					protocol: elbv2.Protocol.UDP,
-					targetType: elbv2.TargetType.INSTANCE,
-					ipAddressType: elbv2.TargetGroupIpAddressType.IPV6,
-					healthCheck: {
-						protocol: elbv2.Protocol.TCP,
-						port: '9999',
-						healthyThresholdCount: 2,
-						unhealthyThresholdCount: 2,
-						interval: Duration.seconds(10),
-						timeout: Duration.seconds(10),
-					},
-					deregistrationDelay: Duration.seconds(30),
-					preserveClientIp: true,
+		/**
+		 * Creates the UDP target group for one ingest port.
+		 *
+		 * Every target group health-checks port 9999, including the SRTP ones. That
+		 * port means "this instance's backend is up", not "this transport can ingest":
+		 * the Auto Scaling group uses ELB health checks, and with those, any attached
+		 * target group reporting an instance unhealthy gets the instance replaced. A
+		 * per-transport health port would therefore let an SRTP-only condition that is
+		 * identical on every instance - an unreachable parameter store, a missing
+		 * plugin, one unprovisioned key - churn the entire fleet and take the
+		 * unencrypted path down with it. The cost of this choice is that an instance
+		 * whose SRTP listener never bound still receives SRTP traffic and drops it;
+		 * that shows up in the SRTP zero-ingestion alarm rather than in a fleet-wide
+		 * outage.
+		 */
+		const createTargetGroup = (
+			id: string,
+			port: number,
+		): elbv2.NetworkTargetGroup => {
+			const targetGroup = new elbv2.NetworkTargetGroup(this, id, {
+				vpc: this.vpc,
+				port,
+				protocol: elbv2.Protocol.UDP,
+				targetType: elbv2.TargetType.INSTANCE,
+				ipAddressType: elbv2.TargetGroupIpAddressType.IPV6,
+				healthCheck: {
+					protocol: elbv2.Protocol.TCP,
+					port: '9999',
+					healthyThresholdCount: 2,
+					unhealthyThresholdCount: 2,
+					interval: Duration.seconds(10),
+					timeout: Duration.seconds(10),
 				},
-			)
+				deregistrationDelay: Duration.seconds(30),
+				preserveClientIp: true,
+			})
 
 			// Enable stickiness for single active instance pattern
 			targetGroup.setAttribute('stickiness.enabled', 'true')
 			targetGroup.setAttribute('stickiness.type', 'source_ip')
-
-			targetGroups.push(targetGroup)
+			return targetGroup
 		}
 
-		// Create UDP listeners for ports 5000-5009
-		for (let i = 0; i < targetGroups.length; i++) {
-			const port = 5000 + i
-			const targetGroup = targetGroups[i]
-			if (!targetGroup) {
-				throw new Error(`Target group for port ${port} is undefined`)
-			}
-			this.networkLoadBalancer.addListener(`UDPListener${port}`, {
+		// Existing construct IDs are kept for the unencrypted ports so this deployment
+		// does not replace their target groups; the SRTP ones are new.
+		const targetGroups = [
+			...unencryptedPorts.map((port) => ({
+				port,
+				targetGroup: createTargetGroup(`TargetGroup${port}`, port),
+				listenerId: `UDPListener${port}`,
+			})),
+			...srtpPorts.map((port) => ({
+				port,
+				targetGroup: createTargetGroup(`SrtpTargetGroup${port}`, port),
+				listenerId: `SrtpUDPListener${port}`,
+			})),
+		]
+
+		for (const { port, targetGroup, listenerId } of targetGroups) {
+			this.networkLoadBalancer.addListener(listenerId, {
 				port,
 				protocol: elbv2.Protocol.UDP,
 				defaultAction: elbv2.NetworkListenerAction.forward([targetGroup]),
 			})
-		}
-
-		// Attach all target groups to the Auto Scaling Group
-		// This enables automatic registration/deregistration of instances
-		for (const targetGroup of targetGroups) {
+			// Attaching to the ASG is what registers and deregisters instances.
 			this.autoScalingGroup.attachToNetworkTargetGroup(targetGroup)
 		}
 
@@ -509,82 +581,213 @@ export class StreamingStack extends Stack {
 		})
 		cpuAlarm.addAlarmAction(new cloudwatch_actions.SnsAction(alarmTopic))
 
-		// Composite alarm: NLB UDP traffic > 1 MB/s but no PutMedia ingestion on any Kinesis stream
 		const oneMebibytePerSecondBytesPerMinute = 1024 * 1024 * 60 // 1 MiB/s * 60s
-		const nlbUdpBytesAlarm = new cloudwatch.Alarm(
-			this,
-			'NLBUDPBytesHighAlarm',
+
+		/**
+		 * The transports the alarms below are built for, one descriptor each.
+		 *
+		 * The three strings are kept apart because they have different jobs, and
+		 * merging them is how the SRTP traffic leg came to query `SRTP` for a dimension
+		 * the backend publishes as `srtp`. `dimension` has to match the published value
+		 * exactly and so is never written here - it comes from the constant the backend
+		 * publishes with. `label` names logical IDs and alarms, and `title` is prose. A
+		 * readable word is wrong in the one position where only an exact match works,
+		 * and nothing about `string` says so, which is why a single argument must not
+		 * serve two of these at once.
+		 */
+		const transports = [
 			{
-				alarmName: `${Stack.of(this).stackName}-NLB-UDP-Bytes-Gt-1MBps`,
-				alarmDescription:
-					'NLB ProcessedBytes_UDP exceeds 1 MB/s (bytes per minute threshold)',
-				metric: new cloudwatch.Metric({
-					namespace: 'AWS/NetworkELB',
-					metricName: 'ProcessedBytes_UDP',
-					dimensionsMap: {
-						LoadBalancer: Fn.select(
-							1,
-							Fn.split(
-								'loadbalancer/',
-								this.networkLoadBalancer.loadBalancerArn,
-							),
-						),
-					},
-					statistic: 'Sum',
-					period: Duration.minutes(1),
-				}),
+				dimension: UNENCRYPTED_TRANSPORT,
+				label: 'Unencrypted',
+				title: 'unencrypted',
+				ports: unencryptedPorts,
+			},
+			{
+				dimension: SRTP_TRANSPORT,
+				label: 'SRTP',
+				title: 'SRTP',
+				ports: srtpPorts,
+			},
+		] as const
+		type TransportAlarms = (typeof transports)[number]
+
+		/** One of the backend's per-transport metrics, for this stack. */
+		const backendMetric = (
+			metricName: string,
+			transport: TransportAlarms,
+			statistic: string,
+		): cloudwatch.Metric =>
+			new cloudwatch.Metric({
+				namespace: trafficMetricNamespace(Stack.of(this).stackName),
+				metricName,
+				dimensionsMap: { [TRANSPORT_DIMENSION]: transport.dimension },
+				statistic,
+				period: Duration.minutes(1),
+			})
+
+		/**
+		 * "Traffic is arriving on this transport", from the backend's own metric.
+		 *
+		 * Not from the load balancer. ProcessedBytes_UDP is published per load balancer
+		 * and nothing narrower - there is no per-listener or per-target-group variant -
+		 * so it cannot tell 5000-5009 from 6000-6009. Pairing it with a single
+		 * transport's ingestion, which is what the restart composite used to do, asks
+		 * "is anything arriving anywhere" against "is this transport reaching Kinesis",
+		 * and traffic on the other transport then decides the answer.
+		 *
+		 * Missing data is not a breach: without a sample there is no evidence traffic
+		 * is arriving, and the backend publishes a zero every minute precisely so that
+		 * a gap means "this instance is not reporting" rather than "it is idle". An
+		 * instance that stops reporting is the Auto Scaling health check's problem, not
+		 * the restart automation's.
+		 */
+		const trafficArrivingOn = (transport: TransportAlarms): cloudwatch.Alarm =>
+			new cloudwatch.Alarm(this, `UDPTrafficArriving${transport.label}`, {
+				alarmName: `${Stack.of(this).stackName}-UDP-Traffic-${transport.label}`,
+				alarmDescription: `Bytes received on the ${transport.title} transport exceed 1 MB/s`,
+				metric: backendMetric(RECEIVED_BYTES_METRIC, transport, 'Sum'),
 				threshold: oneMebibytePerSecondBytesPerMinute,
 				evaluationPeriods: 5,
 				comparisonOperator:
 					cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
-				treatMissingData: cloudwatch.TreatMissingData.BREACHING,
-			},
-		)
-
-		const kvsIncomingMetrics: Record<string, cloudwatch.IMetric> = {}
-		this.kinesisVideoStreams.forEach((_, i) => {
-			const port = kinesisStreamPortStart + i
-			const streamName = `${kinesisStreamPrefix}-${port}`
-			kvsIncomingMetrics[`s${i}`] = new cloudwatch.Metric({
-				namespace: 'AWS/KinesisVideo',
-				metricName: 'PutMedia.IncomingBytes',
-				dimensionsMap: { StreamName: streamName },
-				statistic: 'Sum',
-				period: Duration.minutes(1),
+				treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
 			})
-		})
-		const kvsIncomingSum = new cloudwatch.MathExpression({
-			expression: this.kinesisVideoStreams.map((_, i) => `s${i}`).join('+'),
-			usingMetrics: kvsIncomingMetrics,
-			period: Duration.minutes(1),
-			label: 'PutMedia Incoming Bytes (all streams)',
-		})
-		const kvsNoIngestionAlarm = new cloudwatch.Alarm(
-			this,
-			'KVSNoPutMediaIngestionAlarm',
-			{
-				alarmName: `${Stack.of(this).stackName}-KVS-PutMedia-Incoming-Zero`,
-				alarmDescription:
-					'Sum of PutMedia.IncomingBytes across all Kinesis Video Streams is 0',
-				metric: kvsIncomingSum,
+
+		/**
+		 * A transport that is configured but not serving, which no traffic leg can see.
+		 *
+		 * The traffic-gated alarms answer "traffic arrives and is lost", so they are
+		 * blind to a transport whose listener never bound: nothing arrives, its byte
+		 * count is a steady zero, and the fault is indistinguishable from an idle
+		 * transport. That is precisely what an unreachable parameter store does - the
+		 * key load throws, its transport is skipped, and the ports stay closed - so the
+		 * failure the isolation exists to survive was also the one nothing reported.
+		 *
+		 * Minimum, so one degraded instance in the fleet is enough; notify only, since
+		 * restarting a fleet does not make a parameter store reachable.
+		 */
+		const notServingOn = (transport: TransportAlarms): cloudwatch.Alarm => {
+			const alarm = new cloudwatch.Alarm(
+				this,
+				`TransportNotServing${transport.label}`,
+				{
+					alarmName: `${Stack.of(this).stackName}-Transport-Not-Serving-${transport.label}`,
+					alarmDescription: `The ${transport.title} transport is configured but its listener is not serving on at least one instance`,
+					metric: backendMetric(SERVING_METRIC, transport, 'Minimum'),
+					threshold: 1,
+					evaluationPeriods: 5,
+					comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+					// A transport nobody reports on is the health check's problem, as
+					// above; this alarm is about an instance that reports and says no.
+					treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+				},
+			)
+			alarm.addAlarmAction(new cloudwatch_actions.SnsAction(alarmTopic))
+			return alarm
+		}
+
+		/**
+		 * Sums PutMedia.IncomingBytes over an explicit set of ports.
+		 *
+		 * Built from a port list rather than from this.kinesisVideoStreams, which now
+		 * holds both transports: iterating it would silently change what the existing
+		 * alarm watches every time a transport is added.
+		 */
+		const kvsIncomingSumFor = (ports: number[]): cloudwatch.MathExpression => {
+			const metrics: Record<string, cloudwatch.IMetric> = {}
+			ports.forEach((port, i) => {
+				metrics[`s${i}`] = new cloudwatch.Metric({
+					namespace: 'AWS/KinesisVideo',
+					metricName: 'PutMedia.IncomingBytes',
+					dimensionsMap: { StreamName: `${kinesisStreamPrefix}-${port}` },
+					statistic: 'Sum',
+					period: Duration.minutes(1),
+				})
+			})
+			return new cloudwatch.MathExpression({
+				expression: ports.map((_, i) => `s${i}`).join('+'),
+				usingMetrics: metrics,
+				period: Duration.minutes(1),
+				label: 'PutMedia Incoming Bytes',
+			})
+		}
+
+		/**
+		 * "Nothing reached Kinesis on this transport."
+		 *
+		 * One alarm per transport because a metric-math alarm cannot carry twenty
+		 * metrics, and missing data is a breach on all of them: a stream nobody is
+		 * putting media to publishes no samples at all, so for this question a gap is
+		 * the condition rather than an absence of evidence. That is only safe because
+		 * every use below pairs it with the matching transport's traffic alarm - alone
+		 * it would fire on an idle fleet, which is exactly what made the SRTP alarm
+		 * unable to report a real SRTP failure while staying quiet before devices
+		 * existed.
+		 */
+		const noIngestionOn = (transport: TransportAlarms): cloudwatch.Alarm =>
+			new cloudwatch.Alarm(this, `KVSNoPutMediaIngestion${transport.label}`, {
+				alarmName: `${Stack.of(this).stackName}-KVS-PutMedia-Incoming-Zero-${transport.label}`,
+				alarmDescription: `Sum of PutMedia.IncomingBytes across the ${transport.title} Kinesis Video Streams is 0, counting no data as 0`,
+				metric: kvsIncomingSumFor(transport.ports),
 				threshold: 0,
 				evaluationPeriods: 5,
 				comparisonOperator:
 					cloudwatch.ComparisonOperator.LESS_THAN_OR_EQUAL_TO_THRESHOLD,
 				treatMissingData: cloudwatch.TreatMissingData.BREACHING,
-			},
-		)
+			})
 
+		/**
+		 * One transport is taking traffic and losing all of it: the actual fault.
+		 *
+		 * Both legs are scoped to the same ports, which is the whole point. The traffic
+		 * leg makes the zero-ingestion leg meaningful - "no data reached Kinesis" is
+		 * normal on an idle transport and a fault on a busy one - and scoping them
+		 * together is what the previous shape could not do, because its traffic leg was
+		 * the load-balancer-wide byte count.
+		 *
+		 * It also means a transport with no devices provisioned never fires, so the
+		 * SRTP alarm is quiet until SRTP is in use and then reports a transport that is
+		 * serving but losing what it takes - a missing GStreamer plugin, say. A
+		 * transport that never bound at all arrives here as a steady zero and is
+		 * covered by notServingOn instead.
+		 */
+		const ingestFaultOn = (
+			transport: TransportAlarms,
+		): cloudwatch.CompositeAlarm => {
+			const alarm = new cloudwatch.CompositeAlarm(
+				this,
+				`UDPTrafficNoKinesisIngestion${transport.label}`,
+				{
+					alarmRule: cloudwatch.AlarmRule.allOf(
+						trafficArrivingOn(transport),
+						noIngestionOn(transport),
+					),
+					alarmDescription: `Bytes are arriving on the ${transport.title} transport but PutMedia incoming data across its Kinesis Video Streams is 0`,
+					compositeAlarmName: `${Stack.of(this).stackName}-UDP-Traffic-No-KVS-Ingestion-${transport.label}`,
+				},
+			)
+			alarm.addAlarmAction(new cloudwatch_actions.SnsAction(alarmTopic))
+			return alarm
+		}
+
+		for (const transport of transports) notServingOn(transport)
+		const ingestFaultAlarms = transports.map(ingestFaultOn)
+
+		/**
+		 * Restart the fleet when either transport is in that state.
+		 *
+		 * anyOf, not allOf: the transports fail independently - a missing plugin or an
+		 * unreachable key store takes SRTP down on its own - and requiring both to be
+		 * dead would mean a healthy SRTP path suppresses the restart that an
+		 * unencrypted-ingestion failure needs, and the reverse.
+		 */
 		const udpTrafficNoIngestionAlarm = new cloudwatch.CompositeAlarm(
 			this,
 			'UDPTrafficNoKinesisIngestionAlarm',
 			{
-				alarmRule: cloudwatch.AlarmRule.allOf(
-					cloudwatch.AlarmRule.not(nlbUdpBytesAlarm),
-					kvsNoIngestionAlarm,
-				),
+				alarmRule: cloudwatch.AlarmRule.anyOf(...ingestFaultAlarms),
 				alarmDescription:
-					'NLB UDP processed bytes > 1 MB/s but PutMedia incoming data across all Kinesis Video Streams is 0',
+					'Bytes are arriving on a UDP transport but none of them are reaching its Kinesis Video Streams',
 				compositeAlarmName: `${Stack.of(this).stackName}-UDP-Traffic-No-KVS-Ingestion`,
 			},
 		)
@@ -632,6 +835,14 @@ export class StreamingStack extends Stack {
 		new CfnOutput(this, 'NLBIPv4Address', {
 			value: eip.ref,
 			description: `NLB fixed IPv4 address (Elastic IP) in ${primarySubnet.availabilityZone}`,
+		})
+
+		// The e2e suite (backend/e2e) finds the fleet's instances through the group:
+		// it tags every instance with aws:autoscaling:groupName, which EC2 can filter
+		// on, and the group's name is generated.
+		new CfnOutput(this, 'AutoScalingGroupName', {
+			value: this.autoScalingGroup.autoScalingGroupName,
+			description: 'Auto Scaling Group name for the ingestion fleet',
 		})
 	}
 }
