@@ -1,6 +1,7 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
 import {
 	DynamoDBDocumentClient,
+	GetCommand,
 	PutCommand,
 	UpdateCommand,
 } from '@aws-sdk/lib-dynamodb'
@@ -17,6 +18,26 @@ export type StreamMetadata = {
 	lastFramePath?: string
 	hlsManifestPath?: string
 	rawStreamPath?: string
+	/**
+	 * Highest SRTP packet index ever accepted on this port - authenticated by libsrtp
+	 * and above the previous value - under the key and SSRC below.
+	 *
+	 * It is the replay floor. libsrtp's replay window starts empty in every new helper,
+	 * so without it a recording of earlier traffic authenticates again after any
+	 * restart; the helper drops everything at or below this, and searches for the
+	 * rollover counter upwards from it. It therefore only ever rises for a given key
+	 * and SSRC - see raiseSrtpIndexFloor - and a value that was never authenticated
+	 * must never be written here.
+	 */
+	srtpIndex?: number
+	/** SSRC the floor was reached by; another sender's traffic has its own. */
+	srtpIndexSsrc?: number
+	/**
+	 * Fingerprint of the key the floor was reached under; a new key starts afresh.
+	 * Needed as well as the SSRC because provisioning may replace a key and keep the
+	 * SSRC, and the SSRC alone cannot tell the new key's index space from the old one's.
+	 */
+	srtpIndexKeyFingerprint?: string
 	createdAt: string
 	updatedAt: string
 }
@@ -24,7 +45,61 @@ export type StreamMetadata = {
 export type StreamMetadataServiceConfig = {
 	tableName: string
 	region?: string
+	/** For tests: where requests go instead of the regional endpoint. */
+	endpoint?: string
+	/** For tests: replaces DYNAMODB_REQUEST_TIMEOUT_MS; see there. */
+	requestTimeoutMs?: number
 }
+
+/**
+ * How long one DynamoDB request may take, and how long its socket may sit idle.
+ *
+ * Every call here is awaited inside a port's serialized event queue, so a request that
+ * never completes holds that port - its lock, its shutdown - for as long as it does not.
+ * The SDK sets no limit by default: its request timeout is 0, and even a configured
+ * one only logs unless throwOnRequestTimeout is set. DynamoDB answers in milliseconds,
+ * so this is only reached when something is wrong, and with the SDK's three attempts a
+ * call gives up after roughly three times this.
+ */
+const DYNAMODB_REQUEST_TIMEOUT_MS = 3_000
+const DYNAMODB_CONNECTION_TIMEOUT_MS = 2_000
+
+const createDocumentClient = (
+	config: StreamMetadataServiceConfig,
+): DynamoDBDocumentClient => {
+	const requestTimeout = config.requestTimeoutMs ?? DYNAMODB_REQUEST_TIMEOUT_MS
+	return DynamoDBDocumentClient.from(
+		new DynamoDBClient({
+			region: config.region ?? 'eu-central-1',
+			...(config.endpoint === undefined ? {} : { endpoint: config.endpoint }),
+			requestHandler: {
+				connectionTimeout: Math.min(
+					DYNAMODB_CONNECTION_TIMEOUT_MS,
+					requestTimeout,
+				),
+				// Until the response headers arrive...
+				requestTimeout,
+				throwOnRequestTimeout: true,
+				// ...and after them, while the body is read.
+				socketTimeout: requestTimeout,
+			},
+		}),
+	)
+}
+
+/**
+ * Outcome of a write that is conditional on still owning the port's lock.
+ *
+ * `lostLock` and `writeError` are distinct because they demand opposite responses:
+ * losing the lock means another instance owns the stream and this one must stop
+ * producing immediately, whereas a transient DynamoDB error means nothing about
+ * ownership - the lease is still held until it goes stale, so tearing down and
+ * retrying on every failed write would churn the pipeline for no reason.
+ */
+export type OwnedWriteResult = 'ok' | 'lostLock' | 'writeError'
+
+const isConditionalCheckFailed = (err: unknown): boolean =>
+	err instanceof Error && err.name === 'ConditionalCheckFailedException'
 
 export class StreamMetadataService {
 	private readonly docClient: DynamoDBDocumentClient
@@ -32,11 +107,15 @@ export class StreamMetadataService {
 	private readonly lastUpdateTimes: Map<number, number> = new Map()
 	private readonly updateThrottleMs = 15_000 // 15 seconds
 
-	constructor(config: StreamMetadataServiceConfig) {
-		const client = new DynamoDBClient({
-			region: config.region ?? 'eu-central-1',
-		})
-		this.docClient = DynamoDBDocumentClient.from(client)
+	/**
+	 * `deps.docClient` is injectable so this service can be tested without AWS; production
+	 * callers omit it and get a real client for the configured region.
+	 */
+	constructor(
+		config: StreamMetadataServiceConfig,
+		deps?: { docClient?: DynamoDBDocumentClient },
+	) {
+		this.docClient = deps?.docClient ?? createDocumentClient(config)
 		this.tableName = config.tableName
 	}
 
@@ -183,24 +262,34 @@ export class StreamMetadataService {
 	 * Updates lastPacketTime for a port. Only succeeds if this instance holds the Kinesis lock,
 	 * ensuring only the designated sender refreshes the heartbeat.
 	 */
+	/**
+	 * Refreshes the port's lock lease, throttled to once per 15 seconds.
+	 *
+	 * Takes no timestamp on purpose. `lastPacketTime` is both the record of activity and
+	 * the lock's lease (tryAcquireKinesisLock treats a row older than
+	 * KINESIS_LOCK_STALE_MS as available), so it must carry the time the lease was
+	 * refreshed. Writing a packet's arrival time instead would let a lease expire while
+	 * the owner is still receiving traffic, whenever processing runs behind arrival -
+	 * another instance could then take the slot and both would produce at once. Arrival
+	 * times belong to stream-activity tracking, not here.
+	 *
+	 * Returns an outcome rather than throwing so the caller can distinguish losing the
+	 * lock (stop producing) from a transient write failure (keep going; the lease has not
+	 * expired yet). A failed write clears the throttle so the next packet retries
+	 * immediately instead of waiting out the window.
+	 */
 	async updateLastPacketTime(
 		port: number,
-		timestamp: Date,
 		instanceId: string,
-	): Promise<void> {
-		// Throttle updates to max once per 15 seconds
+	): Promise<OwnedWriteResult> {
 		const now = Date.now()
 		const lastUpdate = this.lastUpdateTimes.get(port) ?? 0
-		const timeSinceLastUpdate = now - lastUpdate
-
-		if (timeSinceLastUpdate < this.updateThrottleMs) {
-			return
+		if (now - lastUpdate < this.updateThrottleMs) {
+			return 'ok'
 		}
 
 		this.lastUpdateTimes.set(port, now)
-
-		const isoTimestamp = timestamp.toISOString()
-		const isoNow = new Date().toISOString()
+		const isoNow = new Date(now).toISOString()
 
 		try {
 			await this.docClient.send(
@@ -214,20 +303,106 @@ export class StreamMetadataService {
 					},
 					ExpressionAttributeValues: {
 						':status': 'active',
-						':lastPacketTime': isoTimestamp,
+						':lastPacketTime': isoNow,
 						':updatedAt': isoNow,
 						':instanceId': instanceId,
 					},
 					ConditionExpression: 'kinesisOwnerInstanceId = :instanceId',
 				}),
 			)
+			return 'ok'
 		} catch (error) {
+			this.lastUpdateTimes.delete(port)
+			if (isConditionalCheckFailed(error)) {
+				console.warn(
+					`[StreamMetadataService] Lost the Kinesis lock for port ${port}; another instance owns it`,
+				)
+				return 'lostLock'
+			}
 			console.error(
-				`[StreamMetadataService] Error updating last packet time for port ${port}:`,
+				`[StreamMetadataService] Error refreshing the lock lease for port ${port}:`,
 				error,
 			)
-			this.lastUpdateTimes.delete(port)
-			throw error
+			return 'writeError'
+		}
+	}
+
+	/**
+	 * Reads the replay floor for a port, if one was reached under this key and SSRC.
+	 *
+	 * Strongly consistent, because a stale read is a lower floor, and a lower floor is
+	 * a replay window. And it throws rather than returning undefined when the read
+	 * fails: undefined means "nothing was ever accepted under this key", which admits
+	 * everything, so the caller must not start on a floor it could not read. That costs
+	 * nothing extra, since a start already needs DynamoDB to have acquired the lock.
+	 */
+	async getSrtpIndexFloor(
+		port: number,
+		expectedSsrc: number,
+		expectedKeyFingerprint: string,
+	): Promise<number | undefined> {
+		const result = await this.docClient.send(
+			new GetCommand({
+				TableName: this.tableName,
+				Key: { port },
+				ConsistentRead: true,
+			}),
+		)
+		const item = result.Item as StreamMetadata | undefined
+		if (item === undefined) return undefined
+		const { srtpIndex, srtpIndexSsrc, srtpIndexKeyFingerprint } = item
+		if (typeof srtpIndex !== 'number' || !Number.isSafeInteger(srtpIndex)) {
+			return undefined
+		}
+		if (srtpIndex < 0) return undefined
+		// Another sender, or a key provisioned since: this floor describes a different
+		// index space, and a new key is exactly what lets a device start from zero.
+		if (srtpIndexSsrc !== expectedSsrc) return undefined
+		if (srtpIndexKeyFingerprint !== expectedKeyFingerprint) return undefined
+		return srtpIndex
+	}
+
+	/**
+	 * Raises the replay floor for a port to an index authentication has accepted.
+	 *
+	 * Conditional, so that it only ever goes up: a write that would lower it - an
+	 * instance reporting less than another already recorded, or two writes arriving out
+	 * of order - fails the condition and is dropped. The one way down is a different key
+	 * or SSRC, which is a different index space; that write replaces the floor.
+	 *
+	 * Best effort otherwise. A failed write leaves the floor where it was, which widens
+	 * the replay window by what went unrecorded rather than opening it; the producer
+	 * also keeps the highest index it has seen, so its own next start is unaffected.
+	 */
+	async raiseSrtpIndexFloor(
+		port: number,
+		index: number,
+		ssrc: number,
+		keyFingerprint: string,
+	): Promise<void> {
+		try {
+			await this.docClient.send(
+				new UpdateCommand({
+					TableName: this.tableName,
+					Key: { port },
+					UpdateExpression:
+						'SET srtpIndex = :index, srtpIndexSsrc = :ssrc, srtpIndexKeyFingerprint = :fingerprint, updatedAt = :now',
+					ConditionExpression:
+						'attribute_not_exists(srtpIndex) OR srtpIndex < :index OR srtpIndexSsrc <> :ssrc OR srtpIndexKeyFingerprint <> :fingerprint',
+					ExpressionAttributeValues: {
+						':index': index,
+						':ssrc': ssrc,
+						':fingerprint': keyFingerprint,
+						':now': new Date().toISOString(),
+					},
+				}),
+			)
+		} catch (error) {
+			if (isConditionalCheckFailed(error)) return
+			console.warn(
+				`[StreamMetadataService] Could not raise the SRTP replay floor for port ${port}:`,
+				error,
+			)
 		}
 	}
 
