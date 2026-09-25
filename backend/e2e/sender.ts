@@ -187,7 +187,35 @@ export class E2eSender extends EventEmitter {
 	/** Streams the fixture in a loop, in real time, until stopped or duration ends. */
 	async run(): Promise<void> {
 		this.socket = dgram.createSocket('udp4')
-		if (this.stopped) return
+		// Connect once, before any packet: resolving the host is the only async
+		// step ahead of streaming, and it is deliberately done here where a
+		// failure rejects loudly rather than disappearing into a send callback.
+		// A connected socket also means each send carries no destination - no
+		// per-packet DNS lookup on the send path at all.
+		await new Promise<void>((resolve, reject) => {
+			const socket = this.socket
+			if (socket === undefined) {
+				resolve()
+				return
+			}
+			// DNS failure surfaces as an 'error' event, not a connect callback
+			// argument - so it is handled here, before it could crash the
+			// process as an unhandled event.
+			const onError = (err: Error): void => {
+				socket.removeListener('error', onError)
+				reject(err)
+			}
+			socket.once('error', onError)
+			socket.connect(this.port, this.host, () => {
+				socket.removeListener('error', onError)
+				resolve()
+			})
+		})
+		if (this.stopped) {
+			this.socket?.close()
+			this.socket = undefined
+			return
+		}
 		const frameIntervalMs = 1000 / this.fps
 		const { nals, accessUnitStarts } = this.fixture
 		const started = Date.now()
@@ -210,10 +238,12 @@ export class E2eSender extends EventEmitter {
 					: nals.length
 			const timestamp = this.timestamp
 			for (let n = from; n < to; n++) {
+				if (this.stopped) break
 				const nal = nals[n]?.data
 				if (nal === undefined) continue
 				const pieces = rtpPayloadsForNal(nal)
 				for (let p = 0; p < pieces.length; p++) {
+					if (this.stopped) break
 					const piece = pieces[p]
 					if (piece === undefined) continue
 					const isLastPacket = n === to - 1 && p === pieces.length - 1
@@ -245,8 +275,12 @@ export class E2eSender extends EventEmitter {
 			frame++
 			await sleep(frameIntervalMs)
 		}
-		// The socket is closed on natural completion too, not only on stop():
-		// an open socket would hold the process open long after the test ended.
+		// The socket is closed only here, at a point where no send is in flight.
+		// run() owns the socket's lifecycle and stop() only signals: closing
+		// from stop() raced with an in-flight send, whose callback could then
+		// never fire - stranding every await upstream of it, and when the event
+		// loop drained, Node exited 0 in the middle of the suite, silently, with
+		// cases still unrun.
 		this.socket?.close()
 		this.socket = undefined
 	}
@@ -258,14 +292,19 @@ export class E2eSender extends EventEmitter {
 				resolve()
 				return
 			}
-			socket.send(packet, this.port, this.host, () => resolve())
+			// The socket is connected, so no destination: no per-packet DNS
+			// lookup, and the send cannot outlive the lifecycle run() owns.
+			socket.send(packet, () => resolve())
 		})
 	}
 
+	/**
+	 * Signals the stream to stop. Only signals: the socket is closed by run()
+	 * at a point where no send is in flight (see there for the race this
+	 * avoids). run() then resolves within a frame interval.
+	 */
 	stop(): void {
 		this.stopped = true
-		this.socket?.close()
-		this.socket = undefined
 	}
 
 	get currentState(): { roc: number; seq: number; timestamp: number } {

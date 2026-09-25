@@ -36,6 +36,21 @@ const log = (message: string): void => {
 	console.log(`[e2e ${new Date().toISOString()}] ${message}`)
 }
 
+/**
+ * A net under the whole suite: once, mid-case, a promise that never settled
+ * drained the event loop and Node exited 0 silently with cases still unrun -
+ * a clean exit code that looks like success. Nothing else runs after the
+ * summary on a successful run, so if the loop ever empties before that, it is
+ * the same bug again and must be visible rather than silent.
+ */
+let suiteDone = false
+process.on('beforeExit', (code) => {
+	if (suiteDone) return
+	console.error(
+		`[e2e] the event loop drained with the suite unfinished (exit code ${String(code)}): an await never settled, which is a bug in the suite, not a pass. The last line above is where it stopped.`,
+	)
+})
+
 const main = async (): Promise<void> => {
 	log(`discovering stack ${stackName} in ${region}`)
 	const config = await discoverStack(region, stackName)
@@ -131,8 +146,10 @@ const main = async (): Promise<void> => {
 		for (const f of failures) {
 			console.error(` - ${f.name}: ${String(f.error)}`)
 		}
+		suiteDone = true
 		process.exit(1)
 	}
+	suiteDone = true
 	log(`all ${String(selected.length)} case(s) passed`)
 }
 
