@@ -316,11 +316,19 @@ const METRIC_PERIOD_MS = 60_000
  * can equally pass a wait on the previous run's stale bytes. Every ingestion
  * query here starts on a boundary, so only bytes uploaded after `since` are
  * ever counted.
+ *
+ * CloudWatch also rejects `StartTime >= EndTime` with a 400 rather than
+ * returning an empty result, so the callers must not query until the
+ * boundary is strictly in the past; see `periodBoundaryElapsed`.
  */
 const nextPeriodBoundary = (since: Date): Date =>
 	new Date(
 		Math.ceil((since.getTime() + 1) / METRIC_PERIOD_MS) * METRIC_PERIOD_MS,
 	)
+
+/** True once the aligned window has at least one full period before `now`. */
+const periodBoundaryElapsed = (from: Date): boolean =>
+	Date.now() - from.getTime() >= METRIC_PERIOD_MS
 
 /**
  * Waits until the KVS stream received media after `since`, using the metric the
@@ -336,6 +344,18 @@ export const waitForStreamIngestion = async (
 	const from = nextPeriodBoundary(since)
 	const deadline = Date.now() + timeoutMs
 	for (;;) {
+		// CloudWatch rejects StartTime >= EndTime with a 400, so a poll is only
+		// valid once a full period has elapsed past the boundary; until then it
+		// would have nothing to sum anyway.
+		if (!periodBoundaryElapsed(from)) {
+			if (Date.now() > deadline) {
+				throw new Error(
+					`no PutMedia.IncomingBytes on ${streamName} since ${from.toISOString()} (aligned up from ${since.toISOString()})`,
+				)
+			}
+			await sleep(5_000)
+			continue
+		}
 		const end = new Date()
 		const stats = await cw.send(
 			new GetMetricStatisticsCommand({
