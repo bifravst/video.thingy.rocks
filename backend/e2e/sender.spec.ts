@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import dgram from 'node:dgram'
 import { describe, it } from 'node:test'
 
 import { hasGstElements, startHelper } from '../src/testing/srtpHelper.ts'
@@ -116,3 +117,50 @@ void describe(
 		)
 	},
 )
+
+/**
+ * The sender's network resilience, with no GStreamer needed.
+ *
+ * The restart-recovery case keeps a sender streaming while the backend is
+ * deliberately restarted beneath it. While nothing is bound to the port, the
+ * target answers every datagram with ICMP port unreachable, which a connected
+ * UDP socket delivers as an 'error' event on the receive path. The sender must
+ * absorb that and keep sending - before it did, the first ICMP error killed
+ * the whole suite as an unhandled 'error' event, mid-case, on 2026-09-25
+ * (`recvmsg ECONNREFUSED` at UDP.onMessage).
+ */
+void describe('E2eSender network resilience', () => {
+	void it(
+		'keeps streaming through ICMP port-unreachable feedback',
+		{ timeout: 30_000 },
+		async () => {
+			// A port that is guaranteed closed: bind one, read the number the
+			// OS picked, close it again.
+			const probe = dgram.createSocket('udp4')
+			await new Promise<void>((resolve) => {
+				probe.bind(0, '127.0.0.1', () => resolve())
+			})
+			const closedPort = probe.address().port
+			probe.close()
+
+			const sender = new E2eSender({
+				host: '127.0.0.1',
+				port: closedPort,
+				keyHex: 'ab'.repeat(30),
+				ssrc: 4242,
+				roc: 0,
+				fps: 15,
+				// Plenty of datagrams into the closed port; on Linux every one
+				// of them comes back as ICMP to a connected socket.
+				durationS: 2,
+			})
+			// Before the fix this call did not reject - the process died
+			// inside it, on the first 'error' event nobody was listening for.
+			await sender.run()
+			assert.ok(
+				sender.networkErrorCount > 0,
+				'the ICMP feedback must arrive and be counted, not be fatal',
+			)
+		},
+	)
+})

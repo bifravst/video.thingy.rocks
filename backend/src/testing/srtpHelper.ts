@@ -4,6 +4,7 @@ import {
 	type ChildProcessWithoutNullStreams,
 } from 'node:child_process'
 import dgram from 'node:dgram'
+import { fileURLToPath } from 'node:url'
 
 import {
 	SRTP_HELPER_PROTOCOL_VERSION,
@@ -16,11 +17,14 @@ import {
  *
  * The helper binds its own UDP port (an ephemeral one here, so parallel runs cannot
  * collide), so a test sends to it directly - there is no relay to connect, and the
- * port it reports in its ready frame is the port to send to. Paths are relative to
- * the repository root, where the tests run.
+ * port it reports in its ready frame is the port to send to. The path is
+ * resolved from this module rather than the cwd: `npm test` runs from
+ * backend/, a plain `node --test` from the repo root, and a cwd-relative path
+ * doubled it into backend/backend/src/... for one of the two, failing the
+ * suite from there.
  */
 
-export const HELPER = 'backend/src/srtp_port.py'
+export const HELPER = fileURLToPath(new URL('../srtp_port.py', import.meta.url))
 
 /**
  * Whether this machine has GStreamer Python bindings with every named element.

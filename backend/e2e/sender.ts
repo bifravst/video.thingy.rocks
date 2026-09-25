@@ -159,6 +159,15 @@ export class E2eSender extends EventEmitter {
 	private readonly fixture: AnnexB
 	private socket: dgram.Socket | undefined
 	private stopped = false
+	/**
+	 * Network errors this run absorbed: ICMP feedback - port unreachable while
+	 * the receiver restarts under a live sender, which the restart-recovery
+	 * case does deliberately - connection refused, anything the network says
+	 * back about the datagrams. Counted, never thrown: the first one used to
+	 * surface as an unhandled 'error' event and kill the whole suite mid-case,
+	 * on 2026-09-25.
+	 */
+	private networkErrors = 0
 	private readonly onAccessUnit?: (
 		frame: number,
 		seq: number,
@@ -187,6 +196,20 @@ export class E2eSender extends EventEmitter {
 	/** Streams the fixture in a loop, in real time, until stopped or duration ends. */
 	async run(): Promise<void> {
 		this.socket = dgram.createSocket('udp4')
+		this.networkErrors = 0
+		// A connected UDP socket receives the network's verdicts on its
+		// datagrams - ICMP port unreachable above all - as 'error' events on
+		// the receive path. The restart-recovery case keeps this sender live
+		// while the backend is deliberately restarted beneath it, so the
+		// window where nothing is bound to the port is part of the test; the
+		// errors it produces must be absorbed here, or the first one kills the
+		// process as an unhandled 'error' event, which is exactly how this
+		// suite died mid-case on 2026-09-25. Counted and announced, never
+		// thrown: a sender whose receiver is rebooting carries on sending.
+		this.socket.on('error', (err: Error) => {
+			this.networkErrors += 1
+			this.emit('network-error', err)
+		})
 		// Connect once, before any packet: resolving the host is the only async
 		// step ahead of streaming, and it is deliberately done here where a
 		// failure rejects loudly rather than disappearing into a send callback.
@@ -200,9 +223,13 @@ export class E2eSender extends EventEmitter {
 			}
 			// DNS failure surfaces as an 'error' event, not a connect callback
 			// argument - so it is handled here, before it could crash the
-			// process as an unhandled event.
+			// process as an unhandled event. The persistent handler above has
+			// already counted it; this one also fails the run, and closes the
+			// socket so a failed sender leaves nothing open behind it.
 			const onError = (err: Error): void => {
 				socket.removeListener('error', onError)
+				socket.close()
+				if (this.socket === socket) this.socket = undefined
 				reject(err)
 			}
 			socket.once('error', onError)
@@ -309,6 +336,15 @@ export class E2eSender extends EventEmitter {
 
 	get currentState(): { roc: number; seq: number; timestamp: number } {
 		return { roc: this.roc, seq: this.seq, timestamp: this.timestamp }
+	}
+
+	/**
+	 * How many network errors this run absorbed - the ICMP feedback of a
+	 * receiver restarting under a live sender, most famously. Zero says the
+	 * network said nothing back the whole run; it never says the run failed.
+	 */
+	get networkErrorCount(): number {
+		return this.networkErrors
 	}
 }
 

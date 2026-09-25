@@ -313,9 +313,11 @@ const METRIC_PERIOD_MS = 60_000
  * starts mid-minute counts the minute's earlier bytes too. On 2026-09-25 that
  * counted a case's own legitimate first phase as "ingestion since the rewind
  * began", failing a rewind the receiver had in fact refused; on a re-run it
- * can equally pass a wait on the previous run's stale bytes. Every ingestion
- * query here starts on a boundary, so only bytes uploaded after `since` are
- * ever counted.
+ * can equally pass a wait on the previous run's stale bytes. Every NEGATIVE
+ * ingestion query here (assertNoStreamIngestion) starts on this boundary, so
+ * only bytes uploaded in full minutes after `since` are ever counted. The
+ * positive wait floors instead - see containingPeriodBoundary for why the
+ * two cannot share a direction.
  *
  * CloudWatch also rejects `StartTime >= EndTime` with a 400 rather than
  * returning an empty result, so the callers must not query until the
@@ -326,6 +328,26 @@ const nextPeriodBoundary = (since: Date): Date =>
 		Math.ceil((since.getTime() + 1) / METRIC_PERIOD_MS) * METRIC_PERIOD_MS,
 	)
 
+/**
+ * The period boundary `since` falls inside - the minute the phase being
+ * waited on began streaming into.
+ *
+ * The positive wait must include this bucket: a short stream uploads all of
+ * its bytes - the stream itself plus the several-second tail of fragment
+ * completion and teardown that follows the sender's stop - inside the one
+ * minute bucket it started in. On 2026-09-25 the hint-climb and
+ * restart-recovery cases each streamed ~750 KB that reached Kinesis whole
+ * (the metric datapoint shows it), every byte of it in the minute before the
+ * ceiling-aligned window began, and both healthy cases failed on the 240s
+ * timeout. The price is that bytes uploaded earlier in that same minute
+ * than `since` count too; that is acceptable because every positive wait is
+ * paired with an exact log-line assertion over its own window, and because
+ * no phase can share a minute with the phase before it - the previous
+ * phase's wait already ran into the next minute by then.
+ */
+const containingPeriodBoundary = (since: Date): Date =>
+	new Date(Math.floor(since.getTime() / METRIC_PERIOD_MS) * METRIC_PERIOD_MS)
+
 /** True once the aligned window has at least one full period before `now`. */
 const periodBoundaryElapsed = (from: Date): boolean =>
 	Date.now() - from.getTime() >= METRIC_PERIOD_MS
@@ -333,6 +355,10 @@ const periodBoundaryElapsed = (from: Date): boolean =>
 /**
  * Waits until the KVS stream received media after `since`, using the metric the
  * alarms use. This is the e2e definition of "it works": bytes reached Kinesis.
+ *
+ * The window is floored to the minute `since` falls in (see
+ * containingPeriodBoundary): the stream's own minute bucket is the one its
+ * bytes are most likely all in.
  */
 export const waitForStreamIngestion = async (
 	region: string,
@@ -341,7 +367,7 @@ export const waitForStreamIngestion = async (
 	timeoutMs = 240_000,
 ): Promise<number> => {
 	const cw = new CloudWatchClient({ region })
-	const from = nextPeriodBoundary(since)
+	const from = containingPeriodBoundary(since)
 	const deadline = Date.now() + timeoutMs
 	for (;;) {
 		// CloudWatch rejects StartTime >= EndTime with a 400, so a poll is only
@@ -349,9 +375,7 @@ export const waitForStreamIngestion = async (
 		// would have nothing to sum anyway.
 		if (!periodBoundaryElapsed(from)) {
 			if (Date.now() > deadline) {
-				throw new Error(
-					`no PutMedia.IncomingBytes on ${streamName} since ${from.toISOString()} (aligned up from ${since.toISOString()})`,
-				)
+				throw noIngestionError(streamName, since, from)
 			}
 			await sleep(5_000)
 			continue
@@ -374,23 +398,32 @@ export const waitForStreamIngestion = async (
 		)
 		if (total > 0) return total
 		if (Date.now() > deadline) {
-			throw new Error(
-				`no PutMedia.IncomingBytes on ${streamName} since ${from.toISOString()} (aligned up from ${since.toISOString()})`,
-			)
+			throw noIngestionError(streamName, since, from)
 		}
 		await sleep(15_000)
 	}
 }
+
+/** The positive wait's failure: says which minute bucket was watched. */
+const noIngestionError = (streamName: string, since: Date, from: Date): Error =>
+	new Error(
+		`no PutMedia.IncomingBytes on ${streamName} since ${from.toISOString()} (the minute ${since.toISOString()} falls in)`,
+	)
 
 /**
  * Asserts the opposite: no media reached the stream in the window. Missing
  * datapoints count as zero - a stream nobody writes to publishes nothing at
  * all.
  *
- * The window is the same period-aligned one: bytes counted are those in full
- * minutes after `since`. If the aligned window has not yet elapsed a full
- * period, it waits until it has, so the assertion is never vacuously true over
- * an empty window.
+ * The window is the next-boundary-aligned one (see nextPeriodBoundary for
+ * why only this direction is safe here): bytes counted are those in full
+ * minutes after `since`, never the earlier bytes of the minute `since` falls
+ * in - which the phase before this one may legitimately have uploaded. The
+ * positive wait above floors for the opposite reason; a short stream's own
+ * bytes must not be excluded from the wait that exists to see them.
+ *
+ * If the aligned window has not yet elapsed a full period, it waits until it
+ * has, so the assertion is never vacuously true over an empty window.
  */
 export const assertNoStreamIngestion = async (
 	region: string,
