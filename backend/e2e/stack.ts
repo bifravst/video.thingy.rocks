@@ -23,8 +23,129 @@ import {
 	SendCommandCommand,
 	SSMClient,
 } from '@aws-sdk/client-ssm'
-import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb'
+import {
+	DeleteCommand,
+	DynamoDBDocumentClient,
+	GetCommand,
+	PutCommand,
+} from '@aws-sdk/lib-dynamodb'
 import assert from 'node:assert/strict'
+
+/** A synthetic lock-table key no ingest port can ever collide with. */
+const SUITE_LOCK_PORT = 424242
+/** A lock older than this is a crashed run's leftover and may be taken over. */
+const SUITE_LOCK_STALE_MS = 30 * 60_000
+
+/**
+ * Serializes e2e runs against one stack.
+ *
+ * Two suites running against the same stack corrupt each other completely:
+ * every port's key gets provisioned twice, the fleet is restarted mid-case,
+ * and one run's unauthenticated traffic walks the other's rollover-counter
+ * search past the answer - each failure mode looks exactly like a product bug.
+ * The lock is a row in the stack's own lock table, so it is visible in the
+ * same place as every other lock, and it is written conditionally: a run that
+ * crashed without releasing does not block forever.
+ */
+export const acquireSuiteLock = async (
+	region: string,
+	tableName: string,
+	runId: string,
+): Promise<void> => {
+	const doc = DynamoDBDocumentClient.from(new DynamoDBClient({ region }))
+	const staleIso = new Date(Date.now() - SUITE_LOCK_STALE_MS).toISOString()
+	try {
+		await doc.send(
+			new PutCommand({
+				TableName: tableName,
+				Item: {
+					port: SUITE_LOCK_PORT,
+					status: 'active',
+					e2eRunId: runId,
+					createdAt: new Date().toISOString(),
+					updatedAt: new Date().toISOString(),
+				},
+				// Take over only when nobody holds it, or when the holder has
+				// clearly crashed: a live suite refreshes this row while
+				// provisioning.
+				ConditionExpression: 'attribute_not_exists(port) OR updatedAt < :stale',
+				ExpressionAttributeValues: { ':stale': staleIso },
+			}),
+		)
+	} catch (error) {
+		if (
+			error instanceof Error &&
+			error.name === 'ConditionalCheckFailedException'
+		) {
+			const held = await doc.send(
+				new GetCommand({
+					TableName: tableName,
+					Key: { port: SUITE_LOCK_PORT },
+				}),
+			)
+			throw new Error(
+				`another e2e run holds this stack's lock (row ${String(SUITE_LOCK_PORT)}, run ${String(held.Item?.e2eRunId ?? '?')}, last refreshed ${String(held.Item?.updatedAt ?? '?')}). Wait for it to finish, or delete that row if it is a crashed run's leftover.`,
+				{ cause: error },
+			)
+		}
+		throw error
+	}
+}
+
+/** Refreshes the lock so a concurrent acquirer sees it is still held. */
+export const refreshSuiteLock = async (
+	region: string,
+	tableName: string,
+	runId: string,
+): Promise<void> => {
+	const doc = DynamoDBDocumentClient.from(new DynamoDBClient({ region }))
+	await doc
+		.send(
+			new PutCommand({
+				TableName: tableName,
+				Item: {
+					port: SUITE_LOCK_PORT,
+					status: 'active',
+					e2eRunId: runId,
+					updatedAt: new Date().toISOString(),
+				},
+				ConditionExpression: 'attribute_not_exists(port) OR e2eRunId = :run',
+				ExpressionAttributeValues: { ':run': runId },
+			}),
+		)
+		.catch((error: unknown) => {
+			throw new Error(
+				`this run's hold on the stack's e2e lock was taken over by another run: ${String(error)}`,
+			)
+		})
+}
+
+/** Releases the lock. Safe to call more than once. */
+export const releaseSuiteLock = async (
+	region: string,
+	tableName: string,
+	runId: string,
+): Promise<void> => {
+	const doc = DynamoDBDocumentClient.from(new DynamoDBClient({ region }))
+	await doc
+		.send(
+			new DeleteCommand({
+				TableName: tableName,
+				Key: { port: SUITE_LOCK_PORT },
+				ConditionExpression: 'e2eRunId = :run',
+				ExpressionAttributeValues: { ':run': runId },
+			}),
+		)
+		.catch((error: unknown) => {
+			if (
+				error instanceof Error &&
+				error.name === 'ConditionalCheckFailedException'
+			) {
+				return // Taken over or already gone - not ours to delete.
+			}
+			console.warn('[e2e] could not release the suite lock:', error)
+		})
+}
 
 /**
  * The e2e suite's connection to the deployed stack it tests.
@@ -426,9 +547,19 @@ export const readMedia = async (
 	)
 	const payload = result.Payload
 	if (payload === undefined) return 0
+	// Bounded on purpose: GetMedia streams continuously (it follows the live
+	// stream, not just the backog), so an unbounded read never ends. The
+	// assertion only needs some bytes back, not the whole archive.
 	const chunks: Buffer[] = []
+	let total = 0
+	const deadline = Date.now() + 30_000
 	for await (const chunk of payload as AsyncIterable<Uint8Array>) {
 		chunks.push(Buffer.from(chunk))
+		total += chunk.byteLength
+		if (total > 1_000_000 || Date.now() > deadline) break
+	}
+	if (typeof (payload as { destroy?: () => void }).destroy === 'function') {
+		;(payload as { destroy: () => void }).destroy()
 	}
 	return Buffer.concat(chunks).length
 }

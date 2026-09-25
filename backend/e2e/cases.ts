@@ -48,6 +48,16 @@ export type E2eCase = {
 const streamNameFor = (config: E2eConfig, port: number): string =>
 	`${config.streamPrefix}-${String(port)}`
 
+/**
+ * One log line per phase of a case, with the runner's format. The cases wait
+ * minutes at a time on CloudWatch metric propagation and log indexing with
+ * nothing happening in the terminal; without these lines a working run is
+ * indistinguishable from a hung one (which it was, twice, on 2026-09-25).
+ */
+const step = (message: string): void => {
+	console.log(`[e2e ${new Date().toISOString()}]   ${message}`)
+}
+
 /** Runs one sender and stops it after `seconds`, resolving the run promise. */
 const streamFor = async (sender: E2eSender, seconds: number): Promise<void> => {
 	const finished = sender.run()
@@ -96,6 +106,7 @@ export const cases: E2eCase[] = [
 				durationS: 45,
 			})
 			await streamFor(sender, 45)
+			step('streamed for 45s; now waiting on logs, metrics and media')
 
 			// Authenticated, and the port took the lock while it produced.
 			const lines = await waitForLogLines(
@@ -122,6 +133,7 @@ export const cases: E2eCase[] = [
 			)
 
 			// The lock went back once the sender stopped (auth loss releases it).
+			step('waiting 20s for the lock to be released after the sender stopped')
 			await new Promise((resolve) => setTimeout(resolve, 20_000))
 			const row = await lockRow(ctx.config.region, ctx.config.tableName, 6000)
 			assert.equal(
@@ -152,6 +164,7 @@ export const cases: E2eCase[] = [
 				durationS: 20,
 			})
 			await streamFor(sender, 20)
+			step('streamed for 20s')
 
 			// Metrics need a minute to be sure; the lock is the immediate signal.
 			await new Promise((resolve) => setTimeout(resolve, 30_000))
@@ -194,6 +207,7 @@ export const cases: E2eCase[] = [
 				durationS: 20,
 			})
 			await streamFor(sender, 20)
+			step('streamed for 20s')
 
 			await new Promise((resolve) => setTimeout(resolve, 30_000))
 			const row = await lockRow(ctx.config.region, ctx.config.tableName, 6002)
@@ -241,6 +255,7 @@ export const cases: E2eCase[] = [
 				durationS: 45,
 			})
 			await streamFor(sender, 45)
+			step('streamed for 45s; now waiting on logs, metrics and media')
 
 			await waitForStreamIngestion(
 				ctx.config.region,
@@ -278,6 +293,7 @@ export const cases: E2eCase[] = [
 				durationS: 20,
 			})
 			await streamFor(sender, 20)
+			step('streamed for 20s')
 			await waitForStreamIngestion(
 				ctx.config.region,
 				streamNameFor(ctx.config, 6004),
@@ -300,6 +316,7 @@ export const cases: E2eCase[] = [
 				durationS: 45,
 			})
 			await streamFor(sender, 45)
+			step('streamed for 45s; now waiting on logs, metrics and media')
 			const lines = await waitForLogLines(
 				ctx.config.region,
 				ctx.config.logGroup,
@@ -333,6 +350,7 @@ export const cases: E2eCase[] = [
 				durationS: 20,
 			})
 			await streamFor(sender, 20)
+			step('streamed for 20s')
 			await waitForStreamIngestion(
 				ctx.config.region,
 				streamNameFor(ctx.config, 6005),
@@ -347,7 +365,9 @@ export const cases: E2eCase[] = [
 				durationS: 30,
 			})
 			await streamFor(sender, 30)
+			step('streamed for 30s')
 
+			step('waiting 60s for the rewind window to pass before asserting refusal')
 			await new Promise((resolve) => setTimeout(resolve, 60_000))
 			await assertNoStreamIngestion(
 				ctx.config.region,
@@ -386,6 +406,7 @@ export const cases: E2eCase[] = [
 				durationS: 20,
 			})
 			await streamFor(sender, 20)
+			step('streamed for 20s')
 			await waitForStreamIngestion(
 				ctx.config.region,
 				streamNameFor(ctx.config, 6006),
@@ -445,6 +466,7 @@ export const cases: E2eCase[] = [
 				durationS: 15,
 			})
 			await streamFor(sender, 15)
+			step('streamed for 15s')
 			await waitForStreamIngestion(
 				ctx.config.region,
 				streamNameFor(ctx.config, 6007),
@@ -464,6 +486,7 @@ export const cases: E2eCase[] = [
 				durationS: 45,
 			})
 			await streamFor(sender, 45)
+			step('streamed for 45s; now waiting on logs, metrics and media')
 			const lines = await waitForLogLines(
 				ctx.config.region,
 				ctx.config.logGroup,
