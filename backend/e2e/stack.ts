@@ -127,14 +127,23 @@ export const codeBucketFor = async (
 	const resources = await cfn.send(
 		new DescribeStackResourcesCommand({ StackName: stackName }),
 	)
-	const bucket = (resources.StackResources ?? []).find(
-		(r) => r.LogicalResourceId === 'CodeBucket',
-	)?.PhysicalResourceId
-	assert.ok(
-		bucket !== undefined,
-		'the stack has no CodeBucket resource - was it deployed from the srtp-ingest-v3 branch?',
+	// The bucket's logical ID is not a stable handle (CDK appends a hash to S3
+	// bucket IDs), but the stack has exactly one AWS::S3::Bucket - the code
+	// bucket - so the type is.
+	const buckets = (resources.StackResources ?? []).filter(
+		(r) =>
+			r.ResourceType === 'AWS::S3::Bucket' &&
+			r.PhysicalResourceId !== undefined,
 	)
-	return bucket
+	assert.ok(
+		buckets.length > 0,
+		'the stack has no S3 bucket - was it deployed from the srtp-ingest-v3 branch?',
+	)
+	assert.ok(
+		buckets.length === 1,
+		`the stack has ${String(buckets.length)} S3 buckets; cannot tell which holds the backend code`,
+	)
+	return buckets[0]?.PhysicalResourceId as string
 }
 
 /**
