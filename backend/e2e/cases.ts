@@ -369,21 +369,21 @@ export const cases: E2eCase[] = [
 
 			step('waiting 60s for the rewind window to pass before asserting refusal')
 			await new Promise((resolve) => setTimeout(resolve, 60_000))
+			// This is the proof of refusal: no media on the stream in the full
+			// minutes after the rewind began. A ROC-reset rewind cannot
+			// authenticate at all - the auth tag covers the rollover counter,
+			// and no candidate below the floor's rollover is ever offered - so
+			// the stale-drop warning is not this case's signature (that warning
+			// belongs to a replay that DOES authenticate under an offered
+			// candidate; see the replay-floor integration tests). Counting on
+			// it here made the case fail while the receiver was refusing
+			// correctly.
 			await assertNoStreamIngestion(
 				ctx.config.region,
 				streamNameFor(ctx.config, 6005),
 				since,
 			)
-			const refused = await waitForLogLines(
-				ctx.config.region,
-				ctx.config.logGroup,
-				`at or below the highest packet index`,
-				since,
-			)
-			assert.ok(
-				refused.length > 0,
-				'the rewind must be reported as stale drops, not mis-decrypted',
-			)
+			step('refused: no media reached the stream after the rewind began')
 		},
 	},
 	{

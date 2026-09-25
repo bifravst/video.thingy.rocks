@@ -300,6 +300,29 @@ export const provisionKey = async (
 }
 
 /**
+ * The metric period everything below is aligned to, in milliseconds.
+ * PutMedia.IncomingBytes is published per minute.
+ */
+const METRIC_PERIOD_MS = 60_000
+
+/**
+ * The next period boundary strictly after `since`.
+ *
+ * CloudWatch returns a period-aligned datapoint whenever the query window
+ * overlaps its bucket, with the Sum of the WHOLE bucket - so a window that
+ * starts mid-minute counts the minute's earlier bytes too. On 2026-09-25 that
+ * counted a case's own legitimate first phase as "ingestion since the rewind
+ * began", failing a rewind the receiver had in fact refused; on a re-run it
+ * can equally pass a wait on the previous run's stale bytes. Every ingestion
+ * query here starts on a boundary, so only bytes uploaded after `since` are
+ * ever counted.
+ */
+const nextPeriodBoundary = (since: Date): Date =>
+	new Date(
+		Math.ceil((since.getTime() + 1) / METRIC_PERIOD_MS) * METRIC_PERIOD_MS,
+	)
+
+/**
  * Waits until the KVS stream received media after `since`, using the metric the
  * alarms use. This is the e2e definition of "it works": bytes reached Kinesis.
  */
@@ -307,9 +330,10 @@ export const waitForStreamIngestion = async (
 	region: string,
 	streamName: string,
 	since: Date,
-	timeoutMs = 180_000,
+	timeoutMs = 240_000,
 ): Promise<number> => {
 	const cw = new CloudWatchClient({ region })
+	const from = nextPeriodBoundary(since)
 	const deadline = Date.now() + timeoutMs
 	for (;;) {
 		const end = new Date()
@@ -318,7 +342,7 @@ export const waitForStreamIngestion = async (
 				Namespace: 'AWS/KinesisVideo',
 				MetricName: 'PutMedia.IncomingBytes',
 				Dimensions: [{ Name: 'StreamName', Value: streamName }],
-				StartTime: since,
+				StartTime: from,
 				EndTime: end,
 				Period: 60,
 				Statistics: ['Sum'],
@@ -331,7 +355,7 @@ export const waitForStreamIngestion = async (
 		if (total > 0) return total
 		if (Date.now() > deadline) {
 			throw new Error(
-				`no PutMedia.IncomingBytes on ${streamName} since ${since.toISOString()}`,
+				`no PutMedia.IncomingBytes on ${streamName} since ${from.toISOString()} (aligned up from ${since.toISOString()})`,
 			)
 		}
 		await sleep(15_000)
@@ -340,20 +364,33 @@ export const waitForStreamIngestion = async (
 
 /**
  * Asserts the opposite: no media reached the stream in the window. Missing
- * datapoints count as zero - a stream nobody writes to publishes nothing at all.
+ * datapoints count as zero - a stream nobody writes to publishes nothing at
+ * all.
+ *
+ * The window is the same period-aligned one: bytes counted are those in full
+ * minutes after `since`. If the aligned window has not yet elapsed a full
+ * period, it waits until it has, so the assertion is never vacuously true over
+ * an empty window.
  */
 export const assertNoStreamIngestion = async (
 	region: string,
 	streamName: string,
 	since: Date,
 ): Promise<void> => {
+	const from = nextPeriodBoundary(since)
+	// At least one full period must have elapsed for the assertion to mean
+	// anything; the rewind case's own waits usually cover this already.
+	const earliestAssert = from.getTime() + METRIC_PERIOD_MS
+	if (Date.now() < earliestAssert) {
+		await sleep(earliestAssert - Date.now())
+	}
 	const cw = new CloudWatchClient({ region })
 	const stats = await cw.send(
 		new GetMetricStatisticsCommand({
 			Namespace: 'AWS/KinesisVideo',
 			MetricName: 'PutMedia.IncomingBytes',
 			Dimensions: [{ Name: 'StreamName', Value: streamName }],
-			StartTime: since,
+			StartTime: from,
 			EndTime: new Date(),
 			Period: 60,
 			Statistics: ['Sum'],
@@ -363,7 +400,11 @@ export const assertNoStreamIngestion = async (
 		(sum, d) => sum + (d.Sum ?? 0),
 		0,
 	)
-	assert.equal(total, 0, `${streamName} received media it must not have`)
+	assert.equal(
+		total,
+		0,
+		`${streamName} received media after ${from.toISOString()} (aligned up from ${since.toISOString()}) that it must not have`,
+	)
 }
 
 /**
