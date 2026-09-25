@@ -2,8 +2,11 @@ import { fromNodeProviderChain } from '@aws-sdk/credential-providers'
 import { HealthServer } from './HealthServer.ts'
 import { resolveInstanceId } from './InstanceId.ts'
 import { KinesisIngestionPipeline } from './KinesisIngestionPipeline.ts'
+import { SrtpTransport, srtpTransportConfigFromEnv } from './SrtpTransport.ts'
 import { StreamMetadataService } from './StreamMetadataService.ts'
 import { StreamStateManager } from './StreamStateManager.ts'
+import { UNENCRYPTED_TRANSPORT } from './TrafficMetricNames.ts'
+import { TrafficMetrics } from './TrafficMetrics.ts'
 import { UDPListener, type PacketHandler } from './UDPListener.ts'
 
 const ensureAwsCredentials = async (): Promise<void> => {
@@ -147,11 +150,22 @@ const createPacketHandler = (): PacketHandler => ({
 		// Only update DynamoDB lastPacketTime if we hold the lock
 		if (kinesisLockHeldForPorts.has(port)) {
 			try {
-				await streamMetadataService.updateLastPacketTime(
+				const outcome = await streamMetadataService.updateLastPacketTime(
 					port,
-					timestamp,
 					instanceId,
 				)
+				if (outcome === 'lostLock') {
+					// Another instance owns the row now: stop producing rather than
+					// keep writing to a stream this instance no longer holds, which is
+					// the one condition that must never be waited out.
+					console.warn(
+						`[Main] Lost the Kinesis lock for port ${port}; stopping ingestion`,
+					)
+					kinesisLockHeldForPorts.delete(port)
+					if (kinesisIngestionPipeline) {
+						await kinesisIngestionPipeline.stop(port)
+					}
+				}
 			} catch (err) {
 				console.error(`[Main] Error updating DynamoDB for port ${port}:`, err)
 			}
@@ -270,6 +284,37 @@ udpListener.setPacketHandler(packetHandler)
 
 const healthServer = new HealthServer()
 
+/**
+ * The SRTP transport and the traffic metrics publisher, resolved during startup.
+ *
+ * Both are additive: nothing either of them does may prevent the unencrypted
+ * path from serving. The SRTP transport is started only after the unencrypted
+ * listener is bound, and a failure in its keys, credentials or helpers can only
+ * ever leave its own ports unwatched.
+ */
+let srtpTransport: SrtpTransport | undefined
+let trafficMetrics: TrafficMetrics | undefined
+
+/** The SRTP configuration, or undefined when SRTP is not enabled or cannot be. */
+const resolveSrtpTransportConfig = ():
+	| {
+			keyParameterPrefix: string
+			portRange: { start: number; end: number }
+	  }
+	| undefined => {
+	try {
+		return srtpTransportConfigFromEnv(process.env)
+	} catch (err) {
+		// A configuration error in the additive path must not take the service down:
+		// it is logged, loudly, and SRTP stays disabled until it is fixed.
+		console.error(
+			'[Main] Invalid SRTP configuration; SRTP ingest disabled:',
+			err,
+		)
+		return undefined
+	}
+}
+
 // Graceful shutdown handler
 const shutdown = async (): Promise<void> => {
 	console.log('[Main] Shutting down...')
@@ -278,6 +323,19 @@ const shutdown = async (): Promise<void> => {
 	await udpListener.stop()
 	streamStateManager.stop()
 	preStartBufferByPort.clear()
+
+	// The SRTP transport stops its producers (flushing what they hold), releases
+	// its locks and ends its helpers, and only then returns - nothing of it may
+	// outlive this process or keep writing to its streams.
+	if (srtpTransport !== undefined) {
+		await srtpTransport.stop()
+		srtpTransport = undefined
+	}
+	if (trafficMetrics !== undefined) {
+		await trafficMetrics.stop()
+		trafficMetrics = undefined
+	}
+
 	for (const port of kinesisLockHeldForPorts) {
 		await streamMetadataService.releaseKinesisLock(port, instanceId)
 	}
@@ -331,6 +389,47 @@ const start = async (): Promise<void> => {
 		await ensureAwsCredentials()
 		await healthServer.start()
 		await udpListener.start()
+
+		// The primary transport serves; from here on everything additive follows.
+		// The traffic metrics feed the stack's zero-ingestion alarms, which need a
+		// per-transport view of "is traffic arriving" that the load balancer's own
+		// per-load-balancer byte count cannot give them.
+		trafficMetrics = new TrafficMetrics({
+			region: config.awsRegion,
+			stackName: process.env.STACK_NAME,
+		})
+		udpListener.on('packet', ({ data }: { port: number; data: Buffer }) => {
+			trafficMetrics?.recordReceived(UNENCRYPTED_TRANSPORT, data.length)
+		})
+		trafficMetrics.setServing(UNENCRYPTED_TRANSPORT, true)
+		trafficMetrics.start()
+
+		// SRTP is started last and isolated: a failure in its keys, credentials or
+		// helpers is contained in the transport and leaves the service - and the
+		// unencrypted path - serving.
+		const srtpConfig = resolveSrtpTransportConfig()
+		if (srtpConfig !== undefined) {
+			srtpTransport = new SrtpTransport({
+				keyParameterPrefix: srtpConfig.keyParameterPrefix,
+				portRange: srtpConfig.portRange,
+				region: config.awsRegion,
+				instanceId,
+				streamNameForPort: (port) => `${config.kinesisStreamPrefix}-${port}`,
+				locks: streamMetadataService,
+				floors: streamMetadataService,
+				metrics: trafficMetrics,
+			})
+			try {
+				await srtpTransport.start()
+			} catch (err) {
+				console.error(
+					'[Main] SRTP transport could not start; continuing without it:',
+					err,
+				)
+				srtpTransport = undefined
+			}
+		}
+
 		console.log('[Main] Service started successfully')
 	} catch (error) {
 		console.error('[Main] Failed to start service:', error)
