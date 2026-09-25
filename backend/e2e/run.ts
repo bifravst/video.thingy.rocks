@@ -49,6 +49,12 @@ const main = async (): Promise<void> => {
 	// code on the instances and restart the service. The restart has to deploy the
 	// code too: instances only pick it up at boot, so a fleet that predates the
 	// deploy would otherwise still run whatever it booted with.
+	//
+	// The readiness window starts BEFORE the restart, not after it: the service
+	// logs 'SRTP transport started' a fraction of a second inside the restart
+	// command, so a window that starts once the command has completed can sit
+	// entirely after the one moment that line is ever written.
+	const since = new Date()
 	const keys = new Map<string, { keyHex: string }>()
 	for (const c of selected) {
 		log(`provisioning port ${String(c.port)} (${c.name})`)
@@ -61,9 +67,8 @@ const main = async (): Promise<void> => {
 	await restartBackend(region, instances, codeBucket)
 
 	// Wait for the service to say, in its own log, that the SRTP transport is up -
-	// and fail fast, with the reason, on the two startup failures that otherwise
-	// cost three minutes of streaming into a port nothing is listening on.
-	const since = new Date()
+	// and fail fast, with the reason, on the failures that otherwise cost
+	// three minutes of streaming into a port nothing is listening on.
 	log('waiting for the SRTP transport to report that it started')
 	const startup = await waitForLogLines(
 		region,
