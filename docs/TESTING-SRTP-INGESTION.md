@@ -93,12 +93,15 @@ npm run test:e2e
 
 The suite provisions a fresh key per port, then **deploys the backend code to
 the running fleet itself** — `aws s3 sync` from the stack's code bucket, the
-SRTP Python bindings, `npm install`, service restart — so it works against
-instances that predate the deploy (a plain restart cannot do this: instances
-receive code only at boot). It then waits for the service's own log line saying
-the SRTP transport started, and fails fast with the reason if it did not, before
-any case runs. It needs the fleet's instances reachable through SSM (the
-instance role already has it). Ports and cases:
+SRTP Python bindings, the GStreamer `srtpdec` element (Amazon Linux 2023 does
+not ship it, so the deployed `install-gst-srtp-plugin.sh` builds the two-file
+plugin from the matching gst-plugins-bad release, ~2.5 minutes once per
+instance), `npm install`, service restart — so it works against instances that
+predate the deploy (a plain restart cannot do this: instances receive code only
+at boot). It then waits for the service's own log lines — the SRTP transport
+started, and a port's helper actually reaching `searching` — and fails fast with
+the reason if they do not, before any case runs. It needs the fleet's instances
+reachable through SSM (the instance role already has it). Ports and cases:
 
 | Port        | Case             | What it proves                                                                                                                |
 | ----------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------- |

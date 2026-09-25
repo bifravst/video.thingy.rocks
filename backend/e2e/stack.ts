@@ -346,10 +346,14 @@ export const restartBackend = async (
 					// already run this code just confirm it.
 					`aws s3 sync s3://${codeBucket}/backend/ /opt/video-streaming/ --region ${region}`,
 					// The SRTP helper's GObject bindings, installed non-fatally like
-					// the new user-data installs them: an instance that has them
+					// the user-data installs them: an instance that has them
 					// already skips this in seconds, an instance from before the
 					// SRTP deploy gains them now.
 					'yum install -y python3-gobject-base || echo "WARNING: python3-gobject-base not installed; SRTP ingestion will not work"',
+					// The GStreamer srtpdec element, built from the deployed
+					// script - Amazon Linux 2023 does not ship it. Idempotent,
+					// non-fatal, about 2.5 minutes the first time.
+					'bash /opt/video-streaming/install-gst-srtp-plugin.sh || echo "WARNING: the GStreamer srtp plugin could not be installed; SRTP ingestion will not work"',
 					'cd /opt/video-streaming',
 					'npm install --production',
 					'systemctl restart video-streaming.service',

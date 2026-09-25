@@ -56,6 +56,12 @@ chmod 755 /var/video-streams
 # Download application code from S3 (placeholders replaced by CDK)
 aws s3 sync s3://__CODE_BUCKET__/backend/ /opt/video-streaming/ --region __AWS_REGION__
 
+# Build and install the GStreamer SRTP element (srtpdec/srtpenc) from the
+# deployed script: Amazon Linux 2023 ships gstreamer1-plugins-bad-free without
+# it. Non-fatal like every SRTP-only step, and skipped entirely when the element
+# is already present. Takes about 2.5 minutes once per instance.
+/opt/video-streaming/install-gst-srtp-plugin.sh || echo "WARNING: the GStreamer srtp plugin could not be installed; SRTP ingestion will not work"
+
 # Install dependencies from deployed package.json
 cd /opt/video-streaming
 npm install --production

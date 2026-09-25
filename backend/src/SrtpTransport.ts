@@ -242,7 +242,7 @@ export class SrtpTransport {
 		this.supervisors = []
 		const errors = results
 			.filter((r): r is PromiseRejectedResult => r.status === 'rejected')
-			.map((r) => r.reason)
+			.map((r) => String(r.reason))
 		if (errors.length > 0) {
 			this.logger.error(
 				'Errors while stopping the SRTP transport',
@@ -276,8 +276,8 @@ const spawnHelperProcess = (
 			helperPath,
 			'--port',
 			String(port),
-			'--ssrc',
-			String(key.ssrc),
+			// The SSRC travels in the init frame only - the helper's argument
+			// vector carries public configuration and nothing else.
 			'--stream-name',
 			config.streamNameForPort(port),
 			'--aws-region',
