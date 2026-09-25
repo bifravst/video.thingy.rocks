@@ -535,6 +535,16 @@ export const cases: E2eCase[] = [
 					'-hide_banner',
 					'-loglevel',
 					'error',
+					// -re paces the encode to real time: a lavfi source encodes
+					// faster than playback and the UDP muxer does not pace, so
+					// without it 45s of video arrives as a ~2s, 16k-datagram
+					// burst that overflows the receiver's socket buffer (the
+					// default receive buffer is ~200 KB) - almost everything is
+					// dropped, the 10 MB pre-start gate is never crossed, and
+					// the case fails while the path itself is healthy. That is
+					// how this case failed on 2026-09-25 even after the
+					// bitrate was raised.
+					'-re',
 					'-f',
 					'lavfi',
 					'-i',
