@@ -28,6 +28,8 @@ import {
 export type CaseContext = {
 	config: E2eConfig
 	instances: string[]
+	/** The CDK code bucket, for the in-case backend deploy/restarts. */
+	codeBucket: string
 }
 
 export type E2eCase = {
@@ -291,7 +293,7 @@ export const cases: E2eCase[] = [
 				6004,
 				{ ssrc: 1014 },
 			)
-			await restartBackend(ctx.config.region, ctx.instances)
+			await restartBackend(ctx.config.region, ctx.instances, ctx.codeBucket)
 			since = new Date()
 			sender = makeSender(ctx.config, 6004, 1014, freshKey, {
 				roc: 1,
@@ -400,7 +402,7 @@ export const cases: E2eCase[] = [
 			})
 			const streaming = sender.run()
 			await new Promise((resolve) => setTimeout(resolve, 5_000))
-			await restartBackend(ctx.config.region, ctx.instances)
+			await restartBackend(ctx.config.region, ctx.instances, ctx.codeBucket)
 			await new Promise((resolve) => setTimeout(resolve, 10_000))
 
 			// Re-authenticated after the restart (a new first authentication for
@@ -455,7 +457,7 @@ export const cases: E2eCase[] = [
 				6007,
 				{ ssrc: 1017 },
 			)
-			await restartBackend(ctx.config.region, ctx.instances)
+			await restartBackend(ctx.config.region, ctx.instances, ctx.codeBucket)
 			since = new Date()
 			sender = makeSender(ctx.config, 6007, 1017, freshKey, {
 				roc: 0,
