@@ -1,0 +1,209 @@
+# S/RTP ingest: complete findings from the review history
+
+This document is the consolidated bug list from every reviewer and implementer
+involved in the two previous attempts to add SRTP ingest:
+
+- **PR #46** (`s-rtp-ingest`, closed, replaced): authored with Claude Code,
+  reviewed by Copilot over ~27 rounds (94 review comments, 30 fix commits).
+- **PR #48** (`srtp-ingest-v2`, open): authored with Claude Code, fixed by
+  Cursor Agent over 16+ Copilot rounds (47 fix commits, 227 tests).
+
+It exists so that the third implementation (this PR) can be _designed_ against
+the full set of known failure modes instead of re-discovering them one review
+round at a time. Every finding below is mapped to how this implementation either
+eliminates it by construction, implements the known-correct fix, covers it with
+a test, or explicitly accepts it as a documented risk.
+
+The PR #48 description diagnosed why the review loop never converged, and that
+diagnosis is the starting point for this document:
+
+> #46 accumulated 94 review comments over 27 rounds, and the fix commits were
+> growing rather than shrinking... 59 of its 87 resolved threads were resolved
+> only because the code moved out from under them. The findings were not 94
+> problems but four causes.
+
+The four causes:
+
+1. **Cryptographic state reconstructed outside the authenticator** — SRTP
+   rollover-counter state inferred from plaintext headers of _unauthenticated_
+   datagrams, persisted, and re-seeded into the decoder.
+2. **One stream shared by two transports** — turned single ownership into a
+   distributed-consensus problem (slot locks, epochs, fences, fleet cutover).
+3. **The additive path was not isolated** — SRTP-only failures repeatedly took
+   down unencrypted ingest.
+4. **Bounded hygiene** — key exposure, validation, prerequisites. (This category
+   was actually finished in #48 and is carried forward.)
+
+---
+
+## A. Cryptographic state (rollover counter / packet index)
+
+The single most contested subject across both PRs: with static pre-shared keys,
+a restartable receiver, and no handshake, the receiver must reconstruct
+libsrtp's per-session packet index. Every design that reconstructed this state
+from unauthenticated input or persisted it as _authoritative_ state produced an
+unending cascade of races.
+
+| #   | Finding (PR)                                                                                                                                                           | Status              | How v3 handles it                                                                                                                                                                                                                                                                                                |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A1  | `srtpdec` seeded without ROC: after the sender's sequence number wraps, any restart breaks decryption permanently (#46)                                                | confirmed           | ROC search in the helper, seeded from a _hint_, confirmed only by authentication                                                                                                                                                                                                                                 |
+| A2  | ROC estimated from plaintext headers of unauthenticated datagrams; forged high/low sequence pairs poison persisted ROC (#46)                                           | confirmed           | **Node never touches datagrams or crypto state.** Only authenticated output from `srtpdec` can produce a reported ROC                                                                                                                                                                                            |
+| A3  | Ordinary reordering across a wrap inflates the ROC (65534, 0, late 65535, 1 → double increment) (#46, #48)                                                             | confirmed, twice    | Wrap tracking is a **faithful port of libsrtp's own index estimation** (`srtp_rdbx_estimate_index` + `srtp_index_guess`, including the early-session shortcut), on **authenticated** packets only, inside the helper — divergence from the authenticator was found and pinned by a test against the real library |
+| A4  | `{roc: 0, highestSeq: 0}` doubles as fresh-state sentinel and real value → first packet with seq > 32768 misclassified as ROC 1, persisted one rollover too high (#46) | confirmed           | Fresh state is `null`, never a magic number; the helper has no persisted "state", only a hint and a floor                                                                                                                                                                                                        |
+| A5  | Restoring ROC without the sequence index: seed ROC 5 + current seq 40000 → libsrtp estimates ROC 4 → auth fails (#46)                                                  | confirmed           | The seed is never treated as authoritative; libsrtp confirms or the search continues                                                                                                                                                                                                                             |
+| A6  | Seed-vs-replay mismatch: buffer spanning a wrap seeded with post-wrap ROC, then pre-wrap packets replayed → initial packets fail auth (#46)                            | confirmed           | **No replay machinery.** The kernel socket buffer retains datagrams across helper pipeline rebuilds; the same bound socket feeds every pipeline, in order, with no user-space reordering                                                                                                                         |
+| A7  | ROC keyed by slot, not by key/SSRC identity → key rotation or fresh sender inherits stale ROC (#46)                                                                    | confirmed           | Hint + floor rows are keyed by port and invalidated by key fingerprint + SSRC                                                                                                                                                                                                                                    |
+| A8  | Key fingerprint hashed textual hex → case difference looks like rotation (#46)                                                                                         | confirmed           | Hex normalized (lowercased) before fingerprinting                                                                                                                                                                                                                                                                |
+| A9  | Eventually-consistent `GetItem` for ROC restore after handoff → stale read (#46)                                                                                       | confirmed           | The hint is _not_ correctness-critical: a stale hint costs a bounded re-search, so consistency doesn't matter                                                                                                                                                                                                    |
+| A10 | Unconditional ROC write not tied to owner → non-owner overwrites current owner's state (#46)                                                                           | confirmed           | The hint is best-effort, last-writer-wins, and a wrong hint is harmless (see A9). The _floor_ write is monotonic-conditioned, so any writer can only raise it                                                                                                                                                    |
+| A11 | Throttles/fences around final ROC persistence (write-error skip, lostLock throttle poisoning) (#46)                                                                    | confirmed           | None of this machinery exists, because nothing correctness-critical is persisted at handoff                                                                                                                                                                                                                      |
+| A12 | Sender restart at ROC 0 with same key/SSRC → stale persisted ROC rejects the stream forever (#46)                                                                      | confirmed           | Session-continuity contract (below) + hint semantics make a stale hint self-healing: the search re-finds ROC 0                                                                                                                                                                                                   |
+| A13 | In-memory seed refuses to lower after clearing DynamoDB; docs said no restart needed (#46)                                                                             | confirmed           | No in-memory authority; every new helper session searches from its own state                                                                                                                                                                                                                                     |
+| A14 | Candidate search not bidirectional: hint 1000, actual ROC 999 unreachable (#48)                                                                                        | confirmed           | Candidate order: floor/hint, then 0, then bands outwards in **both** directions, unbounded in uint32 space                                                                                                                                                                                                       |
+| A15 | Adjacent-packet wrap detector inflated ROC under reordering (#48)                                                                                                      | confirmed           | RFC 3711 index tracking (A3)                                                                                                                                                                                                                                                                                     |
+| A16 | Candidate advancement raced the authentication probe → candidate reported that never authenticated under it (#48)                                                      | confirmed           | **Single process, single thread of control**: the helper's GStreamer main loop owns the search; authentications are tagged with the candidate that produced them before any report is emitted                                                                                                                    |
+| A17 | Candidate exposed to the streaming thread before its trial baseline was recorded (#48)                                                                                 | confirmed           | Same as A16                                                                                                                                                                                                                                                                                                      |
+| A18 | Each new helper session restarted the candidate generator at the first band → distant ROC never found despite "no value permanently excluded" (#48)                    | confirmed           | Search progress (far-climb position) is reported to the supervisor and passed into the next session's init frame, per key/SSRC identity                                                                                                                                                                          |
+| A19 | libsrtp replay window empty on restart → a recorded authentic packet replays as the first packet and is accepted (#48)                                                 | confirmed           | **Replay floor**: the highest packet index ever accepted under a key+SSRC, persisted monotonically (`srtpIndex < :index` conditional write), enforced _before_ the depayloader; datagrams at or below the floor are dropped and logged as rewinds                                                                |
+| A20 | Sender restart reusing the static key and SSRC reuses the AES-CM keystream → XOR of two recordings cancels plaintext (#48)                                             | confirmed, security | The floor (A19) rejects index rewinds; the contract requires a fresh key on sender reset; e2e test verifies rejection                                                                                                                                                                                            |
+
+**Session-continuity contract** (unchanged from #46/#48): a sender must never
+rewind its RTP packet index while keeping the same key and SSRC. A sender reset
+requires reprovisioning a fresh key (the provisioning tooling enforces
+SecureString + AWS-managed SSM key). Violations are _detected and rejected_
+(floor) rather than silently mis-decrypted.
+
+## B. Lock / ownership lifecycle
+
+The DynamoDB lock exists because NLB UDP flows can move between instances during
+rolling deploys; only the instance actually receiving traffic may run `kvssink`
+for a stream. #46's paired-port sharing turned this into distributed consensus.
+
+| #   | Finding (PR)                                                                                                    | Status                         | How v3 handles it                                                                                                                                                 |
+| --- | --------------------------------------------------------------------------------------------------------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| B1  | Paired ports (5000/6000) mapped to the same stream with separate lock rows → two producers for one stream (#46) | confirmed                      | **Per-transport streams.** SRTP port 6000+N has its own KVS stream; the lock row is keyed by the raw port, exactly as the unencrypted path keys its own           |
+| B2  | Lock released while the old producer still writes (#46, #48)                                                    | confirmed, three times         | Stop-before-release is the supervisor's single teardown path: SIGTERM → bounded grace → SIGKILL → wait for `exit` event → only then release the lock              |
+| B3  | Local owner cleared before the release completed → paired port reacquired, old release removed new lock (#46)   | confirmed                      | Single owner state machine per port; release is the last step of the one teardown path                                                                            |
+| B4  | Ownership assumed valid through async startup → stale invocation registered a pipeline without a lock (#46)     | confirmed                      | The per-port supervisor is a serialized state machine (one in-flight operation per port); a start that observes a superseded generation is discarded before spawn |
+| B5  | Failed start left lock held / buffer deleted / no retry — or retry storm with no backoff (#46)                  | confirmed                      | Failed start always releases the lock and re-arms with backoff; deterministic config failures disable the port                                                    |
+| B6  | Heartbeat used packet arrival time rather than current time → stale-lock takeover while receiving (#46)         | confirmed                      | Heartbeat timestamps are taken at write time                                                                                                                      |
+| B7  | Inactivity stop raced a resumed stream → active stream left without ingestion (#46)                             | confirmed                      | Serialized per-port machine; resume is observed before teardown completes                                                                                         |
+| B8  | `stop()` resolved on timeout without child exit → lock released with live writer (#48)                          | confirmed                      | Timeout escalates to SIGKILL and still resolves only on `exit`                                                                                                    |
+| B9  | A rejected `producer.stop()` was swallowed → teardown released the lock anyway (#48)                            | confirmed                      | Stop failure keeps the lock and retries (the port cannot be torn down out from under a live producer); the lease going stale is the documented fallback           |
+| B10 | Missed child-exit race left `stop()` pending forever (#48)                                                      | confirmed (mechanism differed) | Exit listeners attach before any awaited step; re-checked after attach                                                                                            |
+| B11 | Late stdout messages from an exited session acted on a replacement session (#48)                                | confirmed                      | Every frame carries the session id; frames from a superseded session are logged but cannot act                                                                    |
+| B12 | DynamoDB client had SDK defaults (no timeouts) → any call could hang the port queue forever (#48)               | confirmed                      | The shared client is constructed with connection, request (with `throwOnRequestTimeout`) and socket timeouts                                                      |
+
+## C. Deployment / migration (the #46 cutover class)
+
+Renaming streams and re-keying locks forced a blue/green fleet cutover with a
+readiness Lambda, retained legacy fleets and frozen generations — and Copilot
+found fatal flaws in every variant of it for six straight rounds.
+
+| #   | Finding (PR)                                                                                                                                 | Status    | How v3 handles it                                                                                                                                   |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| C1  | Stream rename + lock re-key + rolling ASG → old/new fleets write to different streams, locks don't fence, traffic splits or duplicates (#46) | confirmed | **No renames. Existing streams keep names and construct IDs (pinned by a CDK test). SRTP streams are new resources. The deploy is purely additive** |
+| C2  | Construct-ID change replaced KVS streams → retained media deleted (#46)                                                                      | confirmed | Same as C1                                                                                                                                          |
+| C3  | TCP-connect readiness ≠ ingest readiness → cutover to non-ingesting fleet (#46)                                                              | confirmed | No cutover exists. Health port opens as soon as the _primary_ transport serves (see D4)                                                             |
+| C4  | Listeners repointed before targets healthy → zero healthy targets (#46)                                                                      | confirmed | No listener changes to existing ports at all                                                                                                        |
+| C5  | Retained legacy fleet shared the new launch template / wasn't pinned to immutable artifacts (#46)                                            | confirmed | No legacy fleet                                                                                                                                     |
+| C6  | ELB health checks + any unhealthy SRTP target → ASG churn replaced instances serving unencrypted fine (#46)                                  | confirmed | The health endpoint is shared; an SRTP-only failure never closes it (D-class below)                                                                 |
+| C7  | Fleet-cutover Lambda: rejected `Promise.all` never responded to CloudFormation; `NaN` passed validation (#46)                                | confirmed | The Lambda is gone                                                                                                                                  |
+
+## D. Isolation: SRTP must never take unencrypted ingest down
+
+Violated in a _new_ way almost every round, because both transports shared one
+Node process and one startup block.
+
+| #   | Finding (PR)                                                                                                               | Status    | How v3 handles it                                                                                                                              |
+| --- | -------------------------------------------------------------------------------------------------------------------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| D1  | SSM/KMS key-load failure in the fatal startup block exits before any listener starts (#46)                                 | confirmed | Key loading happens after the primary listener serves; failures skip the SRTP transport only                                                   |
+| D2  | SRTP listener bind failure exits the process after unencrypted started (#46)                                               | confirmed | SRTP setup is wrapped; its failure is logged and the service continues                                                                         |
+| D3  | UDP relay socket with no `error` listener → async `ECONNREFUSED` kills Node (#48)                                          | confirmed | **No relay socket exists** — the helper binds the public port itself; the supervisor never touches datagrams                                   |
+| D4  | Health port opened only after additive transports prepared → instance unhealthy during a legitimate SSM stall (#48)        | confirmed | Health port opens immediately after the primary listener binds, before any SRTP work                                                           |
+| D5  | Helper stdin `EPIPE` unhandled → process dies (#48)                                                                        | confirmed | Every pipe/stream error handler is attached synchronously at spawn; the protocol has a spec that pins this class                               |
+| D6  | Malformed helper frame (`0`, `1.5`, `70000`) → sync throw from `dgram.connect` in a stdout handler kills the process (#48) | confirmed | The supervisor _validates_ every numeric field before use and rejects frames it cannot parse; no socket API is called with unvalidated numbers |
+| D7  | Primary listener startup had no rollback: half-bound sockets spawn producers, orphans on exit (#48)                        | confirmed | Startup rollback stops listeners and machines best-effort, collecting failures into one `AggregateError`                                       |
+| D8  | One listener stop failure aborted the rest of shutdown → locks unreleased (#48)                                            | confirmed | Every shutdown step runs regardless of the others (`allSettled` + aggregate)                                                                   |
+| D9  | User-data SRTP element check exited before the service started → unencrypted down too (#46)                                | confirmed | SRTP checks are warning-only                                                                                                                   |
+| D10 | `Boolean("false") === true` env flag parsing (#46)                                                                         | confirmed | Strict parsing of explicit enabled values                                                                                                      |
+
+## E. Unbounded waits
+
+| #   | Finding (PR)                                                                                                                  | Status    | How v3 handles it                                                                           |
+| --- | ----------------------------------------------------------------------------------------------------------------------------- | --------- | ------------------------------------------------------------------------------------------- |
+| E1  | FIFO write-open blocked forever when GStreamer exited before opening `filesrc` (unencrypted path) (#48)                       | confirmed | Every awaited step races the child's exit and a deadline; listeners attach before the await |
+| E2  | Initial FIFO write awaited with no deadline: 1 MiB into a 64 KiB pipe with a non-reading consumer hangs startup forever (#48) | confirmed | Same: single deadline covering open and initial write, non-blocking IO                      |
+| E3  | Every port-queue-blocking call (acquire/refresh/release/hint) could hang forever on SDK defaults (#48)                        | confirmed | Bounded SDK client (B12); every operation in the supervisor has a deadline                  |
+| E4  | Late-exit startup race left a threadpool thread held for good (#48)                                                           | confirmed | Same as E1                                                                                  |
+
+## F. Admission, DoS and key hygiene
+
+| #   | Finding (PR)                                                                                                                                  | Status         | How v3 handles it                                                                                                                                                                                                 |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| F1  | SRTP key in `gst-launch` argv → readable via `/proc/<pid>/cmdline` (#46, #48)                                                                 | confirmed      | The helper is a GStreamer _application_; the key crosses via stdin in the init frame and reaches `srtpdec` through the `request-key` callback; it never appears in argv, logs, or protocol frames                 |
+| F2  | Provisioning script exposed key via argv and `--value` (#48)                                                                                  | confirmed      | Key via stdin/file/0600 prompt; AWS CLI via `--cli-input-json file://` 0600 mktemp, removed by EXIT trap; signal handlers only `exit`                                                                             |
+| F3  | `INT`/`TERM` traps returned instead of exiting → secret file recreated world-readable (#48)                                                   | confirmed      | Same as F2                                                                                                                                                                                                        |
+| F4  | GStreamer `debug` string forwarded on the protocol → could leak negotiated caps/key (#48)                                                     | confirmed      | Protocol frames carry structured, validated fields only; no free-form GStreamer text crosses the boundary                                                                                                         |
+| F5  | Non-`SecureString` parameters accepted (#46)                                                                                                  | confirmed      | `Parameter.Type` enforced                                                                                                                                                                                         |
+| F6  | SSRC/cipher validation gaps across store, scripts, sender (#46)                                                                               | confirmed      | Single validated suite (`aes-128-icm` + `hmac-sha1-80`), uint32 SSRC enforced everywhere                                                                                                                          |
+| F7  | Per-datagram SSRC-mismatch warnings → attacker-driven unbounded log amplification (#48)                                                       | confirmed      | Unknown SSRCs are counted and reported once per stats interval, never echoed                                                                                                                                      |
+| F8  | Protocol line-length bound enforced only on the partial tail → oversized complete line reached `JSON.parse` (#48)                             | confirmed      | Length checked inside the line loop, before parsing                                                                                                                                                               |
+| F9  | Unauthenticated traffic could fill buffers, acquire locks, refresh leases, drive ROC (#46 acknowledged as accepted risk; #48 bounded to 20 s) | improved in v3 | **The supervisor sees no datagrams at all.** Lock acquisition and every lease refresh is driven only by _authenticated_ reports from the helper — forged traffic earns nothing, for any duration, by construction |
+| F10 | Once running, any datagram refreshed the lease (documented bound in #48)                                                                      | improved in v3 | Lease refresh is likewise driven by authenticated reports only                                                                                                                                                    |
+| F11 | Keyless SRTP port admitted arbitrary traffic (#46)                                                                                            | confirmed      | A port without a key never gets a helper; the listener for that port is not started                                                                                                                               |
+| F12 | Docs/probe/package drift: incomplete apt lists, partial element probes, wrong key length in the built-in test key (#46, #48)                  | confirmed      | The sender's `--check` is driven by the same element table it runs with; the docs' install line is generated from it                                                                                              |
+
+## G. Alarms, metrics, docs consistency
+
+| #   | Finding (PR)                                                                             | Status    | How v3 handles it                                                                        |
+| --- | ---------------------------------------------------------------------------------------- | --------- | ---------------------------------------------------------------------------------------- |
+| G1  | Inverted composite alarm (`not(no traffic)`) (#46)                                       | confirmed | Zero-ingestion alarms are per-transport and positively scoped                            |
+| G2  | Load-balancer-wide `ProcessedBytes_UDP` conflated transports in one alarm leg (#46, #48) | confirmed | Per-transport custom metrics with names/dimensions from one shared module                |
+| G3  | Dimension value case mismatch (`srtp` vs `SRTP`) → alarm silently never fires (#48)      | confirmed | Single source of truth for metric names and dimension values                             |
+| G4  | `notBreaching` suppressed the missing-producer alarm (#48)                               | confirmed | The service publishes a per-transport "expected" heartbeat metric; absence is observable |
+| G5  | Root `npm test` importing backend-only SDK via CDK spec broke clean installs (#48)       | confirmed | CDK specs import SDK-free modules only                                                   |
+| G6  | Docs described sender SSRC change without reprovision+restart (#46)                      | confirmed | Ops runbook states the full procedure                                                    |
+| G7  | Recovery docs demonstrated the same-key restart they forbade (#48)                       | confirmed | Docs and e2e assert a fresh key and `trials: 1`                                          |
+
+## Review-process findings (why the loop never converged)
+
+These are not code bugs, but they are the reason neither PR could reach "done":
+
+1. **Fixes grew instead of shrank** — #46's last five fix commits were 214, 453,
+   359, 256 and 544 lines; each patch added state, and new state was new
+   interleaving space for the next review round.
+2. **59 of 87 resolved threads in #46 were resolved only because the code moved
+   out from under them** — the review surface never actually reached zero.
+3. **Copilot reviews each push with no memory of rebuttals or accepted
+   trade-offs**, and its findings included false positives that were rebutted
+   with verification (CDK logical-ID hashes; the `kms:Decrypt` grant for
+   `alias/aws/ssm`; a described missed-exit interleaving that was unreachable,
+   though hiding a different real bug). A loop containing false positives and
+   unverifiable interleaving claims cannot asymptote to zero findings.
+4. **No runtime ground truth**: both PRs' test plans ended with the same
+   unchecked boxes — _deploy to a dev stack and send a real SRTP stream_ and
+   _confirm SSRC stability with firmware_. Every interleaving dispute was
+   settled by argument, never by observation.
+
+This PR answers (4) directly: the e2e suite (`e2e/`) runs against a deployed
+stack and turns the contested behaviors — wrap, restart, hint-climb, rewind
+rejection, forged traffic, isolation — into executable, pass/fail observations.
+
+## Accepted risks (documented, not hidden)
+
+- **No fencing token on the lock lease**: a stale takeover can briefly produce
+  two writers, and KVS `PutMedia` cannot be fenced. Pre-existing on `saga` for
+  the unencrypted path; identical exposure here.
+- **A wrong or missing ROC hint costs the datagrams spent on failed candidates**
+  — video resumes at the sender's next keyframe (~11 s with a default x264 GOP).
+  This replaces a design where a wrong hint made the stream undecryptable until
+  an operator intervened.
+- **SSRC is pinned per port** (`srtpdec` static-key limitation) — camera
+  firmware must use a stable SSRC per port. Still needs firmware confirmation.
+- **The anti-replay floor is per key+SSRC and monotonic**: it detects rewinds
+  only after the first accepted packet of that key; it does not retroactively
+  protect the very first session of a new key.
+- **KVS SDK is built from source at boot** (pre-existing on `saga`) — every
+  rolling update is marginal; prebaking it into an AMI is the highest-value
+  follow-up.
