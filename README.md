@@ -83,6 +83,14 @@ cost of at most one keyframe interval of video.
   (`aes-128-icm`) encryption and **HMAC-SHA1-80** authentication, using the
   pre-shared 30-byte master key + salt (60 hex characters) provisioned for your
   port. This is the only suite validated end-to-end; do not send SRTCP.
+- **SSRC — Synchronization SouRCe — is the 32-bit stream identifier in the fixed
+  RTP header** (bytes 8–11, RFC 3550 section 3): the label that says "these
+  packets all belong to one RTP stream from one sender". Normally a sender picks
+  it at random when a session starts; here it is **provisioned per port together
+  with the key** (a plain decimal number, e.g. `42`), and the receiver accepts
+  only that value — datagrams carrying any other SSRC are dropped without being
+  attempted. Your device must therefore use one fixed SSRC per port, on every
+  packet, for the lifetime of the key.
 
 ### The one hard rule: never rewind the packet index
 
@@ -105,8 +113,9 @@ or a session reset — ask for a **fresh key** (`scripts/provision-srtp-key.sh`,
 plus a service restart). A new key starts a clean index space at ROC 0 and is
 confirmed on the first packet. This is the only recovery from a rewind.
 
-Also: use a **stable SSRC** for your port. The static-key receiver is pinned to
-the SSRC provisioned with the key; datagrams carrying any other SSRC are dropped
+Also: use a **stable SSRC** for your port — the Synchronization Source
+identifier from _Stream format_ above. The static-key receiver is pinned to the
+SSRC provisioned with the key; datagrams carrying any other SSRC are dropped
 (counted, never logged per packet).
 
 ### What each client-side event costs
@@ -133,6 +142,10 @@ fragments come back, your stream works end to end.
 openssl rand -hex 30                       # 30 bytes: key + salt
 STACK_NAME=<stack> ./scripts/provision-srtp-key.sh <port> <ssrc>
 # key read from stdin or a 0600 file - never an argument, never a log line
+#
+# <port>  the ingest port this key is for (6000-6009)
+# <ssrc>  the SSRC your device writes into every RTP header: a decimal
+#         uint32 (0-4294967295), e.g. 42 - see "Stream format" above
 ```
 
 Keys are stored as SSM `SecureString` parameters and are loaded **at service
