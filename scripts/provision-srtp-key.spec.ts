@@ -19,7 +19,9 @@ const SCRIPT = 'scripts/provision-srtp-key.sh'
 /**
  * Stands in for the AWS CLI: records its arguments, the request file's mode and
  * contents, and then takes as long as it is told to, so a test can signal the script
- * while it is waiting on the call.
+ * while it is waiting on the call. Answers `ssm get-parameter` with the generation the
+ * test primes (`FAKE_AWS_GENERATION`), or not-found when unprimed - the port's first
+ * provisioning.
  */
 const FAKE_AWS = `#!/bin/bash
 printf '%s\\n' "$*" >> "$FAKE_AWS_LOG.argv"
@@ -31,6 +33,13 @@ for arg in "$@"; do
       ;;
   esac
 done
+if [ "$1" = "ssm" ] && [ "$2" = "get-parameter" ]; then
+  if [ -n "\${FAKE_AWS_GENERATION:-}" ]; then
+    printf '%s\\n' "$FAKE_AWS_GENERATION"
+    exit 0
+  fi
+  exit 1
+fi
 sleep "\${FAKE_AWS_SLEEP:-0}"
 `
 
@@ -62,7 +71,11 @@ void describe('provision-srtp-key.sh', () => {
 		rmSync(dir, { recursive: true, force: true })
 	})
 
-	const start = (key: string, awsSleepSeconds = 0): Run => {
+	const start = (
+		key: string,
+		awsSleepSeconds = 0,
+		extraEnv: Record<string, string> = {},
+	): Run => {
 		const child = spawn('bash', [SCRIPT, '6000', '3735928559'], {
 			stdio: ['pipe', 'pipe', 'pipe'],
 			env: {
@@ -71,6 +84,7 @@ void describe('provision-srtp-key.sh', () => {
 				TMPDIR: scratch,
 				FAKE_AWS_LOG: log,
 				FAKE_AWS_SLEEP: String(awsSleepSeconds),
+				...extraEnv,
 			},
 		})
 		let stdout = ''
@@ -145,6 +159,55 @@ void describe('provision-srtp-key.sh', () => {
 			'the request file holds the key, so nobody else may read it',
 		)
 		assert.deepStrictEqual(requestFilesLeft(), [])
+	})
+
+	/**
+	 * The generation counter, not the clock: two provisions of the same port
+	 * within one second must get different generations, because the replay
+	 * floor's rotation fence only lets a strictly newer generation replace a
+	 * row's identity. Unix seconds gave both the same value, which left the
+	 * newer key unable to persist its floor - silently, since a key that
+	 * cannot write its floor still ingests.
+	 */
+	void it('gives a same-second re-provisioning a strictly newer generation', async () => {
+		const first = await start(randomBytes(30).toString('hex')).exited
+		assert.strictEqual(first.code, 0)
+		const request1 = JSON.parse(readFileSync(`${log}.payload`, 'utf8')) as {
+			Value: string
+		}
+		const gen1 = (JSON.parse(request1.Value) as { generation: number })
+			.generation
+
+		// The second run happens immediately - same unix second, most runs -
+		// and reads back the generation the first wrote.
+		const second = await start(randomBytes(30).toString('hex'), 0, {
+			FAKE_AWS_GENERATION: String(gen1),
+		}).exited
+		assert.strictEqual(second.code, 0)
+		const request2 = JSON.parse(readFileSync(`${log}.payload`, 'utf8')) as {
+			Value: string
+		}
+		const gen2 = (JSON.parse(request2.Value) as { generation: number })
+			.generation
+		assert.ok(
+			gen2 > gen1,
+			`the generation must advance within one second (${String(gen1)} -> ${String(gen2)})`,
+		)
+		// One higher, not merely different: the counter, never the clock.
+		assert.strictEqual(gen2, gen1 + 1)
+
+		// And the counter is written before the key, so a run that fails in
+		// between skips a generation instead of repeating one.
+		const calls = readFileSync(`${log}.argv`, 'utf8').trim().split('\n')
+		const counterPut = calls.findIndex((line) =>
+			line.includes('/srtp/port/6000/generation --type String'),
+		)
+		const keyPut = calls.findIndex((line) => line.includes('file://'))
+		assert.ok(counterPut >= 0, 'the generation parameter must be written')
+		assert.ok(
+			counterPut < keyPut,
+			'the generation counter must be written before the key parameter',
+		)
 	})
 
 	/**
