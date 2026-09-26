@@ -22,6 +22,13 @@
 # validated end-to-end (it's also the only one whose key length - 30 bytes - matches what
 # the backend and this script enforce; a different suite, e.g. aes-256-icm, needs a longer
 # key and would be rejected by backend/src/SrtpKeyStore.ts).
+#
+# Every run also stamps the parameter with a `generation` - the current unix time, so
+# every later provisioning of the same port is strictly newer than every earlier one.
+# The backend uses it as the replay floor's rotation fence: a floor row may only be
+# replaced by a newer generation, so a helper still running a previous key can never
+# overwrite the floor of the key that replaced it (see
+# backend/src/StreamMetadataService.ts, raiseSrtpIndexFloor).
 
 set -e
 
@@ -114,8 +121,10 @@ trap 'exit 143' TERM
 # There is no KeyId, so SSM encrypts with the AWS managed key aws/ssm. The instance role
 # can decrypt that without a KMS grant; a customer managed key would need one (see the
 # SRTP key grant in cdk/StreamingStack.ts).
-printf '{"Name":"%s","Type":"SecureString","Overwrite":true,"Value":"{\\"key\\":\\"%s\\",\\"ssrc\\":%s,\\"cipher\\":\\"%s\\",\\"auth\\":\\"%s\\"}"}' \
-  "$PARAMETER_NAME" "$HEX_KEY" "$SSRC" "$CIPHER" "$AUTH" >"$REQUEST_FILE"
+# The generation is the provisioning time in unix seconds: monotonic by construction, so
+# every rotation of this port's key is strictly newer than the one before it.
+printf '{"Name":"%s","Type":"SecureString","Overwrite":true,"Value":"{\\"key\\":\\"%s\\",\\"ssrc\\":%s,\\"cipher\\":\\"%s\\",\\"auth\\":\\"%s\\",\\"generation\\":%s}"}' \
+  "$PARAMETER_NAME" "$HEX_KEY" "$SSRC" "$CIPHER" "$AUTH" "$(date +%s)" >"$REQUEST_FILE"
 
 echo "Provisioning SRTP key for port $PORT at $PARAMETER_NAME (region $REGION)..."
 

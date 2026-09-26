@@ -5,7 +5,11 @@ import { Logger } from './Logger.ts'
 import type { SrtpHelperInit } from './SrtpHelperProtocol.ts'
 import type { SrtpPortKey } from './SrtpKeyStore.ts'
 import { SrtpKeyStore } from './SrtpKeyStore.ts'
-import { SrtpPortSupervisor, type HelperProcess } from './SrtpPortSupervisor.ts'
+import {
+	SrtpPortSupervisor,
+	type HelperProcess,
+	type SrtpSupervisorState,
+} from './SrtpPortSupervisor.ts'
 import type { StreamMetadataService } from './StreamMetadataService.ts'
 import { SRTP_TRANSPORT } from './TrafficMetricNames.ts'
 import type { TrafficMetrics } from './TrafficMetrics.ts'
@@ -42,11 +46,33 @@ export type SrtpTransportConfig = {
 		StreamMetadataService,
 		'getSrtpIndexFloor' | 'raiseSrtpIndexFloor'
 	>
-	metrics: TrafficMetrics
+	/** The traffic metrics the transport feeds; structural so tests can fake it. */
+	metrics: Pick<TrafficMetrics, 'setServing' | 'recordReceived'>
 	logger?: Logger
 	helperPath?: string
 	credentialProvider?: CredentialResolver
+	/**
+	 * The key store, injectable for tests; production callers omit it and get a
+	 * real SrtpKeyStore for the configured prefix and region.
+	 */
+	keyStore?: SrtpKeyStoreLike
+	/**
+	 * Spawns one helper process, injectable for tests; production callers omit
+	 * it and get spawnHelperProcess.
+	 */
+	spawnProcess?: (
+		port: number,
+		init: SrtpHelperInit,
+		key: SrtpPortKey,
+		credentials: ResolvedCredentials,
+	) => HelperProcess
 }
+
+/** The parts of SrtpKeyStore the transport uses; a real one satisfies this. */
+export type SrtpKeyStoreLike = Pick<
+	SrtpKeyStore,
+	'loadPorts' | 'keyedPorts' | 'getKeyForPort'
+>
 
 /** The minimal credential shape the helpers' kvssink needs, resolved up front. */
 type ResolvedCredentials = {
@@ -105,7 +131,7 @@ const DEFAULT_HELPER_PATH = fileURLToPath(
 const resolveHelperCredentials = async (
 	provider: CredentialResolver,
 	logger: Logger,
-): Promise<ResolvedCredentials | undefined> => {
+): Promise<(ResolvedCredentials & { expiration?: Date }) | undefined> => {
 	const maxAttempts = 3
 	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 		try {
@@ -114,6 +140,7 @@ const resolveHelperCredentials = async (
 				accessKeyId: credentials.accessKeyId,
 				secretAccessKey: credentials.secretAccessKey,
 				sessionToken: credentials.sessionToken,
+				expiration: credentials.expiration,
 			}
 		} catch (err) {
 			logger.error(
@@ -127,10 +154,61 @@ const resolveHelperCredentials = async (
 	return undefined
 }
 
+/**
+ * Credentials for the helper processes, refreshed per spawn.
+ *
+ * The transport's credentials are temporary instance-role session credentials,
+ * and a helper can be spawned at any point in the service's lifetime - a
+ * respawn after a crash, or the restart after a wedged helper is torn down -
+ * long after the session token the first spawn was given has expired. The
+ * snapshot taken at startup is therefore only ever the first value: every
+ * spawn gets whatever the cache holds, and the cache refreshes before the
+ * current token's expiry (with a margin, because an expired token handed to
+ * kvssink costs a producing pipeline).
+ */
+class HelperCredentials {
+	private cached:
+		{ value: ResolvedCredentials; expiresAtMs: number } | undefined
+
+	constructor(
+		private readonly provider: CredentialResolver,
+		private readonly logger: Logger,
+	) {}
+
+	async get(): Promise<ResolvedCredentials | undefined> {
+		const refreshMarginMs = 5 * 60_000
+		if (
+			this.cached !== undefined &&
+			this.cached.expiresAtMs > Date.now() + refreshMarginMs
+		) {
+			return this.cached.value
+		}
+		const credentials = await resolveHelperCredentials(
+			this.provider,
+			this.logger,
+		)
+		if (credentials === undefined) return undefined
+		this.cached = {
+			value: {
+				accessKeyId: credentials.accessKeyId,
+				secretAccessKey: credentials.secretAccessKey,
+				sessionToken: credentials.sessionToken,
+			},
+			expiresAtMs:
+				credentials.expiration === undefined
+					? Number.POSITIVE_INFINITY
+					: credentials.expiration.getTime(),
+		}
+		return this.cached.value
+	}
+}
+
 export class SrtpTransport {
 	private readonly config: SrtpTransportConfig
 	private readonly logger: Logger
 	private supervisors: SrtpPortSupervisor[] = []
+	/** Ports whose helper has been ready at least once (reached `searching`). */
+	private readonly portsEverReady = new Set<number>()
 	private started = false
 
 	constructor(config: SrtpTransportConfig) {
@@ -147,22 +225,27 @@ export class SrtpTransport {
 		if (this.started) return true
 		this.started = true
 		try {
-			const credentials = await resolveHelperCredentials(
+			// Fail fast when there are no credentials at all, exactly as before;
+			// the value itself is only the cache's first entry (see
+			// HelperCredentials for why respawns must not be bound to it).
+			const credentials = new HelperCredentials(
 				this.config.credentialProvider ??
 					fromNodeProviderChain({ timeout: 10_000, maxRetries: 5 }),
 				this.logger,
 			)
-			if (credentials === undefined) {
+			if ((await credentials.get()) === undefined) {
 				this.logger.error(
 					'SRTP transport disabled: no AWS credentials for the helpers',
 				)
 				return false
 			}
 
-			const keyStore = new SrtpKeyStore({
-				region: this.config.region,
-				parameterPrefix: this.config.keyParameterPrefix,
-			})
+			const keyStore =
+				this.config.keyStore ??
+				new SrtpKeyStore({
+					region: this.config.region,
+					parameterPrefix: this.config.keyParameterPrefix,
+				})
 			const ports = Array.from(
 				{ length: this.config.portRange.end - this.config.portRange.start + 1 },
 				(_, i) => this.config.portRange.start + i,
@@ -185,7 +268,7 @@ export class SrtpTransport {
 				),
 			)
 			for (const supervisor of this.supervisors) supervisor.start()
-			this.config.metrics.setServing(SRTP_TRANSPORT, true)
+			this.recomputeServing()
 			this.logger.info('SRTP transport started', {
 				keyedPorts,
 				unkeyedPorts: ports.filter((p) => !keyedPorts.includes(p)),
@@ -201,15 +284,56 @@ export class SrtpTransport {
 		}
 	}
 
+	/**
+	 * Whether the transport should report itself serving.
+	 *
+	 * Not "the start method ran": a transport whose helpers never come up - a
+	 * missing plugin, a bind failure - has nothing serving, and that is exactly
+	 * the failure its zero-ingestion alarm leg exists to see. Serving is
+	 * therefore true only once some port's helper actually reached `searching`,
+	 * and false again only when every keyed port has given up permanently - a
+	 * helper dying and restarting (cooldown) is not the transport being down,
+	 * so it must not flap the alarm.
+	 */
+	private recomputeServing(): void {
+		if (this.supervisors.length === 0) return
+		const everyPortGaveUp = this.supervisors.every(
+			(supervisor) => supervisor.currentState === 'disabled',
+		)
+		this.config.metrics.setServing(
+			SRTP_TRANSPORT,
+			this.portsEverReady.size > 0 && !everyPortGaveUp,
+		)
+	}
+
+	/** Feeds the serving metric from every port's transitions. */
+	private onSupervisorTransition(
+		port: number,
+		from: SrtpSupervisorState,
+		to: SrtpSupervisorState,
+	): void {
+		void from
+		if (to === 'searching') this.portsEverReady.add(port)
+		this.recomputeServing()
+	}
+
 	private createSupervisor(
 		port: number,
 		key: SrtpPortKey,
-		credentials: ResolvedCredentials,
+		credentials: HelperCredentials,
 	): SrtpPortSupervisor {
 		const config = this.config
 		const metrics = config.metrics
 		const logger = this.logger
 		const lastInputBytes = new Map<number, number>()
+		const spawnProcess =
+			config.spawnProcess ??
+			((
+				p: number,
+				init: SrtpHelperInit,
+				k: SrtpPortKey,
+				c: ResolvedCredentials,
+			) => spawnHelperProcess(p, init, k, config, c, logger))
 		return new SrtpPortSupervisor({
 			port,
 			instanceId: config.instanceId,
@@ -218,6 +342,7 @@ export class SrtpTransport {
 			locks: config.locks,
 			floors: config.floors,
 			logger,
+			onTransition: (from, to) => this.onSupervisorTransition(port, from, to),
 			onStats: (p, stats) => {
 				// inputBytes is cumulative per helper session; the metric wants the
 				// interval's delta.
@@ -227,8 +352,17 @@ export class SrtpTransport {
 				lastInputBytes.set(p, stats.inputBytes)
 				if (delta > 0) metrics.recordReceived(SRTP_TRANSPORT, delta)
 			},
-			spawnHelper: (init: SrtpHelperInit) =>
-				spawnHelperProcess(port, init, key, config, credentials, logger),
+			spawnHelper: async (init: SrtpHelperInit): Promise<HelperProcess> => {
+				const resolved = await credentials.get()
+				if (resolved === undefined) {
+					// The supervisor contains this like any other failed start
+					// and retries on its cooldown.
+					throw new Error(
+						`no AWS credentials for the SRTP helper on port ${String(port)}`,
+					)
+				}
+				return spawnProcess(port, init, key, resolved)
+			},
 		})
 	}
 

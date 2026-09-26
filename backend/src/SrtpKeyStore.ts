@@ -29,6 +29,19 @@ export type SrtpPortKey = {
 	/** Non-secret fingerprint of keyHex (see keyFingerprint) - safe to persist/log, unlike
 	 * keyHex itself. */
 	keyFingerprint: string
+	/**
+	 * Which provisioned key this is: the provisioning script bumps it every time
+	 * it writes a port's key, so a newer key always carries a strictly larger
+	 * generation than the one it replaced.
+	 *
+	 * The replay floor uses it as its rotation fence: identity replacement of
+	 * the floor row is only allowed for a newer generation (see
+	 * StreamMetadataService.raiseSrtpIndexFloor), so a stale helper still
+	 * running the old key can raise its own floor but can never overwrite the
+	 * new key's. Defaults to 0 for parameters provisioned before the fence
+	 * existed.
+	 */
+	generation: number
 }
 
 /**
@@ -68,6 +81,11 @@ type StoredSrtpKey = {
 	ssrc: number
 	cipher?: string
 	auth?: string
+	/**
+	 * Bumped by every provisioning run (see SrtpPortKey.generation); optional so
+	 * parameters written before the rotation fence existed still load.
+	 */
+	generation?: number
 }
 
 /**
@@ -102,6 +120,15 @@ export const isStoredSrtpKey = (value: unknown): value is StoredSrtpKey => {
 
 	if (v.cipher !== undefined && v.cipher !== SUPPORTED_SRTP_CIPHER) return false
 	if (v.auth !== undefined && v.auth !== SUPPORTED_SRTP_AUTH) return false
+
+	if (
+		v.generation !== undefined &&
+		(typeof v.generation !== 'number' ||
+			!Number.isInteger(v.generation) ||
+			v.generation < 0)
+	) {
+		return false
+	}
 
 	return true
 }
@@ -201,7 +228,7 @@ export class SrtpKeyStore {
 
 			if (!isStoredSrtpKey(parsed)) {
 				this.logger.error(
-					`SRTP key parameter is invalid: needs a string "key", a uint32 "ssrc", and, if present, "cipher"/"auth" must be exactly "${SUPPORTED_SRTP_CIPHER}"/"${SUPPORTED_SRTP_AUTH}" (the only suite supported end-to-end)`,
+					`SRTP key parameter is invalid: needs a string "key", a uint32 "ssrc", and, if present, "cipher"/"auth" must be exactly "${SUPPORTED_SRTP_CIPHER}"/"${SUPPORTED_SRTP_AUTH}" and "generation" a non-negative integer (the only suite supported end-to-end)`,
 					new Error('Invalid SRTP key parameter shape'),
 					{ port, parameterName: name },
 				)
@@ -223,6 +250,7 @@ export class SrtpKeyStore {
 				cipher: parsed.cipher ?? SUPPORTED_SRTP_CIPHER,
 				auth: parsed.auth ?? SUPPORTED_SRTP_AUTH,
 				keyFingerprint: keyFingerprint(parsed.key),
+				generation: parsed.generation ?? 0,
 			})
 			this.logger.info('Loaded SRTP key', { port })
 		}

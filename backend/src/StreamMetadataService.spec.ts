@@ -232,30 +232,44 @@ void describe('StreamMetadataService SRTP replay floor', () => {
 		)
 	})
 
-	void it('raises the floor only if it goes up, or the key or SSRC changed', async () => {
+	void it('raises the floor only if it goes up, or a newer key generation replaced it', async () => {
 		const { subject, sent } = service()
-		await subject.raiseSrtpIndexFloor(6000, 9, 42, FINGERPRINT)
+		await subject.raiseSrtpIndexFloor(6000, 9, 42, FINGERPRINT, 7)
 		const input = sent[0]?.input
 		assert.deepStrictEqual(input?.Key, { port: 6000 })
 		assert.strictEqual(
 			input?.ConditionExpression,
-			'attribute_not_exists(srtpIndex) OR srtpIndex < :index OR srtpIndexSsrc <> :ssrc OR srtpIndexKeyFingerprint <> :fingerprint',
+			'attribute_not_exists(srtpIndex) OR attribute_not_exists(srtpKeyGeneration) OR srtpKeyGeneration < :generation OR (srtpKeyGeneration = :generation AND srtpIndexSsrc = :ssrc AND srtpIndexKeyFingerprint = :fingerprint AND srtpIndex < :index)',
 		)
 		const values = input?.ExpressionAttributeValues ?? {}
 		assert.strictEqual(values[':index'], 9 as unknown as string)
 		assert.strictEqual(values[':ssrc'], 42 as unknown as string)
 		assert.strictEqual(values[':fingerprint'], FINGERPRINT)
+		assert.strictEqual(values[':generation'], 7 as unknown as string)
+		// The generation is persisted with the identity it fenced in, so a
+		// later writer can compare against it.
+		assert.match(
+			String(input?.UpdateExpression ?? ''),
+			/srtpKeyGeneration = :generation/,
+		)
 	})
 
 	// A lower index than the stored one is the condition doing its job.
 	void it('treats a refused raise as nothing to do', async () => {
 		const { subject } = service(['conditional'])
-		await subject.raiseSrtpIndexFloor(6000, 9, 42, FINGERPRINT)
+		await subject.raiseSrtpIndexFloor(6000, 9, 42, FINGERPRINT, 0)
 	})
 
+	/**
+	 * A failed write leaves the persisted floor behind the helper's own
+	 * maximum: after a restart, datagrams already accepted above the stale
+	 * floor authenticate again until the floor catches up. That bounded replay
+	 * window is the documented tradeoff of this design - production is never
+	 * stopped over the write, and the write is monotonic, so it converges.
+	 */
 	void it('swallows a failed raise, which leaves the floor where it was', async () => {
 		const { subject } = service(['error'])
-		await subject.raiseSrtpIndexFloor(6000, 9, 42, FINGERPRINT)
+		await subject.raiseSrtpIndexFloor(6000, 9, 42, FINGERPRINT, 0)
 	})
 })
 

@@ -201,6 +201,38 @@ void describe('SrtpKeyStore', () => {
 			}
 		})
 
+		void it('loads the key generation, defaulting to zero for parameters written before it existed', async () => {
+			const valueByPort = new Map<number, string>([
+				// A parameter the current provisioning script wrote: generation stamped.
+				[
+					6000,
+					JSON.stringify({ key: validKeyHex, ssrc: 1, generation: 1730000000 }),
+				],
+				// A parameter from before the rotation fence: no generation at all.
+				[6001, JSON.stringify({ key: validKeyHex, ssrc: 2 })],
+			])
+			const { keyStore } = makeKeyStore(
+				secureResponder((port) => valueByPort.get(port)!),
+			)
+			await keyStore.loadPorts([6000, 6001])
+			assert.strictEqual(keyStore.getKeyForPort(6000)?.generation, 1730000000)
+			// Zero, not undefined: the floor's rotation condition compares it.
+			assert.strictEqual(keyStore.getKeyForPort(6001)?.generation, 0)
+		})
+
+		void it('rejects a non-integer or negative generation', async () => {
+			const valueByPort = new Map<number, string>([
+				[6000, JSON.stringify({ key: validKeyHex, ssrc: 1, generation: 1.5 })],
+				[6001, JSON.stringify({ key: validKeyHex, ssrc: 2, generation: -1 })],
+			])
+			const { keyStore } = makeKeyStore(
+				secureResponder((port) => valueByPort.get(port)!),
+			)
+			await keyStore.loadPorts([6000, 6001])
+			assert.strictEqual(keyStore.hasKeyForPort(6000), false)
+			assert.strictEqual(keyStore.hasKeyForPort(6001), false)
+		})
+
 		void it('rejects parameters that are not SecureString and does not load them', async () => {
 			const { keyStore } = makeKeyStore((command) => ({
 				$metadata: {},

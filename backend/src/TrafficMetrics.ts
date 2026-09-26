@@ -3,14 +3,11 @@ import {
 	PutMetricDataCommand,
 } from '@aws-sdk/client-cloudwatch'
 import { Logger } from './Logger.ts'
+import { SRTP_TRANSPORT, UNENCRYPTED_TRANSPORT } from './TrafficMetricNames.ts'
 import {
-	RECEIVED_BYTES_METRIC,
-	SERVING_METRIC,
-	SRTP_TRANSPORT,
-	TRANSPORT_DIMENSION,
-	UNENCRYPTED_TRANSPORT,
-	trafficMetricNamespace,
-} from './TrafficMetricNames.ts'
+	trafficMetricRequest,
+	type TransportTrafficSample,
+} from './TrafficMetricRequest.ts'
 
 /**
  * Publishes the per-transport traffic metrics the stack's zero-ingestion alarms read.
@@ -38,24 +35,40 @@ import {
  */
 export class TrafficMetrics {
 	private readonly client: CloudWatchClient | undefined
-	private readonly namespace: string
+	/** The stack the request builder derives the namespace from. */
+	private readonly stackName: string
 	private readonly logger = new Logger('TrafficMetrics')
 	private readonly received = new Map<string, number>()
 	private readonly serving = new Map<string, boolean>()
-	private readonly intervalMs = 60_000
+	private readonly intervalMs: number
 	private timer: NodeJS.Timeout | undefined
 	private publishCount = 0
+	/**
+	 * Publishes are serialized through this chain: a publish that overlaps the
+	 * previous one's in-flight request would otherwise read a half-accumulated
+	 * snapshot (see publishNow for the other half of that fix).
+	 */
+	private publishChain: Promise<void> = Promise.resolve()
 
-	constructor(config: { region: string; stackName?: string }) {
+	constructor(config: {
+		region: string
+		stackName?: string
+		/** Injected CloudWatch client, for tests; production omits it. */
+		client?: CloudWatchClient
+		/** Publish interval, for tests; production uses the default. */
+		intervalMs?: number
+	}) {
 		if (config.stackName === undefined || config.stackName === '') {
 			this.logger.warn(
 				'STACK_NAME is not set; the per-transport traffic metrics will not be published and the zero-ingestion alarms will see no data',
 			)
 			this.client = undefined
 		} else {
-			this.client = new CloudWatchClient({ region: config.region })
+			this.client =
+				config.client ?? new CloudWatchClient({ region: config.region })
 		}
-		this.namespace = trafficMetricNamespace(config.stackName ?? 'local')
+		this.stackName = config.stackName ?? 'local'
+		this.intervalMs = config.intervalMs ?? 60_000
 		for (const transport of [UNENCRYPTED_TRANSPORT, SRTP_TRANSPORT]) {
 			this.received.set(transport, 0)
 			this.serving.set(transport, false)
@@ -87,38 +100,59 @@ export class TrafficMetrics {
 		this.serving.set(transport, serving)
 	}
 
+	/** Serializes one publish behind any in-flight one. */
 	private async publish(): Promise<void> {
+		const run = this.publishChain.then(async (): Promise<void> =>
+			this.publishNow(),
+		)
+		// The chain itself never rejects: a failed publish is logged and its
+		// snapshot restored, and the next interval publishes again.
+		this.publishChain = run.catch((): undefined => undefined)
+		return run
+	}
+
+	/**
+	 * Publishes one interval's traffic, as the exact request
+	 * trafficMetricRequest builds - the same module cdk/StreamingStack.spec.ts
+	 * cross-checks the stack's alarms against, so a namespace, metric name or
+	 * dimension that drifts here fails that test rather than arming a dead
+	 * alarm.
+	 *
+	 * The snapshot is taken and the counters cleared BEFORE the request is
+	 * awaited: bytes that arrive while the request is in flight belong to the
+	 * next interval, and clearing after the await would erase them - they were
+	 * never in the submitted request, and a slow or overlapping publish would
+	 * silently under-report traffic, which suppresses the alarms that exist to
+	 * see it. On failure the snapshot is restored instead, so a lost request
+	 * costs the traffic a delay in the metric rather than the metric the
+	 * traffic.
+	 */
+	private async publishNow(): Promise<void> {
 		if (this.client === undefined) return
-		const now = new Date()
+		const at = new Date()
+		const samples: TransportTrafficSample[] = [...this.received.entries()].map(
+			([transport, bytes]) => ({
+				transport,
+				bytes,
+				serving: (this.serving.get(transport) ?? false) ? 1 : 0,
+				at,
+			}),
+		)
+		for (const [transport] of this.received) this.received.set(transport, 0)
 		try {
 			await this.client.send(
-				new PutMetricDataCommand({
-					Namespace: this.namespace,
-					MetricData: [...this.received.entries()].flatMap(
-						([transport, bytes]) => [
-							{
-								MetricName: RECEIVED_BYTES_METRIC,
-								Dimensions: [{ Name: TRANSPORT_DIMENSION, Value: transport }],
-								Timestamp: now,
-								Value: bytes,
-								Unit: 'Bytes',
-							},
-							{
-								MetricName: SERVING_METRIC,
-								Dimensions: [{ Name: TRANSPORT_DIMENSION, Value: transport }],
-								Timestamp: now,
-								Value: (this.serving.get(transport) ?? false) ? 1 : 0,
-								Unit: 'None',
-							},
-						],
-					),
-				}),
+				new PutMetricDataCommand(trafficMetricRequest(samples, this.stackName)),
 			)
 			this.publishCount++
-			// Zero the received counters after every publish, so each datapoint is the
-			// bytes of its own interval and the alarm's Sum is that interval's traffic.
-			for (const [transport] of this.received) this.received.set(transport, 0)
 		} catch (err) {
+			for (const { transport, bytes } of samples) {
+				if (bytes > 0) {
+					this.received.set(
+						transport,
+						(this.received.get(transport) ?? 0) + bytes,
+					)
+				}
+			}
 			// Best effort by design, but a metric that silently never publishes makes
 			// the alarms watch nothing, so it is logged and counted.
 			this.logger.error(
