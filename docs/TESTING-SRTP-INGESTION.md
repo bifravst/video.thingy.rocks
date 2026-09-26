@@ -50,6 +50,11 @@ attempts and how this design handles each.
   starts a clean index space.
 - A wrong or missing floor costs the candidates spent on failed trials - video
   resumes at the sender's next keyframe.
+- The floor write itself is best effort by design: production is never stopped
+  over it. The honest cost of a write that fails is a bounded replay window -
+  after a restart, datagrams already accepted above the stale persisted floor
+  authenticate again until the floor catches up (the write is monotonic, so it
+  converges on the next successful report).
 
 ## Provisioning a port key
 
@@ -67,6 +72,16 @@ deploy).
 
 ## Sending a test stream
 
+The reference sender (`scripts/stream-testsrc-to-srtp.py`) needs the local
+GStreamer stack it drives (checked with its own
+`./scripts/stream-testsrc-to-srtp.py --check`, which names anything missing):
+
+```bash
+sudo apt install python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-plugins-base gstreamer1.0-plugins-ugly gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
+```
+
+Then:
+
 ```bash
 openssl rand -hex 30 > /tmp/key
 STACK_NAME=<stack> ./scripts/provision-srtp-key.sh 6000 42 < /tmp/key
@@ -83,11 +98,15 @@ The e2e suite (`backend/e2e/`) is the acceptance test: it runs against the
 deployed stack, uses its own real H.264 fixture (a 1-second-GOP x264 stream),
 its own RFC 3711 sender with **arbitrary initial rollover counter and sequence
 number**, and asserts on the stack's own observables - the KVS `PutMedia`
-metric, `GetMedia` fragments read back, the application log, and the lock table.
+metric, `GetMedia` fragments read back, the application log, the per-transport
+traffic metrics, and the lock table.
+
+The stack it runs against is named, never guessed: pass the deployed stack's
+name unless it is the default one.
 
 ```bash
 cd backend
-npm run test:e2e
+STREAMING_STACK_NAME=<stack> npm run test:e2e
 # one case: npm run test:e2e -- --only wrap
 ```
 
@@ -103,17 +122,18 @@ started, and a port's helper actually reaching `searching` — and fails fast wi
 the reason if they do not, before any case runs. It needs the fleet's instances
 reachable through SSM (the instance role already has it). Ports and cases:
 
-| Port        | Case             | What it proves                                                                                                                |
-| ----------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| 6000        | happy path       | Real media reaches Kinesis and `GetMedia` reads it back; the lock is taken while producing and released when the sender stops |
-| 6001        | wrong key        | Unauthenticated traffic never acquires the lock and never ingests                                                             |
-| 6002        | forged flood     | Correct public header + random tags earn nothing, forever                                                                     |
-| 6003        | wrap             | A stream that crosses a rollover keeps ingesting and reports it                                                               |
-| 6004        | hint climb       | A fresh key below the old floor's rollover is found (a search that only climbed would never find it)                          |
-| 6005        | rewind           | The same key restarting its index is refused and reported as stale drops                                                      |
-| 6006        | restart recovery | The backend restarts under a live sender and the stream recovers with media                                                   |
-| 6007        | fresh key        | Rotation restarts the index space cleanly, confirmed on trial 1                                                               |
-| 6008 + 5000 | isolation        | SRTP noise on one port while the unencrypted path keeps ingesting undisturbed                                                 |
+| Port        | Case               | What it proves                                                                                                                                                                                         |
+| ----------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 6000        | happy path         | Real media reaches Kinesis and `GetMedia` reads it back; the lock is taken while producing and released when the sender stops; the transport publishes the serving and traffic metrics the alarms read |
+| 6001        | wrong key          | Unauthenticated traffic never acquires the lock and never ingests                                                                                                                                      |
+| 6002        | forged flood       | Correct public header + random tags earn nothing, forever                                                                                                                                              |
+| 6003        | wrap               | A stream crossing rollover 65536 - the upper end of the 48-bit index space - keeps ingesting and reports it                                                                                            |
+| 6004        | key rotation       | A rotated key starts a new index space below the old floor's rollover: the floor is scoped to the key identity, not the port                                                                           |
+| 6005        | rewind             | The same key restarting its index is refused and reported as stale drops                                                                                                                               |
+| 6006        | restart recovery   | The backend restarts under a live sender and the stream recovers with media, asserted from the restarted process's own boot                                                                            |
+| 6007        | fresh key          | Rotation restarts the index space cleanly, confirmed on trial 1                                                                                                                                        |
+| 6008 + 5000 | isolation          | SRTP noise on one port while the unencrypted path keeps ingesting undisturbed                                                                                                                          |
+| 6009        | walked-past search | Traffic that cannot authenticate walks the counter search past the answer, and the real sender is still found through the re-sweep                                                                     |
 
 ## Recovery and troubleshooting
 
