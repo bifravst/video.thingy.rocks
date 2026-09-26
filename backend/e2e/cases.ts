@@ -262,21 +262,23 @@ export const cases: E2eCase[] = [
 			return { keyHex }
 		},
 		run: async (ctx: CaseContext, key: { keyHex: string }): Promise<void> => {
-			// Two rollovers below the top of the 32-bit rollover space, crossing
-			// 65536 - the upper end of the 48-bit packet index - within the first
-			// seconds: the floor row this case seeds carries an index at 65534 *
-			// 65536, which no 32-bit arithmetic in the receiver can afford to
-			// misread. Only a synthetic sender can sit here at all.
+			// One rollover below 65536, crossing it - the upper end of the 48-bit
+			// packet index space - within the first seconds: the first sequence
+			// wrap of a 15 fps stream is ~9 s away, and the one after that a full
+			// 65536 packets (~72 min) later, so the case has to sit at 65535 to
+			// see the crossing at all. The floor row it seeds carries an index at
+			// 65535 * 65536, which no 32-bit arithmetic in the receiver can afford
+			// to misread. Only a synthetic sender can sit here at all.
 			await seedSrtpIndexFloor(ctx.config.region, ctx.config.tableName, 6003, {
 				keyHex: key.keyHex,
 				ssrc: 1013,
-				roc: 65534,
+				roc: 65535,
 			})
 			await restartBackend(ctx.config.region, ctx.instances, ctx.codeBucket)
 
 			const since = new Date()
 			const sender = makeSender(ctx.config, 6003, 1013, key.keyHex, {
-				roc: 65534,
+				roc: 65535,
 				seq: 65400,
 				durationS: 45,
 			})
@@ -309,7 +311,7 @@ export const cases: E2eCase[] = [
 			)
 			assert.ok(
 				rollovers.length > 0,
-				'the wrap past the 32-bit rollover space must be reported as a rollover to 65536',
+				'the wrap to rollover 65536 - the point where the 48-bit packet index leaves the 32-bit range - must be reported',
 			)
 		},
 	},
