@@ -19,6 +19,7 @@ import {
 } from '@aws-sdk/client-kinesis-video-media'
 import {
 	GetCommandInvocationCommand,
+	GetParameterCommand,
 	PutParameterCommand,
 	SendCommandCommand,
 	SSMClient,
@@ -268,15 +269,68 @@ export const codeBucketFor = async (
 }
 
 /**
+ * The next generation for a port's key, from the one its parameter holds.
+ *
+ * Strictly larger than every generation the port has been provisioned with
+ * before, whatever the clock says. Unix seconds were the first attempt and
+ * were not monotonic: two provisions of the same port within one second got
+ * equal generations, and the replay floor's rotation fence - which requires a
+ * strictly newer generation before a different key may replace the row's
+ * identity - then rejected every floor write of the newer key, silently
+ * leaving it without persisted replay protection.
+ *
+ * The `unixSeconds` floor heals a deleted generation parameter: a value below
+ * floor rows already written would fence the next key out of its own floor
+ * row forever, so the next generation is never below the current time even
+ * when the parameter reads as absent.
+ */
+export const nextGeneration = (current: number, unixSeconds: number): number =>
+	Math.max(current + 1, unixSeconds)
+
+/**
+ * Reads a port's generation parameter and returns the next one, writing it
+ * back before the key parameter is provisioned: a run that fails between the
+ * two leaves the counter advanced (a skipped generation is harmless; a
+ * repeated one is the collision above).
+ */
+const nextPortGeneration = async (
+	ssm: SSMClient,
+	name: string,
+): Promise<number> => {
+	let current = 0
+	try {
+		const existing = await ssm.send(new GetParameterCommand({ Name: name }))
+		const value = Number(existing.Parameter?.Value)
+		if (Number.isInteger(value) && value >= 0) current = value
+		else throw new Error(`${name} does not hold a non-negative integer`)
+	} catch (error) {
+		// The first provisioning of this port has no parameter yet; anything
+		// else is a real failure and must not be provisioned past.
+		if (error instanceof Error && error.name !== 'ParameterNotFound')
+			throw error
+	}
+	const next = nextGeneration(current, Math.floor(Date.now() / 1000))
+	await ssm.send(
+		new PutParameterCommand({
+			Name: name,
+			Type: 'String',
+			Overwrite: true,
+			Value: String(next),
+		}),
+	)
+	return next
+}
+
+/**
  * Provisions one port's key as a SecureString, exactly as the ops script does:
  * no KeyId, so the parameter is encrypted under the AWS-managed aws/ssm key,
  * which the instance role can read without a KMS grant. The value shape is the
  * one SrtpKeyStore validates.
  *
- * The generation is the provisioning time in unix seconds, like the script's:
- * every re-provision of the same port (the rotation cases do this) is strictly
- * newer than the one before it, which the replay floor's rotation fence
- * requires.
+ * The generation is bumped per port the same way the script does it - a
+ * read-modify-write counter, strictly newer than the last one - which the
+ * rotation cases' re-provisioning and the replay floor's rotation fence both
+ * depend on (see nextGeneration).
  */
 export const provisionKey = async (
 	region: string,
@@ -288,6 +342,13 @@ export const provisionKey = async (
 		options.keyHex ??
 		(await import('node:crypto')).randomBytes(30).toString('hex')
 	const ssm = new SSMClient({ region })
+	// The generation counter first, the key second: a failure in between only
+	// skips a generation, which is harmless, while the reverse order could
+	// repeat one across two different keys.
+	const generation = await nextPortGeneration(
+		ssm,
+		`/${stackName}/srtp/port/${String(port)}/generation`,
+	)
 	await ssm.send(
 		new PutParameterCommand({
 			Name: `/${stackName}/srtp/port/${String(port)}/key`,
@@ -298,7 +359,7 @@ export const provisionKey = async (
 				ssrc: options.ssrc,
 				cipher: 'aes-128-icm',
 				auth: 'hmac-sha1-80',
-				generation: Math.floor(Date.now() / 1000),
+				generation,
 			}),
 		}),
 	)
@@ -614,6 +675,38 @@ export const lockRow = async (
 }
 
 /**
+ * Waits until a port's floor row names the given key's fingerprint: the proof a
+ * rotation actually persists its floor.
+ *
+ * The rotation fence's failure mode is silent otherwise - a rotated key that
+ * cannot write its floor still ingests (a floor it cannot read means the same
+ * as no floor: the search starts from zero) and confirms on trial 1, so every
+ * other assertion in the rotation cases passes with the fence broken. The row
+ * itself is the only observable of the fence.
+ */
+export const waitForSrtpIndexFloorFor = async (
+	region: string,
+	tableName: string,
+	port: number,
+	keyHex: string,
+	timeoutMs = 60_000,
+): Promise<Record<string, unknown>> => {
+	const { keyFingerprint } = await import('../src/SrtpKeyStore.ts')
+	const fingerprint = keyFingerprint(keyHex)
+	const deadline = Date.now() + timeoutMs
+	for (;;) {
+		const row = await lockRow(region, tableName, port)
+		if (row?.srtpIndexKeyFingerprint === fingerprint) return row
+		if (Date.now() > deadline) {
+			throw new Error(
+				`the replay floor of port ${String(port)} was never persisted under the rotated key (row: ${JSON.stringify(row)})`,
+			)
+		}
+		await sleep(5_000)
+	}
+}
+
+/**
  * The per-transport traffic metrics the backend publishes and the stack's
  * zero-ingestion alarms read - asserted here against the deployed system, in
  * the namespace the stack itself derives (the same module both sides import).
@@ -780,10 +873,20 @@ export const restartBackend = async (
 /**
  * Proves media came back, not just a metric: KVS GetMedia returns the fragments
  * themselves.
+ *
+ * The start selector is tied to the case's start, not to the beginning of the
+ * stream's retention: EARLIEST replays everything the stream ever retained, so
+ * on a reused stream a previous run's fragments would satisfy this read and
+ * the assertion would prove nothing about this run's upload. The server
+ * timestamp is the moment KVS received the fragment - it does not depend on
+ * the producer's timestamp discipline - and the margin covers the skew
+ * between this clock and KVS's (the previous suite run on the same streams is
+ * minutes away, far beyond it).
  */
 export const readMedia = async (
 	region: string,
 	streamName: string,
+	since: Date,
 ): Promise<number> => {
 	const kv = new KinesisVideoClient({ region })
 	const endpoint = await kv.send(
@@ -800,7 +903,10 @@ export const readMedia = async (
 	const result = await media.send(
 		new GetMediaCommand({
 			StreamName: streamName,
-			StartSelector: { StartSelectorType: 'EARLIEST' },
+			StartSelector: {
+				StartSelectorType: 'SERVER_TIMESTAMP',
+				StartTimestamp: new Date(since.getTime() - 30_000),
+			},
 		}),
 	)
 	const payload = result.Payload
