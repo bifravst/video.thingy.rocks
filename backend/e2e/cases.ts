@@ -8,8 +8,11 @@ import {
 	provisionKey,
 	readMedia,
 	restartBackend,
+	seedSrtpIndexFloor,
+	waitForLogEvents,
 	waitForLogLines,
 	waitForStreamIngestion,
+	waitForTransportMetrics,
 } from './stack.ts'
 
 /**
@@ -17,12 +20,13 @@ import {
  *
  * Every case gets its own SRTP port and its own freshly provisioned key, so
  * nothing one case does can disturb another's floor, and every case asserts on
- * the deployed system's own observables: the KVS metric, the application log,
- * the lock table, and - where it matters most - media read back out of Kinesis.
+ * the deployed system's own observables: the KVS metric, the per-transport
+ * traffic metrics, the application log, the lock table, and - where it matters
+ * most - media read back out of Kinesis.
  *
  * Ports: 6000 happy path, 6001 wrong key, 6002 forged flood, 6003 wrap,
- * 6004 hint climb, 6005 rewind, 6006 restart recovery, 6007 fresh key,
- * 6008 isolation noise (plus unencrypted 5000).
+ * 6004 key rotation, 6005 rewind, 6006 restart recovery, 6007 fresh key,
+ * 6008 isolation noise (plus unencrypted 5000), 6009 walked-past search.
  */
 
 export type CaseContext = {
@@ -76,6 +80,8 @@ const makeSender = (
 		seq?: number
 		timestamp?: number
 		durationS?: number
+		/** Default 15; wrong-key noise runs faster to walk the counter search. */
+		fps?: number
 	},
 ): E2eSender =>
 	new E2eSender({
@@ -84,7 +90,7 @@ const makeSender = (
 		keyHex,
 		ssrc,
 		...options,
-		fps: 15,
+		fps: options.fps ?? 15,
 	})
 
 export const cases: E2eCase[] = [
@@ -131,6 +137,17 @@ export const cases: E2eCase[] = [
 				mediaBytes > 0,
 				'GetMedia must return fragments for the ingested stream',
 			)
+
+			// The per-transport metrics the zero-ingestion alarms read are the
+			// stack's own observables too: the deployed publisher must be showing
+			// the transport as serving with real traffic on it, in the namespace
+			// the alarms query - a publisher that drifted from what the alarms
+			// expect watches nothing, which reads as "no traffic" and never fires.
+			step('waiting for the transport metrics the alarms read')
+			await waitForTransportMetrics(ctx.config.region, ctx.config.stackName, {
+				transport: 'srtp',
+				since,
+			})
 
 			// The lock went back once the sender stopped (auth loss releases it).
 			step('waiting 20s for the lock to be released after the sender stopped')
@@ -245,18 +262,40 @@ export const cases: E2eCase[] = [
 			return { keyHex }
 		},
 		run: async (ctx: CaseContext, key: { keyHex: string }): Promise<void> => {
+			// Two rollovers below the top of the 32-bit rollover space, crossing
+			// 65536 - the upper end of the 48-bit packet index - within the first
+			// seconds: the floor row this case seeds carries an index at 65534 *
+			// 65536, which no 32-bit arithmetic in the receiver can afford to
+			// misread. Only a synthetic sender can sit here at all.
+			await seedSrtpIndexFloor(ctx.config.region, ctx.config.tableName, 6003, {
+				keyHex: key.keyHex,
+				ssrc: 1013,
+				roc: 65534,
+			})
+			await restartBackend(ctx.config.region, ctx.instances, ctx.codeBucket)
+
 			const since = new Date()
-			// Two rollovers up, crossing the third within the first second: only a
-			// synthetic sender can sit here, and it is exactly the state a receiver
-			// restart used to lose.
 			const sender = makeSender(ctx.config, 6003, 1013, key.keyHex, {
-				roc: 2,
+				roc: 65534,
 				seq: 65400,
 				durationS: 45,
 			})
 			await streamFor(sender, 45)
 			step('streamed for 45s; now waiting on logs, metrics and media')
 
+			// Confirmed straight at the seeded floor's rollover - a 48-bit floor
+			// must not cost the search its first trial - and ingesting.
+			const lines = await waitForLogLines(
+				ctx.config.region,
+				ctx.config.logGroup,
+				`SRTP traffic authenticated.*"port":6003`,
+				since,
+			)
+			assert.ok(lines.length > 0, 'the authentication must be in the log')
+			assert.ok(
+				lines.some((line) => line.includes('"trials":1')),
+				"a stream at the floor's own rollover must confirm on the first trial",
+			)
 			await waitForStreamIngestion(
 				ctx.config.region,
 				streamNameFor(ctx.config, 6003),
@@ -265,17 +304,17 @@ export const cases: E2eCase[] = [
 			const rollovers = await waitForLogLines(
 				ctx.config.region,
 				ctx.config.logGroup,
-				`SRTP rollover.*"port":6003.*"roc":3`,
+				`SRTP rollover.*"port":6003.*"roc":65536`,
 				since,
 			)
 			assert.ok(
 				rollovers.length > 0,
-				'the wrap must be reported as a rollover to 3',
+				'the wrap past the 32-bit rollover space must be reported as a rollover to 65536',
 			)
 		},
 	},
 	{
-		name: 'a fresh key below the old floor is found (the too-high hint)',
+		name: 'a rotated key starts a new index space below the old floor',
 		port: 6004,
 		ssrc: 1014,
 		provision: async (
@@ -300,9 +339,13 @@ export const cases: E2eCase[] = [
 				since,
 			)
 
-			// A fresh key starts a new floor from zero. The sender restarts at
-			// ROC 1 - BELOW where the old floor was. An ascending-only search
-			// would never find this; the near climb has to come back down.
+			// What this proves: the floor is scoped to the key's identity, not to
+			// the port. A fresh key has a fresh fingerprint, so the old floor is
+			// not its floor - the search starts at zero and finds a sender below
+			// where the old floor was. An implementation that keyed the floor by
+			// port alone would hold the sender at ROC 5 and refuse everything
+			// below it as a rewind. (The search returning to a walked-past
+			// counter is a different behavior, proved by the 6009 case.)
 			const freshKey = await provisionKey(
 				ctx.config.region,
 				ctx.config.stackName,
@@ -398,7 +441,7 @@ export const cases: E2eCase[] = [
 			return { keyHex }
 		},
 		run: async (ctx: CaseContext, key: { keyHex: string }): Promise<void> => {
-			let since = new Date()
+			const since = new Date()
 			// Two rollovers up: after the restart the floor points there, so the
 			// fresh helper must find a counter that is not zero.
 			let sender = makeSender(ctx.config, 6006, 1016, key.keyHex, {
@@ -414,33 +457,51 @@ export const cases: E2eCase[] = [
 			)
 
 			// The sender keeps counting while the receiver restarts beneath it.
-			since = new Date()
 			sender = makeSender(ctx.config, 6006, 1016, key.keyHex, {
 				roc: sender.currentState.roc,
 				seq: sender.currentState.seq,
 				timestamp: sender.currentState.timestamp,
-				durationS: 90,
+				durationS: 150,
 			})
 			const streaming = sender.run()
 			await new Promise((resolve) => setTimeout(resolve, 5_000))
+			const restartSince = new Date()
 			await restartBackend(ctx.config.region, ctx.instances, ctx.codeBucket)
-			await new Promise((resolve) => setTimeout(resolve, 10_000))
+
+			// Anchor both assertions to the restarted process, not to the clock:
+			// the old process authenticated this very sender during the five
+			// seconds before the restart, so a window taken from wall-clock
+			// `since` can match the OLD process's lines and the pre-restart
+			// media, and the case can pass without proving any recovery at all.
+			// The boot line is the one line only the new process writes.
+			step('waiting for the restarted service to come up (its own boot line)')
+			const boots = await waitForLogEvents(
+				ctx.config.region,
+				ctx.config.logGroup,
+				'SRTP transport started',
+				restartSince,
+				300_000,
+			)
+			const postRestart = boots[boots.length - 1]?.timestamp as Date
 
 			// Re-authenticated after the restart (a new first authentication for
-			// the port, in this process's lifetime) and media resumed.
+			// the port, in this process's lifetime) and media resumed. The
+			// ingestion window is ceiling-aligned: only bytes in minutes after
+			// the boot count, never the pre-restart minute's earlier upload.
 			const lines = await waitForLogLines(
 				ctx.config.region,
 				ctx.config.logGroup,
 				`SRTP traffic authenticated.*"port":6006`,
-				since,
+				postRestart,
 				240_000,
 			)
 			assert.ok(lines.length > 0)
 			await waitForStreamIngestion(
 				ctx.config.region,
 				streamNameFor(ctx.config, 6006),
-				since,
+				postRestart,
 				240_000,
+				'next',
 			)
 			sender.stop()
 			await streaming
@@ -598,6 +659,103 @@ export const cases: E2eCase[] = [
 			} finally {
 				if (ffmpeg.exitCode === null) ffmpeg.kill('SIGKILL')
 				assert.equal(ffmpeg.exitCode, 0, ffmpegErr)
+			}
+		},
+	},
+	{
+		name: 'the search recovers after traffic walks it past the answer',
+		port: 6009,
+		ssrc: 1019,
+		provision: async (
+			region: string,
+			stackName: string,
+		): Promise<{ keyHex: string }> => {
+			const keyHex = await provisionKey(region, stackName, 6009, { ssrc: 1019 })
+			return { keyHex }
+		},
+		run: async (ctx: CaseContext, key: { keyHex: string }): Promise<void> => {
+			// The scenario the search's re-sweep exists for: traffic that cannot
+			// authenticate - a sender holding a stale key, an attacker, another
+			// test run against the same port - advances the climbing search one
+			// candidate per few drops, and once the climb has passed the real
+			// counter, only the periodic re-sweep of the counters just above the
+			// floor reaches it again. A search that only ever climbed would never
+			// come back down, and the port would stay bound but unable to ingest
+			// for as long as the wrong-key traffic kept arriving.
+			//
+			// Phase one establishes the floor the search anchors to.
+			let since = new Date()
+			const establish = makeSender(ctx.config, 6009, 1019, key.keyHex, {
+				roc: 7,
+				durationS: 20,
+			})
+			await streamFor(establish, 20)
+			step('streamed for 20s to establish the floor at rollover 7')
+			await waitForStreamIngestion(
+				ctx.config.region,
+				streamNameFor(ctx.config, 6009),
+				since,
+			)
+
+			// Phase two: wrong-key noise, fast enough to walk the search through
+			// more than a full candidate cycle. The search re-offers the floor and
+			// re-sweeps the counters just above it once every `floor-every`
+			// candidates (512 by default, about 34s of 60 fps traffic that never
+			// authenticates); the noise phase spans two of those cycles.
+			since = new Date()
+			const wrongKey = key.keyHex.slice(0, 58) + 'ff'
+			const noise = makeSender(ctx.config, 6009, 1019, wrongKey, {
+				roc: 0,
+				durationS: 240,
+				fps: 60,
+			})
+			const noiseRun = noise.run()
+			await new Promise((resolve) => setTimeout(resolve, 90_000))
+			step(
+				'noise has walked the search past the answer; starting the real sender',
+			)
+
+			// Phase three: the real sender returns at rollover 12, a counter the
+			// climb passed within the first seconds of the noise - five above the
+			// floor, inside the re-sweep window, unreachable by any climb. The
+			// noise keeps running, because it is what keeps the trials advancing;
+			// both stop once the authentication is in the log.
+			const sender = makeSender(ctx.config, 6009, 1019, key.keyHex, {
+				roc: 12,
+				durationS: 150,
+			})
+			const senderRun = sender.run()
+			try {
+				const lines = await waitForLogLines(
+					ctx.config.region,
+					ctx.config.logGroup,
+					`SRTP traffic authenticated.*"port":6009`,
+					since,
+					240_000,
+				)
+				assert.ok(lines.length > 0, 'the walked-past sender must be found')
+				// The trial count is the proof the search actually came back
+				// down rather than climbing into the answer by luck: the counter
+				// sits inside the re-sweep band, and the only way back to it is
+				// past a full candidate cycle, so the confirmation must carry
+				// more than one cycle's worth of trials.
+				const trials = lines
+					.map((line) => /"trials":(\d+)/.exec(line)?.[1])
+					.map((match) => (match === undefined ? 0 : Number(match)))
+					.reduce((max, n) => Math.max(max, n), 0)
+				assert.ok(
+					trials > 512,
+					`the confirmation must come after a full candidate cycle was walked (trials: ${String(trials)})`,
+				)
+				await waitForStreamIngestion(
+					ctx.config.region,
+					streamNameFor(ctx.config, 6009),
+					since,
+				)
+			} finally {
+				sender.stop()
+				noise.stop()
+				await Promise.all([senderRun, noiseRun])
 			}
 		},
 	},

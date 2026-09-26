@@ -272,6 +272,11 @@ export const codeBucketFor = async (
  * no KeyId, so the parameter is encrypted under the AWS-managed aws/ssm key,
  * which the instance role can read without a KMS grant. The value shape is the
  * one SrtpKeyStore validates.
+ *
+ * The generation is the provisioning time in unix seconds, like the script's:
+ * every re-provision of the same port (the rotation cases do this) is strictly
+ * newer than the one before it, which the replay floor's rotation fence
+ * requires.
  */
 export const provisionKey = async (
 	region: string,
@@ -293,10 +298,51 @@ export const provisionKey = async (
 				ssrc: options.ssrc,
 				cipher: 'aes-128-icm',
 				auth: 'hmac-sha1-80',
+				generation: Math.floor(Date.now() / 1000),
 			}),
 		}),
 	)
 	return keyHex
+}
+
+/**
+ * Seeds a port's replay-floor row directly, as if traffic under that key had
+ * already been accepted up to the given rollover counter.
+ *
+ * The floor is the receiver's only accelerator, and some states a real sender
+ * cannot reach from zero in bounded time - a rollover counter in the upper
+ * 48-bit index space the search would need hours to climb to, or a floor the
+ * search has been walked past - are only reachable by injecting the row the
+ * way the receiver itself would have persisted it. The identity fields are
+ * derived from the provisioned key, exactly as the receiver computes them, so
+ * the row is indistinguishable from one it wrote itself.
+ *
+ * The whole item is replaced, which is what the receiver's own writes do
+ * modulo the lock fields: lock acquisition and floor raising are both
+ * conditional updates on this row, so a seeded item without lock fields simply
+ * reads as "no floor was persisted and nobody holds the lock".
+ */
+export const seedSrtpIndexFloor = async (
+	region: string,
+	tableName: string,
+	port: number,
+	options: { keyHex: string; ssrc: number; roc: number },
+): Promise<void> => {
+	const { keyFingerprint } = await import('../src/SrtpKeyStore.ts')
+	const doc = DynamoDBDocumentClient.from(new DynamoDBClient({ region }))
+	await doc.send(
+		new PutCommand({
+			TableName: tableName,
+			Item: {
+				port,
+				// Sequence zero of that rollover: the base the receiver's own
+				// floor math extracts from it is the roc itself.
+				srtpIndex: options.roc * 65_536,
+				srtpIndexSsrc: options.ssrc,
+				srtpIndexKeyFingerprint: keyFingerprint(options.keyHex),
+			},
+		}),
+	)
 }
 
 /**
@@ -356,18 +402,25 @@ const periodBoundaryElapsed = (from: Date): boolean =>
  * Waits until the KVS stream received media after `since`, using the metric the
  * alarms use. This is the e2e definition of "it works": bytes reached Kinesis.
  *
- * The window is floored to the minute `since` falls in (see
+ * The window is floored to the minute `since` falls in by default (see
  * containingPeriodBoundary): the stream's own minute bucket is the one its
- * bytes are most likely all in.
+ * bytes are most likely all in. `align: 'next'` ceilings instead, for the one
+ * wait that must not count bytes uploaded before `since` - the restart
+ * recovery's, whose whole point is that only the restarted process's media
+ * counts as proof.
  */
 export const waitForStreamIngestion = async (
 	region: string,
 	streamName: string,
 	since: Date,
 	timeoutMs = 240_000,
+	align: 'containing' | 'next' = 'containing',
 ): Promise<number> => {
 	const cw = new CloudWatchClient({ region })
-	const from = containingPeriodBoundary(since)
+	const from =
+		align === 'next'
+			? nextPeriodBoundary(since)
+			: containingPeriodBoundary(since)
 	const deadline = Date.now() + timeoutMs
 	for (;;) {
 		// CloudWatch rejects StartTime >= EndTime with a 400, so a poll is only
@@ -471,6 +524,32 @@ export const waitForLogLines = async (
 	since: Date,
 	timeoutMs = 120_000,
 ): Promise<string[]> => {
+	const events = await waitForLogEvents(
+		region,
+		logGroup,
+		filter,
+		since,
+		timeoutMs,
+	)
+	return events.map((event) => event.message)
+}
+
+/**
+ * waitForLogLines, but returning each event's own timestamp.
+ *
+ * A window that starts "now" can contain activity from a process that is about
+ * to be replaced: the only boundary that is the new process's alone is the
+ * timestamp of a line only it writes (its boot line), so a case that must prove
+ * recovery anchors its windows to that timestamp instead of to a wall clock
+ * taken before the restart.
+ */
+export const waitForLogEvents = async (
+	region: string,
+	logGroup: string,
+	filter: string,
+	since: Date,
+	timeoutMs = 120_000,
+): Promise<{ message: string; timestamp: Date }[]> => {
 	const logs = new CloudWatchLogsClient({ region })
 	const deadline = Date.now() + timeoutMs
 	for (;;) {
@@ -479,7 +558,7 @@ export const waitForLogLines = async (
 				logGroupName: logGroup,
 				startTime: Math.floor(since.getTime() / 1000),
 				endTime: Math.floor(Date.now() / 1000) + 1,
-				queryString: `fields @message | filter @message like /${filter}/ | sort @timestamp asc`,
+				queryString: `fields @message, @timestamp | filter @message like /${filter}/ | sort @timestamp asc`,
 			}),
 		)
 		assert.ok(started.queryId !== undefined, 'no query id')
@@ -489,15 +568,21 @@ export const waitForLogLines = async (
 				new GetQueryResultsCommand({ queryId: started.queryId }),
 			)
 			if (results.status === 'Running') continue
-			// Only the @message field: CloudWatch also returns @ptr (a base64 event
-			// pointer) and @timestamp per row, which are not log lines and would
-			// make every second returned "line" garbage.
-			const lines = (results.results ?? [])
-				.flatMap((row) =>
-					row.filter((f) => f.field === '@message').map((f) => f.value ?? ''),
+			// Only @message and @timestamp: @ptr is a base64 event pointer, not a
+			// log line, and would make the result garbage.
+			const events: { message: string; timestamp: Date }[] = []
+			for (const row of results.results ?? []) {
+				const message = row.find((f) => f.field === '@message')?.value ?? ''
+				const stamp = row.find((f) => f.field === '@timestamp')?.value
+				if (message.length === 0 || stamp === undefined) continue
+				const timestamp = new Date(stamp)
+				assert.ok(
+					!Number.isNaN(timestamp.getTime()),
+					`CloudWatch returned a timestamp it cannot parse: ${stamp}`,
 				)
-				.filter((v) => v.length > 0)
-			if (lines.length > 0) return lines
+				events.push({ message, timestamp })
+			}
+			if (events.length > 0) return events
 			// The query completed with nothing: either the events have not been
 			// indexed yet, or they truly are not there. Re-query until the deadline,
 			// with a fresh end time so events that arrived meanwhile are in scope.
@@ -526,6 +611,85 @@ export const lockRow = async (
 		}),
 	)
 	return result.Item
+}
+
+/**
+ * The per-transport traffic metrics the backend publishes and the stack's
+ * zero-ingestion alarms read - asserted here against the deployed system, in
+ * the namespace the stack itself derives (the same module both sides import).
+ *
+ * This is the e2e half of the contract the CDK spec checks at synth time: it
+ * proves the deployed publisher emits what the alarms actually query, not only
+ * that the two sides' constants agree on paper.
+ */
+export const waitForTransportMetrics = async (
+	region: string,
+	stackName: string,
+	options: {
+		/** The transport dimension value, e.g. 'srtp'. */
+		transport: string
+		/** Waits for `TransportServing` to report this (default 1). */
+		serving?: number
+		/** Waits for `ReceivedBytes` to sum to at least this (default 1). */
+		bytesAtLeast?: number
+		since: Date
+		timeoutMs?: number
+	},
+): Promise<void> => {
+	const {
+		SERVING_METRIC,
+		RECEIVED_BYTES_METRIC,
+		TRANSPORT_DIMENSION,
+		trafficMetricNamespace,
+	} = await import('../src/TrafficMetricNames.ts')
+	const cw = new CloudWatchClient({ region })
+	const namespace = trafficMetricNamespace(stackName)
+	const dimension = [{ Name: TRANSPORT_DIMENSION, Value: options.transport }]
+	const deadline = Date.now() + (options.timeoutMs ?? 240_000)
+	const wantedServing = options.serving ?? 1
+	const wantedBytes = options.bytesAtLeast ?? 1
+	// Both metrics are published per minute per instance; the first full minute
+	// of data needs the same patience the KVS metric does.
+	for (;;) {
+		const from = nextPeriodBoundary(options.since)
+		const end = new Date()
+		if (periodBoundaryElapsed(from) && end > from) {
+			const query = async (
+				metricName: string,
+				statistic: 'Sum' | 'Minimum',
+			): Promise<number> => {
+				const stats = await cw.send(
+					new GetMetricStatisticsCommand({
+						Namespace: namespace,
+						MetricName: metricName,
+						Dimensions: dimension,
+						StartTime: from,
+						EndTime: end,
+						Period: 60,
+						Statistics: [statistic],
+					}),
+				)
+				return (stats.Datapoints ?? []).reduce(
+					(sum, d) =>
+						statistic === 'Sum'
+							? sum + (d.Sum ?? 0)
+							: Math.min(sum, d.Minimum ?? 1),
+					statistic === 'Sum' ? 0 : Number.POSITIVE_INFINITY,
+				)
+			}
+			const [serving, bytes] = await Promise.all([
+				query(SERVING_METRIC, 'Minimum'),
+				query(RECEIVED_BYTES_METRIC, 'Sum'),
+			])
+			if (serving === wantedServing && bytes >= wantedBytes) return
+			if (Date.now() > deadline) {
+				throw new Error(
+					`the traffic metrics for ${options.transport} never showed serving=${String(wantedServing)} with >=${String(wantedBytes)} bytes since ${from.toISOString()} (last saw serving=${String(serving)}, bytes=${String(bytes)}) - either the publisher is not publishing what the alarms read, or the transport is not serving`,
+				)
+			}
+		}
+		await sleep(15_000)
+	}
 }
 
 /**

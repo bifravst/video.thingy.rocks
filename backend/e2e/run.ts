@@ -44,7 +44,9 @@ const log = (message: string): void => {
  * drained the event loop and Node exited 0 silently with cases still unrun -
  * a clean exit code that looks like success. Nothing else runs after the
  * summary on a successful run, so if the loop ever empties before that, it is
- * the same bug again and must be visible rather than silent.
+ * the same bug again and must be visible rather than silent - including to
+ * whatever automation reads the exit code, which is why this fails the run
+ * and not only says so on the console.
  */
 let suiteDone = false
 process.on('beforeExit', (code) => {
@@ -52,6 +54,7 @@ process.on('beforeExit', (code) => {
 	console.error(
 		`[e2e] the event loop drained with the suite unfinished (exit code ${String(code)}): an await never settled, which is a bug in the suite, not a pass. The last line above is where it stopped.`,
 	)
+	process.exitCode = 1
 })
 
 const main = async (): Promise<void> => {
