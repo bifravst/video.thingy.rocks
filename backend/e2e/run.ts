@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { parseOnlyFilter } from './args.ts'
 import { cases } from './cases.ts'
 import {
 	acquireSuiteLock,
@@ -24,9 +25,10 @@ import {
  *   npm run test:e2e [-- --only wrap]
  */
 
-const args = process.argv.slice(2)
-const onlyIndex = args.indexOf('--only')
-const only = onlyIndex !== -1 ? args[onlyIndex + 1] : undefined
+// Fail-closed: anything but "no arguments" or exactly "--only <non-empty>"
+// throws here rather than silently selecting every case - the full
+// mutation run - for a malformed filter (see parseOnlyFilter).
+const only = parseOnlyFilter(process.argv.slice(2))
 const selected =
 	only === undefined ? cases : cases.filter((c) => c.name.includes(only))
 assert.ok(selected.length > 0, `no case matches --only ${String(only)}`)
