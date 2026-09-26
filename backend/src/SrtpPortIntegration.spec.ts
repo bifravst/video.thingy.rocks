@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
+import { dirname } from 'node:path'
 import { describe, it } from 'node:test'
 
 import type { SrtpHelperMessage } from './SrtpHelperProtocol.ts'
 import {
 	hasGstElements,
+	HELPER,
 	startHelper,
 	type Helper,
 } from './testing/srtpHelper.ts'
@@ -563,6 +566,74 @@ void describe('srtp_port.py against real libsrtp', { skip: !hasSrtp }, () => {
 	})
 
 	void describe('lifecycle', () => {
+		void it('dies from a fatal raised inside a GLib callback', () => {
+			// fatal() is reached from GLib callbacks too (a start or stop command,
+			// a bus message, a pad probe), and PyGObject intercepts exceptions
+			// escaping a callback instead of unwinding MainLoop.run() - so the
+			// sys.exit it used to raise was swallowed: the helper reported its
+			// fatal frame and stayed alive, still holding the bound port, while
+			// the supervisor respawned a session that could never bind it again.
+			// This drives fatal() from a timeout callback and holds the runner
+			// to the exit it promises.
+			const snippet = `
+import sys
+sys.path.insert(0, ${JSON.stringify(dirname(HELPER))})
+import srtp_port
+from gi.repository import GLib
+loop = GLib.MainLoop()
+def boom():
+    srtp_port.fatal("test", "fatal from a GLib callback", 7)
+GLib.timeout_add(10, boom)
+GLib.timeout_add_seconds(10, lambda: loop.quit())
+loop.run()
+print("STILL ALIVE")
+`
+			const result = spawnSync('python3', ['-c', snippet], {
+				encoding: 'utf8',
+				timeout: 30_000,
+			})
+			assert.strictEqual(
+				result.status,
+				7,
+				`the process must die with fatal's code, not survive it\n${String(result.stdout)}\n${String(result.stderr)}`,
+			)
+			assert.ok(
+				!result.stdout.includes('STILL ALIVE'),
+				"the main loop must not have survived the callback's fatal",
+			)
+		})
+
+		void it('dies from a fatal raised on a non-main thread', () => {
+			// The deterministic version of the same guarantee: SystemExit from a
+			// non-main thread ends the thread, never the process, on every
+			// Python - so a sys.exit-based fatal here provably leaves the helper
+			// alive with its fatal already reported. os._exit ends the process
+			// from any thread.
+			const snippet = `
+import sys
+sys.path.insert(0, ${JSON.stringify(dirname(HELPER))})
+import srtp_port
+import threading
+t = threading.Thread(target=lambda: srtp_port.fatal("test", "fatal from a thread", 9))
+t.start()
+t.join()
+print("STILL ALIVE")
+`
+			const result = spawnSync('python3', ['-c', snippet], {
+				encoding: 'utf8',
+				timeout: 30_000,
+			})
+			assert.strictEqual(
+				result.status,
+				9,
+				`the process must die with fatal's code, not survive it\n${String(result.stdout)}\n${String(result.stderr)}`,
+			)
+			assert.ok(
+				!result.stdout.includes('STILL ALIVE'),
+				"the process must not have survived the thread's fatal",
+			)
+		})
+
 		void it('ends with EOS on SIGTERM so the sink can flush', async () => {
 			const helper = await startHelper({ key: KEY, ssrc: SSRC })
 			const code = await helper.stop()
