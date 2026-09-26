@@ -223,7 +223,17 @@ def emit(**fields: object) -> None:
 
 def fatal(reason: str, message: str, code: int = 2) -> None:
     emit(t="fatal", reason=reason, message=message)
-    sys.exit(code)
+    # Terminate directly, not with sys.exit: fatal is also reached from GLib
+    # callbacks (a start or stop command off stdin, a bus message) and those
+    # run on threads where a SystemExit cannot end the process - on older
+    # PyGObject the marshalling of callback exceptions swallows it outright,
+    # and from any non-main thread SystemExit ends the thread, not the
+    # process, on every version. Either way the helper stayed alive with its
+    # fatal already emitted, still holding the port it bound, while the
+    # supervisor respawned a session that could never bind it again.
+    # os._exit cannot be intercepted, from any thread, on any version - and
+    # emit() has already flushed the frame.
+    os._exit(code)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
