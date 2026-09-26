@@ -37,11 +37,19 @@ export type AnnexB = {
 /**
  * Parses an Annex B byte stream into NAL units and access-unit boundaries.
  *
- * An access unit starts at an SPS or an IDR slice: x264 emits SPS, PPS, IDR for
- * every keyframe, so this is stable for the fixture, and h264parse re-derives the
- * same boundaries downstream anyway. A wrong boundary would cost a marker bit in
- * the wrong place, which the depayloader tolerates - the timestamp is what
- * matters, and it is assigned per access unit here.
+ * An access unit is a decoded frame, and only slice NALs know where frames
+ * start: the first field of a slice header is `first_mb_in_slice`, ue(v)-coded,
+ * so zero - "the first slice of its frame" - is the single set bit 1 in the
+ * byte after the NAL type byte. SPS (type 7) also starts an access unit, since
+ * it always precedes the keyframe it describes, and whatever PPS/SEI follow it
+ * belong to that frame.
+ *
+ * Detection any weaker than this mis-frames the committed fixture: its
+ * keyframes are three IDR slices and its P frames three P slices each, so
+ * "every IDR NAL starts a frame" splits one keyframe into three access units,
+ * and "until the next SPS" glues a whole GOP's P frames into one giant access
+ * unit with a single timestamp and a single marker bit - RTP-legal, but not
+ * the per-frame pacing this sender claims.
  */
 export const parseAnnexB = (bytes: Buffer): AnnexB => {
 	const nals: { type: number; data: Buffer }[] = []
@@ -79,9 +87,20 @@ export const parseAnnexB = (bytes: Buffer): AnnexB => {
 	const accessUnitStarts: number[] = []
 	for (let j = 0; j < nals.length; j++) {
 		const type = nals[j]?.type
-		// 7 = SPS, 5 = IDR: a keyframe access unit starts here. P-slice NALs
-		// after it belong to it until the next SPS.
-		if (type === 7 || type === 5) accessUnitStarts.push(j)
+		// SPS starts the keyframe's access unit, PPS/SEI included.
+		if (type === 7) {
+			accessUnitStarts.push(j)
+			continue
+		}
+		if (type !== 1 && type !== 5) continue
+		// A slice starts an access unit exactly when it is the first slice of
+		// its frame: first_mb_in_slice == 0, ue(v)-coded as the single bit 1.
+		// The first byte after the NAL header is slice-header data, never a
+		// start code (emulation prevention guarantees that), so reading its
+		// top bit is well-defined.
+		const nal = nals[j]?.data
+		if (nal === undefined || nal.length < 2) continue
+		if ((nal[1] as number) & 0x80) accessUnitStarts.push(j)
 	}
 	if (accessUnitStarts.length === 0 || accessUnitStarts[0] !== 0) {
 		accessUnitStarts.unshift(0)
