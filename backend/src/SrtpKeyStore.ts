@@ -257,15 +257,20 @@ export class SrtpKeyStore {
 				continue
 			}
 
+			const generation = SRTP_GENERATION_BASE + param.version
 			this.keysByPort.set(port, {
 				keyHex: parsed.key,
 				ssrc: parsed.ssrc,
 				cipher: parsed.cipher ?? SUPPORTED_SRTP_CIPHER,
 				auth: parsed.auth ?? SUPPORTED_SRTP_AUTH,
 				keyFingerprint: keyFingerprint(parsed.key),
-				generation: SRTP_GENERATION_BASE + param.version,
+				generation,
 			})
-			this.logger.info('Loaded SRTP key', { port })
+			// The generation in the log is what makes a deployment skew
+			// visible: a fleet running a backend that predates the
+			// version-derived generation shows zeros here, and every floor
+			// write it makes is fenced out by rows from the earlier schemes.
+			this.logger.info('Loaded SRTP key', { port, generation })
 		}
 	}
 
