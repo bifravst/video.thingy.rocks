@@ -637,8 +637,15 @@ export const waitForSrtpIndexFloorFor = async (
 		const row = await lockRow(region, tableName, port)
 		if (row?.srtpIndexKeyFingerprint === fingerprint) return row
 		if (Date.now() > deadline) {
+			const rowGeneration = row?.srtpKeyGeneration
+			const skewHint =
+				typeof rowGeneration === 'number' &&
+				rowGeneration > 1_500_000_000 &&
+				rowGeneration < 2_000_000_000
+					? ` The row's srtpKeyGeneration (${String(rowGeneration)}) is a unix-seconds value from an earlier scheme, not a ${'2,000,000,003'}-style parameter-version one: the deployed backend predates the version-derived generation, so it loads the freshly provisioned keys without their old JSON field at generation 0, which this row fences out entirely - the rotated key genuinely has no persisted floor. Refresh the code the suite deploys from (npm run cdk:prod:deploy) and re-run.`
+					: ''
 			throw new Error(
-				`the replay floor of port ${String(port)} was never persisted under the rotated key (row: ${JSON.stringify(row)})`,
+				`the replay floor of port ${String(port)} was never persisted under the rotated key (row: ${JSON.stringify(row)}).${skewHint}`,
 			)
 		}
 		await sleep(5_000)

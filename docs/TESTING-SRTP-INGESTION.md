@@ -111,6 +111,13 @@ traffic metrics, and the lock table.
 The stack it runs against is named, never guessed: pass the deployed stack's
 name unless it is the default one.
 
+The suite deploys the backend code to the fleet **from the stack's code
+bucket** - it pulls what `npm run cdk:prod:deploy` last put there, so a code
+change needs that deploy first: a suite run against a fleet still running the
+previous backend tests the previous backend (the failure mode is silent until a
+case that observes the backend's own behavior, like the rotated-floor
+persistence, catches the skew).
+
 ```bash
 cd backend
 STREAMING_STACK_NAME=<stack> npm run test:e2e
