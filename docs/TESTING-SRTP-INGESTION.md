@@ -70,6 +70,12 @@ after (re)provisioning, restart the service
 (`sudo systemctl restart video-streaming.service` on the instances, or a rolling
 deploy).
 
+Every run also bumps the port's `generation` - a separate, non-secret parameter
+at `/{stack}/srtp/port/{port}/generation` - by reading it and writing one
+higher. The backend uses it as the replay floor's rotation fence: a floor row
+may only be replaced by a strictly newer generation, so re-provisioning twice
+within the same second is still a real rotation, never a collision.
+
 ## Sending a test stream
 
 The reference sender (`scripts/stream-testsrc-to-srtp.py`) needs the local
@@ -131,7 +137,7 @@ reachable through SSM (the instance role already has it). Ports and cases:
 | 6004        | key rotation       | A rotated key starts a new index space below the old floor's rollover: the floor is scoped to the key identity, not the port                                                                           |
 | 6005        | rewind             | The same key restarting its index is refused and reported as stale drops                                                                                                                               |
 | 6006        | restart recovery   | The backend restarts under a live sender and the stream recovers with media, asserted from the restarted process's own boot                                                                            |
-| 6007        | fresh key          | Rotation restarts the index space cleanly, confirmed on trial 1                                                                                                                                        |
+| 6007        | fresh key          | Rotation restarts the index space cleanly, confirmed on trial 1, and the rotated key's floor persists - the rotation fence's own proof                                                                 |
 | 6008 + 5000 | isolation          | SRTP noise on one port while the unencrypted path keeps ingesting undisturbed                                                                                                                          |
 | 6009        | walked-past search | Traffic that cannot authenticate walks the counter search past the answer, and the real sender is still found through the re-sweep                                                                     |
 

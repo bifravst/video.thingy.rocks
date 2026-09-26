@@ -11,6 +11,7 @@ import {
 	seedSrtpIndexFloor,
 	waitForLogEvents,
 	waitForLogLines,
+	waitForSrtpIndexFloorFor,
 	waitForStreamIngestion,
 	waitForTransportMetrics,
 } from './stack.ts'
@@ -93,6 +94,19 @@ const makeSender = (
 		fps: options.fps ?? 15,
 	})
 
+/**
+ * A key that is guaranteed to differ from `keyHex`, for the negative cases.
+ *
+ * Appending a fixed suffix cannot work: a randomly generated key that already
+ * ends in that byte stays itself, and about one run in 256 the "wrong key"
+ * case would send the real key and authenticate. Flipping the last byte to
+ * the other safe value always changes it.
+ */
+export const wrongKeyOf = (keyHex: string): string =>
+	keyHex.endsWith('ff')
+		? `${keyHex.slice(0, 58)}00`
+		: `${keyHex.slice(0, 58)}ff`
+
 export const cases: E2eCase[] = [
 	{
 		name: 'happy path: real media reaches Kinesis and can be read back',
@@ -128,10 +142,12 @@ export const cases: E2eCase[] = [
 				since,
 			)
 
-			// The strongest assertion there is: the media itself comes back.
+			// The strongest assertion there is: the media itself comes back - from
+			// this run, not from whatever the stream retained before it.
 			const mediaBytes = await readMedia(
 				ctx.config.region,
 				streamNameFor(ctx.config, 6000),
+				since,
 			)
 			assert.ok(
 				mediaBytes > 0,
@@ -175,7 +191,7 @@ export const cases: E2eCase[] = [
 			const since = new Date()
 			// The sender uses a different key: syntactically the same SRTP, but
 			// every tag is wrong for the port.
-			const wrongKey = key.keyHex.slice(0, 58) + 'ff'
+			const wrongKey = wrongKeyOf(key.keyHex)
 			const sender = makeSender(ctx.config, 6001, 1011, wrongKey, {
 				roc: 0,
 				durationS: 20,
@@ -184,10 +200,14 @@ export const cases: E2eCase[] = [
 			step('streamed for 20s')
 
 			// Metrics need a minute to be sure; the lock is the immediate signal.
+			// Asserted on the lock field, not on the row being absent: the row can
+			// legitimately pre-exist with floor or status metadata from an earlier
+			// run on a reused stack - what this case owns is that no instance ever
+			// held the lock.
 			await new Promise((resolve) => setTimeout(resolve, 30_000))
 			const row = await lockRow(ctx.config.region, ctx.config.tableName, 6001)
 			assert.equal(
-				row,
+				row?.kinesisOwnerInstanceId,
 				undefined,
 				'unauthenticated traffic must never acquire the lock',
 			)
@@ -228,7 +248,12 @@ export const cases: E2eCase[] = [
 
 			await new Promise((resolve) => setTimeout(resolve, 30_000))
 			const row = await lockRow(ctx.config.region, ctx.config.tableName, 6002)
-			assert.equal(row, undefined, 'forged traffic must never acquire the lock')
+			// The lock field, not the whole row: see the wrong-key case for why.
+			assert.equal(
+				row?.kinesisOwnerInstanceId,
+				undefined,
+				'forged traffic must never acquire the lock',
+			)
 			await assertNoStreamIngestion(
 				ctx.config.region,
 				streamNameFor(ctx.config, 6002),
@@ -373,6 +398,17 @@ export const cases: E2eCase[] = [
 				ctx.config.region,
 				streamNameFor(ctx.config, 6004),
 				since,
+			)
+			// The rotation fence's own proof: the rotated key's floor must
+			// actually persist. A key that cannot write its floor still ingests
+			// (no floor means searching from zero) and confirms on trial 1, so
+			// the row is the only observable of the fence working.
+			step("waiting for the rotated key's floor to persist")
+			await waitForSrtpIndexFloorFor(
+				ctx.config.region,
+				ctx.config.tableName,
+				6004,
+				freshKey,
 			)
 		},
 	},
@@ -567,6 +603,15 @@ export const cases: E2eCase[] = [
 				streamNameFor(ctx.config, 6007),
 				since,
 			)
+			// And the rotated key's floor persists - see the 6004 case for why
+			// the row is the only observable of the rotation fence.
+			step("waiting for the rotated key's floor to persist")
+			await waitForSrtpIndexFloorFor(
+				ctx.config.region,
+				ctx.config.tableName,
+				6007,
+				freshKey,
+			)
 		},
 	},
 	{
@@ -583,7 +628,7 @@ export const cases: E2eCase[] = [
 		run: async (ctx: CaseContext, key: { keyHex: string }): Promise<void> => {
 			const since = new Date()
 			// SRTP noise with the wrong key on 6008.
-			const wrongKey = key.keyHex.slice(0, 58) + 'ff'
+			const wrongKey = wrongKeyOf(key.keyHex)
 			const noise = makeSender(ctx.config, 6008, 1018, wrongKey, {
 				roc: 0,
 				durationS: 45,
@@ -705,7 +750,7 @@ export const cases: E2eCase[] = [
 			// candidates (512 by default, about 34s of 60 fps traffic that never
 			// authenticates); the noise phase spans two of those cycles.
 			since = new Date()
-			const wrongKey = key.keyHex.slice(0, 58) + 'ff'
+			const wrongKey = wrongKeyOf(key.keyHex)
 			const noise = makeSender(ctx.config, 6009, 1019, wrongKey, {
 				roc: 0,
 				durationS: 240,

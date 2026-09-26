@@ -1,9 +1,68 @@
 import assert from 'node:assert/strict'
 import dgram from 'node:dgram'
+import { readFileSync } from 'node:fs'
 import { describe, it } from 'node:test'
 
 import { hasGstElements, startHelper } from '../src/testing/srtpHelper.ts'
-import { E2eSender } from './sender.ts'
+import { E2eSender, parseAnnexB } from './sender.ts'
+
+/**
+ * The committed fixture, parsed the way the sender paces it.
+ *
+ * No GStreamer needed: this pins the access-unit detection against the bytes
+ * that actually ship. The fixture's keyframes are three IDR slices and its P
+ * frames three P slices each (measured, not assumed), so anything weaker than
+ * first_mb_in_slice parsing mis-frames it - every IDR slice became its own
+ * "frame" and a whole GOP's P frames glued into one access unit sharing a
+ * single timestamp and marker, which is not the per-frame pacing the sender
+ * claims.
+ */
+void describe('the e2e fixture parses into real access units', () => {
+	const fixture = parseAnnexB(
+		readFileSync(new URL('./fixtures/testsrc.h264', import.meta.url)),
+	)
+
+	void it('starts one access unit per frame, not per IDR slice', () => {
+		// 20 one-second GOPs of 16 frames each: one keyframe and 15 P frames.
+		assert.strictEqual(fixture.accessUnitStarts.length, 320)
+		const startTypes = fixture.accessUnitStarts.map(
+			(i) => fixture.nals[i]?.type as number,
+		)
+		const keyframes = startTypes.filter((t) => t === 7).length
+		const idrFirstSlices = startTypes.filter((t) => t === 5).length
+		const pFirstSlices = startTypes.filter((t) => t === 1).length
+		assert.strictEqual(keyframes, 20)
+		assert.strictEqual(idrFirstSlices, 20)
+		assert.strictEqual(pFirstSlices, 280)
+	})
+
+	void it("keeps a frame's continuation slices inside its access unit", () => {
+		// No access unit is a single stray continuation slice, and none is a
+		// whole GOP: every frame is 1-3 NALs (its slices, plus the parameter
+		// sets on a keyframe), never the ~45 a "until the next SPS" grouping
+		// produced.
+		for (let k = 0; k < fixture.accessUnitStarts.length; k++) {
+			const from = fixture.accessUnitStarts[k] as number
+			const to =
+				k + 1 < fixture.accessUnitStarts.length
+					? (fixture.accessUnitStarts[k + 1] as number)
+					: fixture.nals.length
+			const size = to - from
+			assert.ok(
+				size >= 1 && size <= 5,
+				`access unit ${String(k)} is ${String(size)} NALs`,
+			)
+			const first = fixture.nals[from]?.data as Buffer
+			const type = first[0] as number
+			if (type === 1 || type === 5) {
+				assert.ok(
+					(first[1] as number) & 0x80,
+					"an access unit starting at a slice must be that frame's first slice",
+				)
+			}
+		}
+	})
+})
 
 /**
  * The e2e sender against the real helper and real libsrtp.
@@ -44,6 +103,18 @@ void describe(
 					)
 					assert.ok(confirmed.t === 'auth' && confirmed.status === 'ok')
 					assert.strictEqual(confirmed.roc, 0)
+
+					// Searching mode counts nothing as an access unit: its
+					// pipeline ends at a fakesink straight after srtpdec, and
+					// the aus stat is only ever attached to the producing
+					// pipeline's sink - after the depayloader and the parser -
+					// so it can never be satisfied by authenticated packets
+					// alone.
+					const whileSearching = await helper.waitFor((m) => m.t === 'stats')
+					assert.ok(
+						whileSearching.t === 'stats' && whileSearching.aus === 0,
+						`searching must not count packets as access units (aus: ${String(whileSearching.t === 'stats' ? whileSearching.aus : '?')})`,
+					)
 
 					// The producer's tail is granted, so the depayloader and the
 					// parser run: access units, not just authenticated headers.

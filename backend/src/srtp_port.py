@@ -309,6 +309,9 @@ class Counters:
         #: Kinesis".
         self.input_bytes = 0
         self.authenticated = 0
+        #: Access units that reached the producing pipeline's sink - counted only
+        #: there, after the depayloader and the parser, so the number cannot be
+        #: satisfied by authenticated RTP packets alone.
         self.access_units = 0
         #: Highest authenticated sequence number, i.e. the s_l of RFC 3711 appendix A.
         #: With roc it forms the highest authenticated packet index, which is what a
@@ -530,9 +533,15 @@ class SrtpPort:
         auth_pad = self.dec.get_static_pad("rtp_src")
         if auth_pad is not None:
             auth_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_authenticated)
+        # The access-unit probe is attached only where a named "sink" exists:
+        # the producing pipeline's, which follows the depayloader and the
+        # parser. The searching pipeline's fakesink is deliberately unnamed, so
+        # nothing counts srtpdec's output there - an authenticated RTP packet
+        # is not an access unit, and the aus stat must never be satisfiable
+        # without the producing tail actually having parsed anything.
         sink = pipeline.get_by_name("sink")
         sink_pad = sink.get_static_pad("sink") if sink is not None else None
-        if sink_pad is not None:
+        if sink_pad is not None and self.mode == "producing":
             sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_access_unit)
 
     def _on_input(self, pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
