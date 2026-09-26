@@ -70,11 +70,12 @@ after (re)provisioning, restart the service
 (`sudo systemctl restart video-streaming.service` on the instances, or a rolling
 deploy).
 
-Every run also bumps the port's `generation` - a separate, non-secret parameter
-at `/{stack}/srtp/port/{port}/generation` - by reading it and writing one
-higher. The backend uses it as the replay floor's rotation fence: a floor row
-may only be replaced by a strictly newer generation, so re-provisioning twice
-within the same second is still a real rotation, never a collision.
+Every run also rotates the key parameter's SSM **version**, which SSM increments
+atomically on every overwrite. The backend derives the key's rotation generation
+from that version at load time: a floor row may only be replaced by a strictly
+newer generation, and the atomic version allocation is what guarantees it - even
+two provisions of one port at the same moment are real rotations, never a
+collision.
 
 ## Sending a test stream
 

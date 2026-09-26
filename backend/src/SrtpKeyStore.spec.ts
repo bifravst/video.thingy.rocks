@@ -8,6 +8,7 @@ import {
 	isStoredSrtpKey,
 	isValidSrtpKeyHex,
 	keyFingerprint,
+	SRTP_GENERATION_BASE,
 	SrtpKeyStore,
 } from './SrtpKeyStore.ts'
 
@@ -201,36 +202,49 @@ void describe('SrtpKeyStore', () => {
 			}
 		})
 
-		void it('loads the key generation, defaulting to zero for parameters written before it existed', async () => {
-			const valueByPort = new Map<number, string>([
-				// A parameter the current provisioning script wrote: generation stamped.
-				[
-					6000,
-					JSON.stringify({ key: validKeyHex, ssrc: 1, generation: 1730000000 }),
-				],
-				// A parameter from before the rotation fence: no generation at all.
-				[6001, JSON.stringify({ key: validKeyHex, ssrc: 2 })],
-			])
-			const { keyStore } = makeKeyStore(
-				secureResponder((port) => valueByPort.get(port)!),
-			)
+		void it('derives the rotation generation from the SSM parameter version', async () => {
+			// The version is allocated atomically by SSM on every overwrite -
+			// the whole point of using it as the generation: no counter of ours
+			// can promise concurrent provisions of one port different values.
+			// The offset puts it above every generation persisted by the
+			// earlier schemes, so their rows remain replaceable.
+			const { keyStore } = makeKeyStore((command) => ({
+				$metadata: {},
+				Parameters: (command.input.Names ?? []).map((name) => ({
+					Name: name,
+					Value: JSON.stringify({ key: validKeyHex, ssrc: 1 }),
+					Type: 'SecureString' as const,
+					Version: name.endsWith('6000/key') ? 3 : 7,
+				})),
+			}))
 			await keyStore.loadPorts([6000, 6001])
-			assert.strictEqual(keyStore.getKeyForPort(6000)?.generation, 1730000000)
-			// Zero, not undefined: the floor's rotation condition compares it.
-			assert.strictEqual(keyStore.getKeyForPort(6001)?.generation, 0)
+			assert.strictEqual(
+				keyStore.getKeyForPort(6000)?.generation,
+				SRTP_GENERATION_BASE + 3,
+			)
+			assert.strictEqual(
+				keyStore.getKeyForPort(6001)?.generation,
+				SRTP_GENERATION_BASE + 7,
+			)
 		})
 
-		void it('rejects a non-integer or negative generation', async () => {
-			const valueByPort = new Map<number, string>([
-				[6000, JSON.stringify({ key: validKeyHex, ssrc: 1, generation: 1.5 })],
-				[6001, JSON.stringify({ key: validKeyHex, ssrc: 2, generation: -1 })],
-			])
-			const { keyStore } = makeKeyStore(
-				secureResponder((port) => valueByPort.get(port)!),
-			)
-			await keyStore.loadPorts([6000, 6001])
-			assert.strictEqual(keyStore.hasKeyForPort(6000), false)
-			assert.strictEqual(keyStore.hasKeyForPort(6001), false)
+		void it('ignores the generation field parameters from the earlier schemes carried', async () => {
+			// Unix-time and counter generations live in the value JSON of
+			// already-deployed parameters. The field is inert now - the
+			// parameter version is the source - but those parameters must
+			// still load, and their generation must still exceed every row
+			// those schemes wrote.
+			const value = JSON.stringify({
+				key: validKeyHex,
+				ssrc: 7,
+				generation: 1_730_000_000,
+			})
+			const { keyStore } = makeKeyStore(secureResponder(() => value))
+			await keyStore.loadPorts([6003])
+			const key = keyStore.getKeyForPort(6003)
+			assert.ok(key !== undefined)
+			assert.strictEqual(key.generation, SRTP_GENERATION_BASE + 1)
+			assert.ok(key.generation > 1_730_000_000)
 		})
 
 		void it('rejects parameters that are not SecureString and does not load them', async () => {

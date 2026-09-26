@@ -370,10 +370,11 @@ export class StreamMetadataService {
 	 * of order - fails the condition and is dropped.
 	 *
 	 * The one way down is a different key, which is a different index space - but
-	 * only for a *newer* key: the write carries the provisioned key's generation
-	 * (bumped by every provisioning run, see SrtpPortKey), and identity
-	 * replacement requires a strictly larger one. A stale helper still running
-	 * the previous key can therefore keep raising the floor of the row it wrote
+	 * only for a *newer* key: the write carries the key's rotation generation (the
+	 * SSM parameter's own version, allocated atomically on every overwrite - see
+	 * SrtpPortKey), and identity replacement requires a strictly larger one. A
+	 * stale helper still running the previous key can therefore keep raising the
+	 * floor of the row it wrote
 	 * (harmless - the row is superseded the moment the new key's traffic
 	 * arrives) but can never overwrite the new key's floor and so reopen the
 	 * indexes the new key already accepted. Rows without a generation (written

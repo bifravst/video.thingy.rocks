@@ -30,16 +30,23 @@ export type SrtpPortKey = {
 	 * keyHex itself. */
 	keyFingerprint: string
 	/**
-	 * Which provisioned key this is: the provisioning script bumps it every time
-	 * it writes a port's key, so a newer key always carries a strictly larger
-	 * generation than the one it replaced.
+	 * The rotation generation: the SSM parameter's own version, offset above
+	 * every legacy scheme's values - nothing of ours allocates it.
 	 *
-	 * The replay floor uses it as its rotation fence: identity replacement of
-	 * the floor row is only allowed for a newer generation (see
+	 * SSM increments a parameter's version atomically, server-side, on every
+	 * overwrite, so two concurrent provisions of the same port cannot share a
+	 * generation - which no read-modify-write counter of ours could promise
+	 * (both earlier schemes were review findings for exactly that). The replay
+	 * floor uses it as its rotation fence: replacing a floor row's identity
+	 * requires a strictly newer generation (see
 	 * StreamMetadataService.raiseSrtpIndexFloor), so a stale helper still
-	 * running the old key can raise its own floor but can never overwrite the
-	 * new key's. Defaults to 0 for parameters provisioned before the fence
-	 * existed.
+	 * running the old key can raise its own floor but never overwrite the new
+	 * key's.
+	 *
+	 * The offset keeps any version-derived generation above every generation
+	 * persisted by the earlier schemes (unix seconds, then a counter floored
+	 * at unix seconds): those stay below the base until 2033, so any row they
+	 * wrote is still replaceable.
 	 */
 	generation: number
 }
@@ -81,12 +88,16 @@ type StoredSrtpKey = {
 	ssrc: number
 	cipher?: string
 	auth?: string
-	/**
-	 * Bumped by every provisioning run (see SrtpPortKey.generation); optional so
-	 * parameters written before the rotation fence existed still load.
-	 */
-	generation?: number
 }
+
+/**
+ * The base added to an SSM parameter's version to make it the key's rotation
+ * generation. It must exceed every generation persisted by the earlier schemes
+ * - unix seconds, then a counter floored at unix seconds - which stay below
+ * 2^31 (2,000,000,000 unix time) until the year 2033, so any floor row those
+ * schemes wrote is replaceable by any version-derived generation.
+ */
+export const SRTP_GENERATION_BASE = 2_000_000_000
 
 /**
  * The only cipher/auth suite validated end-to-end (matches the 60-hex-char/30-byte key
@@ -120,15 +131,6 @@ export const isStoredSrtpKey = (value: unknown): value is StoredSrtpKey => {
 
 	if (v.cipher !== undefined && v.cipher !== SUPPORTED_SRTP_CIPHER) return false
 	if (v.auth !== undefined && v.auth !== SUPPORTED_SRTP_AUTH) return false
-
-	if (
-		v.generation !== undefined &&
-		(typeof v.generation !== 'number' ||
-			!Number.isInteger(v.generation) ||
-			v.generation < 0)
-	) {
-		return false
-	}
 
 	return true
 }
@@ -187,7 +189,7 @@ export class SrtpKeyStore {
 			})
 		}
 
-		const paramsByName = new Map<string, string>()
+		const paramsByName = new Map<string, { value: string; version: number }>()
 		for (const parameter of response.Parameters ?? []) {
 			if (parameter.Name === undefined || parameter.Value === undefined)
 				continue
@@ -206,17 +208,28 @@ export class SrtpKeyStore {
 				)
 				continue
 			}
-			paramsByName.set(parameter.Name, parameter.Value)
+			// The parameter's version is the rotation generation: allocated
+			// atomically by SSM on every overwrite, so concurrent provisions of
+			// one port cannot share it. The offset puts it above every
+			// generation persisted by the earlier schemes (see
+			// SRTP_GENERATION_BASE).
+			paramsByName.set(parameter.Name, {
+				value: parameter.Value,
+				version:
+					typeof parameter.Version === 'number' && parameter.Version >= 1
+						? parameter.Version
+						: 1,
+			})
 		}
 
 		for (const port of ports) {
 			const name = this.parameterNameForPort(port)
-			const rawValue = paramsByName.get(name)
-			if (rawValue === undefined) continue
+			const param = paramsByName.get(name)
+			if (param === undefined) continue
 
 			let parsed: unknown
 			try {
-				parsed = JSON.parse(rawValue)
+				parsed = JSON.parse(param.value)
 			} catch {
 				this.logger.error(
 					'SRTP key parameter is not valid JSON',
@@ -228,7 +241,7 @@ export class SrtpKeyStore {
 
 			if (!isStoredSrtpKey(parsed)) {
 				this.logger.error(
-					`SRTP key parameter is invalid: needs a string "key", a uint32 "ssrc", and, if present, "cipher"/"auth" must be exactly "${SUPPORTED_SRTP_CIPHER}"/"${SUPPORTED_SRTP_AUTH}" and "generation" a non-negative integer (the only suite supported end-to-end)`,
+					`SRTP key parameter is invalid: needs a string "key", a uint32 "ssrc", and, if present, "cipher"/"auth" must be exactly "${SUPPORTED_SRTP_CIPHER}"/"${SUPPORTED_SRTP_AUTH}" (the only suite supported end-to-end)`,
 					new Error('Invalid SRTP key parameter shape'),
 					{ port, parameterName: name },
 				)
@@ -250,7 +263,7 @@ export class SrtpKeyStore {
 				cipher: parsed.cipher ?? SUPPORTED_SRTP_CIPHER,
 				auth: parsed.auth ?? SUPPORTED_SRTP_AUTH,
 				keyFingerprint: keyFingerprint(parsed.key),
-				generation: parsed.generation ?? 0,
+				generation: SRTP_GENERATION_BASE + param.version,
 			})
 			this.logger.info('Loaded SRTP key', { port })
 		}
