@@ -17,7 +17,7 @@ void describe('KinesisVideoSender', () => {
 					client: { send: (c: unknown) => Promise<unknown> }
 				}
 			).client = {
-				send: sendMock as (c: unknown) => Promise<unknown>,
+				send: sendMock,
 			}
 
 			const endpoint = await sender.getPutMediaEndpoint()
@@ -48,7 +48,7 @@ void describe('KinesisVideoSender', () => {
 					client: { send: (c: unknown) => Promise<unknown> }
 				}
 			).client = {
-				send: sendMock as (c: unknown) => Promise<unknown>,
+				send: sendMock,
 			}
 
 			const endpoint = await sender.getPutMediaEndpoint()
@@ -73,7 +73,7 @@ void describe('KinesisVideoSender', () => {
 					client: { send: (c: unknown) => Promise<unknown> }
 				}
 			).client = {
-				send: sendMock as (c: unknown) => Promise<unknown>,
+				send: sendMock,
 			}
 
 			await sender.getPutMediaEndpoint()

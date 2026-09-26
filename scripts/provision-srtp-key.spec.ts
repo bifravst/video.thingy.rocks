@@ -114,6 +114,17 @@ void describe('provision-srtp-key.sh', () => {
 		}
 		assert.strictEqual(request.Type, 'SecureString')
 		assert.strictEqual((JSON.parse(request.Value) as { key: string }).key, key)
+		// Every provisioning run stamps the key with a generation: the fence the
+		// replay floor's rotation condition compares against, so a later
+		// provisioning of the same port is always strictly newer than an
+		// earlier one (unix time is monotonic enough for that by construction).
+		const value = JSON.parse(request.Value) as { generation?: number }
+		assert.ok(
+			typeof value.generation === 'number' &&
+				Number.isInteger(value.generation) &&
+				value.generation > 0,
+			'the parameter value must carry a positive integer generation',
+		)
 
 		const argv = readFileSync(`${log}.argv`, 'utf8')
 		assert.ok(

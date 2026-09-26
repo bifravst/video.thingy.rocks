@@ -7,6 +7,7 @@ import type { SrtpPortKey } from './SrtpKeyStore.ts'
 import {
 	SrtpPortSupervisor,
 	type HelperProcess,
+	type SrtpPortSupervisorConfig,
 	type SrtpSupervisorState,
 } from './SrtpPortSupervisor.ts'
 
@@ -174,6 +175,7 @@ const key: SrtpPortKey = {
 	cipher: 'aes-128-icm',
 	auth: 'hmac-sha1-80',
 	keyFingerprint: '0123456789abcdef',
+	generation: 0,
 }
 
 const waitFor = async (
@@ -243,6 +245,53 @@ const makeSupervisor = () => {
 	})
 	active.push(supervisor)
 	return { supervisor, helper, locks, floors, spawned, transitions }
+}
+
+/**
+ * A supervisor built from parts the fixed makeSupervisor stubs cannot express:
+ * spawners that fail or defer, floors that hang. Tracks every spawned fake the
+ * same way makeSupervisor does.
+ */
+const bareSupervisor = (
+	spawnHelper: SrtpPortSupervisorConfig['spawnHelper'],
+	over: Partial<SrtpPortSupervisorConfig> = {},
+): { supervisor: SrtpPortSupervisor; spawned: FakeHelper[] } => {
+	const locks = makeLocks()
+	const floors = makeFloors()
+	const spawned: FakeHelper[] = []
+	const supervisor = new SrtpPortSupervisor({
+		port: 6000,
+		instanceId: 'i-test',
+		key,
+		streamName: 'test-video-6000',
+		...over,
+		locks: over.locks ?? locks.locks,
+		floors: over.floors ?? floors.floors,
+		timeouts: {
+			tickMs: 15,
+			readyMs: 400,
+			acquireRetryMs: 60,
+			stoppedAckMs: 400,
+			frameStallMs: 200,
+			restartMs: 10,
+			restartMaxMs: 50,
+		},
+		spawnHelper: (
+			init: SrtpHelperInit,
+		): HelperProcess | Promise<HelperProcess> => {
+			const result = spawnHelper(init)
+			if (result instanceof Promise) {
+				return result.then((child) => {
+					spawned.push(child as FakeHelper)
+					return child
+				})
+			}
+			spawned.push(result as FakeHelper)
+			return result
+		},
+	})
+	active.push(supervisor)
+	return { supervisor, spawned }
 }
 
 const ready = {
@@ -446,22 +495,40 @@ void describe('SrtpPortSupervisor', () => {
 	})
 
 	void it('shuts down by stopping the producer, releasing the lock, and ending the helper', async () => {
-		const { supervisor, helper, locks } = makeSupervisor()
+		const { supervisor, helper, locks, floors } = makeSupervisor()
 		supervisor.start()
 		await toSearching(supervisor, helper)
 		helper.emitFrame(authOkFirst())
 		await waitFor(() => supervisor.currentState === 'producing')
-		// The helper answers the stop command with the ack, as the real one does.
+		// The helper answers the stop command with the ack, as the real one does -
+		// and, like the real one, it stays alive afterwards (the stop only
+		// retracts production; the process lives on for the next grant).
 		helper.onCommand = (command) => {
 			if (command.type === 'stop') {
 				helper.emitFrame({ t: 'stopped', index: 6000 })
 			}
 		}
+		const before = Date.now()
 		await supervisor.stop()
+		const shutdownMs = Date.now() - before
 		assert.strictEqual(supervisor.currentState, 'terminated')
 		assert.strictEqual(locks.log.releases.length, 1)
 		assert.ok(
 			helper.ended || helper.exitCode !== null || helper.signalCode !== null,
+		)
+		// The ack must actually end the wait, not the timeout: a shutdown that
+		// polls its own serialized queue for the ack can only ever time out (the
+		// frame is queued behind the shutdown itself), costing the full ack
+		// window on every graceful stop and killing the helper anyway.
+		assert.ok(
+			shutdownMs < 300,
+			`the acked stop must resolve promptly, took ${String(shutdownMs)}ms`,
+		)
+		// The ack's index is the helper's last word on the floor; a shutdown that
+		// only sees the acked frame as a post-terminated queue entry drops it.
+		assert.ok(
+			floors.log.raised.includes(6000),
+			'the acked stopped frame must raise the floor',
 		)
 		// A frame after termination changes nothing.
 		const acquiresBefore = locks.log.acquires.length
@@ -496,6 +563,141 @@ void describe('SrtpPortSupervisor', () => {
 			'the stall teardown',
 		)
 		assert.strictEqual(locks.log.releases.length, 1)
+	})
+
+	void it('ends a helper that goes silent before it ever authenticates', async () => {
+		const { supervisor, helper, spawned } = makeSupervisor()
+		supervisor.start()
+		await toSearching(supervisor, helper)
+		// No further frames at all, and no lock to lose: a wedged pre-
+		// authentication helper holds the bound port with nothing to show for
+		// it, so the same stall deadline must end the session here too - not
+		// only in the producing state.
+		await waitFor(
+			() => supervisor.currentState === 'cooldown',
+			3_000,
+			'the stall teardown',
+		)
+		assert.ok(
+			helper.exitCode !== null || helper.signalCode !== null,
+			'the silent helper must be killed',
+		)
+		await waitFor(() => spawned.length === 2, 5_000, 'a respawn')
+	})
+
+	void it('ends a helper that goes silent while waiting for the lock', async () => {
+		const { supervisor, helper, locks } = makeSupervisor()
+		locks.log.nextAcquire = false
+		supervisor.start()
+		await toSearching(supervisor, helper)
+		helper.emitFrame(authOkFirst())
+		await waitFor(() => supervisor.currentState === 'acquiring')
+		// Silence while acquiring: the stall deadline must end this session too.
+		await waitFor(
+			() => supervisor.currentState === 'cooldown',
+			3_000,
+			'the stall teardown',
+		)
+		assert.ok(
+			helper.exitCode !== null || helper.signalCode !== null,
+			'the silent helper must be killed',
+		)
+	})
+
+	void it('never spawns a helper after shutdown, even when the floor read was still pending', async () => {
+		let resolveRead: ((floor: number | undefined) => void) | undefined
+		let reads = 0
+		const { supervisor, spawned } = bareSupervisor(() => new FakeHelper(), {
+			floors: {
+				getSrtpIndexFloor: async () => {
+					reads++
+					return new Promise<number | undefined>((resolve) => {
+						resolveRead = resolve
+					})
+				},
+				raiseSrtpIndexFloor: async () => {},
+			},
+		})
+		supervisor.start()
+		await waitFor(() => reads === 1, 5_000, 'the floor read to start')
+		// Shutdown arrives while the startup is still awaiting its floor read.
+		// Startup must be part of the serialized queue for this to be safe: a
+		// detached startup lets shutdown complete first, then resumes, spawns a
+		// helper into the terminated port, and flips it back to 'starting'.
+		const stopping = supervisor.stop()
+		resolveRead?.(undefined)
+		await stopping
+		await waitFor(
+			() => supervisor.currentState === 'terminated',
+			5_000,
+			'terminated',
+		)
+		await new Promise((r) => setTimeout(r, 300))
+		assert.strictEqual(supervisor.currentState, 'terminated')
+		assert.ok(
+			spawned.every((h) => h.exitCode !== null || h.signalCode !== null),
+			'no helper may be left alive by a shutdown that raced its startup',
+		)
+	})
+
+	void it('contains a spawner that fails, and retries it on cooldown', async () => {
+		let attempts = 0
+		const { supervisor, spawned } = bareSupervisor(() => {
+			attempts++
+			if (attempts === 1) throw new Error('no credentials for the helper')
+			return new FakeHelper()
+		})
+		supervisor.start()
+		// The spawner is the transport's seam (it resolves the helper's AWS
+		// credentials); its failure is a failed start like any other, never a
+		// rejection thrown into the queue.
+		await waitFor(
+			() => supervisor.currentState === 'cooldown',
+			5_000,
+			'the failed spawn contained',
+		)
+		await waitFor(() => spawned.length === 1, 5_000, 'the retried spawn')
+		assert.strictEqual(attempts, 2)
+	})
+
+	void it('carries no search position across a floor the index width moved', async () => {
+		const { supervisor, helper, floors, spawned } = makeSupervisor()
+		// A 48-bit packet index is (roc << 16) | seq with a uint32 roc; this
+		// helper builds one arithmetically, the way the floor store numbers it.
+		const indexAt = (roc: number, seq: number): number => roc * 65536 + seq
+		// The floor sits at rollover 2; a session climbs and reports its far
+		// position, which is carried against that base.
+		floors.log.floor = indexAt(2, 1000)
+		supervisor.start()
+		await toSearching(supervisor, helper)
+		helper.emitFrame({
+			t: 'auth',
+			status: 'fail',
+			candidate: 5,
+			inputs: 10,
+			drops: 5,
+			searchFrom: 10,
+		})
+		helper.exit(0)
+		// The floor then moves to rollover 65538 - an index no int32 shift can
+		// address, and whose base a `floor >> 16` truncates to exactly 2, the
+		// base the carry was stored against. The carry belongs to the old floor
+		// and must be dropped: a new one only costs a repeated climb, but a
+		// wrongly-kept one validates a search position against a floor that no
+		// longer exists.
+		floors.log.floor = indexAt(65538, 1000)
+		await waitFor(() => spawned.length === 2, 5_000, 'the second session')
+		await toSearching(supervisor, spawned[1] as FakeHelper)
+		const init = JSON.parse((spawned[1] as FakeHelper).written[0] ?? '{}') as {
+			floor?: number
+			searchFrom?: number
+		}
+		assert.strictEqual(init.floor, indexAt(65538, 1000))
+		assert.strictEqual(
+			init.searchFrom,
+			undefined,
+			'a carry from a different floor must not survive the floor moving',
+		)
 	})
 
 	void it('a late frame from a replaced session cannot act', async () => {

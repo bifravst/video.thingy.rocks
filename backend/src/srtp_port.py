@@ -936,23 +936,32 @@ class SrtpPort:
             and now - last_auth_ms > self.args.auth_loss_ms
             and (self.confirmed or self.mode == "producing")
         ):
-            emit(
-                t="auth",
-                status="lost",
-                sinceMs=now - last_auth_ms,
-                drops=self._drop_count(),
-            )
             # The sender has stopped, or restarted its session in a way that
-            # invalidates the jitter buffer and the fragment in flight. Either way
-            # the pipeline is rebuilt rather than recovered in place: production is
-            # given up (and reported, so the supervisor releases the port's lock),
-            # and the next authenticated packet starts a fresh search from the floor.
+            # invalidates the jitter buffer and the fragment in flight. Either
+            # way the pipeline is rebuilt rather than recovered in place:
+            # production is given up, and the next authenticated packet starts a
+            # fresh search from the floor.
+            #
+            # The frames are ordered so nothing the supervisor acts on can
+            # arrive before the producing pipeline is down: `stopped` carries
+            # the final index and releases the port's lock, and - exactly as in
+            # _cmd_stop - it is only sent once nothing this process does can
+            # still reach Kinesis. `auth lost` follows it as a report, after the
+            # teardown it describes has actually happened; in earlier designs it
+            # came first, which released the lock while the producer could still
+            # be flushing.
             if self.mode == "producing":
                 self._teardown_pipeline()
                 emit(t="stopped", index=self._highest_index())
             self._reset_session()
             if self.pipeline is None:
                 self._build_searching()
+            emit(
+                t="auth",
+                status="lost",
+                sinceMs=now - last_auth_ms,
+                drops=self._drop_count(),
+            )
             return True
 
         if authenticated == 0 and not self.confirmed:

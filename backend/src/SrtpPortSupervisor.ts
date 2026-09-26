@@ -50,6 +50,9 @@ export type SrtpSupervisorState =
 	| 'disabled' // a fatal reason that restarting cannot fix
 	| 'terminated'
 
+/** The helper's `stopped` frame: the producing pipeline is provably down. */
+type StoppedFrame = Extract<SrtpHelperMessage, { t: 'stopped' }>
+
 /** The parts of a helper child process the supervisor needs, so tests can fake one. */
 export type HelperProcess = ExitingChild & {
 	stdin: {
@@ -86,6 +89,7 @@ export type SrtpFloorStore = {
 		index: number,
 		ssrc: number,
 		keyFingerprint: string,
+		generation: number,
 	): Promise<void>
 }
 
@@ -110,8 +114,12 @@ export type SrtpPortSupervisorConfig = {
 	instanceId: string
 	key: SrtpPortKey
 	streamName: string
-	/** Spawns the helper; receives the init frame so the key never travels elsewhere. */
-	spawnHelper: (init: SrtpHelperInit) => HelperProcess
+	/** Spawns the helper; receives the init frame so the key never travels elsewhere.
+	 *
+	 * May resolve a promise: the transport resolves the helper's AWS credentials
+	 * first (they are refreshed per spawn, because a helper outlives the session
+	 * token it was first given), so the child exists only once that has. */
+	spawnHelper: (init: SrtpHelperInit) => HelperProcess | Promise<HelperProcess>
 	locks: SrtpLockService
 	floors: SrtpFloorStore
 	logger?: Logger
@@ -176,6 +184,13 @@ export class SrtpPortSupervisor {
 	private searchFromCarry: { base: number; searchFrom: number } | undefined
 	/** The floor base of the session this helper is running, to validate carries against. */
 	private sessionFloorBase = 0
+	/**
+	 * The ack waiter for a stop written by shutdown, installed by awaitStopAck
+	 * and resolved by the stdout listener outside the serialized queue.
+	 */
+	private stopAck:
+		| { session: HelperProcess; resolve: (frame: StoppedFrame) => void }
+		| undefined
 
 	private tickTimer: NodeJS.Timeout | undefined
 
@@ -206,9 +221,14 @@ export class SrtpPortSupervisor {
 
 	/** Starts supervision. Idempotent. */
 	start(): void {
-		void this.enqueue(() => {
+		// spawnSession's promise is part of the queue: while its floor read is in
+		// flight, nothing queued after it - a stop() above all - can run, so a
+		// shutdown can never observe a half-started session it then has to
+		// resurrect a helper into (the guard below the floor read is the second
+		// lock on that door).
+		void this.enqueue((): void | Promise<void> => {
 			if (this.state !== 'idle') return
-			void this.spawnSession()
+			return this.spawnSession()
 		})
 		if (this.tickTimer === undefined) {
 			this.tickTimer = setInterval(() => this.tick(), this.timeouts.tickMs)
@@ -246,9 +266,14 @@ export class SrtpPortSupervisor {
 		this.config.onTransition?.(from, to)
 	}
 
+	/** True once the port is permanently out of the supervisor's care. */
+	private isGivenUp(): boolean {
+		return this.state === 'terminated' || this.state === 'disabled'
+	}
+
 	private async spawnSession(): Promise<void> {
 		this.fatalReason = undefined
-		if (this.state === 'terminated' || this.state === 'disabled') return
+		if (this.isGivenUp()) return
 		let floor: number | undefined
 		try {
 			// A floor that cannot be read must not look like a missing one: undefined
@@ -267,7 +292,16 @@ export class SrtpPortSupervisor {
 			this.enterCooldown()
 			return
 		}
-		const floorBase = floor === undefined ? 0 : floor >> 16
+		// The floor read was awaited: the state may have changed underneath it
+		// in a runtime this analysis cannot see, even though the queue now
+		// serializes startup against shutdown. A terminated or disabled port
+		// must not gain a helper after the fact.
+		if (this.isGivenUp()) return
+		// Arithmetic, not bitwise: the packet index is 48 bits, and `>>` coerces
+		// to int32, so any floor at or above 2^31 silently truncates its rollover
+		// counter here - a carried search position then validates against the
+		// wrong base. Doubles hold every integer up to 2^53 exactly.
+		const floorBase = floor === undefined ? 0 : Math.floor(floor / 65536)
 		const carry = this.searchFromCarry
 		// The carry only applies while the floor it climbed from has not moved; a
 		// mismatched base only costs a repeated climb, never a missed counter.
@@ -283,14 +317,29 @@ export class SrtpPortSupervisor {
 			...(searchFrom === undefined ? {} : { searchFrom }),
 		}
 		this.sessionFloorBase = floorBase
-		const session = this.config.spawnHelper(init)
+		let session: HelperProcess
+		try {
+			// The spawner may resolve credentials before the child exists (see the
+			// config type); a failure there is contained like every other failed
+			// start, not thrown into the queue.
+			session = await this.config.spawnHelper(init)
+		} catch (err) {
+			this.logger.error(
+				'Could not spawn the SRTP helper',
+				err instanceof Error ? err : new Error(String(err)),
+				{ port: this.config.port },
+			)
+			this.enterCooldown()
+			return
+		}
 		this.helper = session
 		this.protocol = new SrtpHelperProtocol()
 		this.startedAtMs = Date.now()
 		this.lastFrameAtMs = Date.now()
-		// Everything attached synchronously, before anything is awaited or written:
-		// a helper that fails immediately must have a reader, and an unhandled stream
-		// error anywhere in this set ends the whole process.
+		// Everything attaches synchronously with the session in hand, before
+		// anything else is awaited or written: a helper that fails immediately
+		// must have a reader, and an unhandled stream error anywhere in this set
+		// ends the whole process.
 		//
 		// Every listener captures its session. A frame or exit from a session that
 		// has been replaced is routed through the same handlers but cannot act (see
@@ -306,6 +355,15 @@ export class SrtpPortSupervisor {
 		session.stdout.on('data', (chunk) => {
 			const messages = this.protocol.push(chunk.toString())
 			for (const message of messages) {
+				// The shutdown ack takes a shortcut around the queue. shutdown()
+				// runs inside the queue, so a 'stopped' frame that went through
+				// enqueue() could only be handled after shutdown has already given
+				// up on it and killed the helper - which is how every graceful stop
+				// used to cost the full ack timeout. See awaitStopAck.
+				if (message.t === 'stopped' && this.stopAck?.session === session) {
+					this.stopAck.resolve(message)
+					continue
+				}
 				void this.enqueue(async () => this.handleFrame(message, session))
 			}
 		})
@@ -556,6 +614,11 @@ export class SrtpPortSupervisor {
 	/**
 	 * The port is no longer producing, by the helper's own report, and the lock
 	 * must go. Used for auth loss, where the helper tears production down itself.
+	 *
+	 * The helper sends its `stopped` frame - the one that releases the lock -
+	 * only after the producing pipeline is down, and `auth lost` after that; so
+	 * by the time this runs, the stopped frame has usually already released the
+	 * lock and moved on to searching, and this is the report that agrees.
 	 */
 	private async notProducing(): Promise<void> {
 		if (this.state === 'producing' || this.state === 'stopping') {
@@ -614,13 +677,20 @@ export class SrtpPortSupervisor {
 	}
 
 	private async raiseFloor(index: number): Promise<void> {
-		// Best effort and monotonic in the store itself; a failed write only widens
-		// the replay window by what went unrecorded.
+		// Deliberately best effort, and the honest cost is narrower than it looks:
+		// a failed write does not lose what the helper already accepted - its own
+		// maximum stands in-process - but after a restart the persisted floor can
+		// be behind it, and datagrams already accepted in that gap then
+		// authenticate again until the floor catches up. That replay window is
+		// the documented tradeoff of this design (see docs/SRTP-DESIGN.md):
+		// production is never stopped over a metrics/floor write, and the write is
+		// monotonic, so it converges on the next successful report.
 		await this.config.floors.raiseSrtpIndexFloor(
 			this.config.port,
 			index,
 			this.config.key.ssrc,
 			this.config.key.keyFingerprint,
+			this.config.key.generation,
 		)
 	}
 
@@ -703,8 +773,23 @@ export class SrtpPortSupervisor {
 				return
 			}
 			case 'searching':
-			case 'acquiring':
+			case 'acquiring': {
+				// The same absence, before there is a lock to lose: the helper
+				// reports stats on its own timer whether or not any datagram is
+				// arriving, so silence is never "the port is just idle" - it is a
+				// wedged process holding the bound port with nothing to show for
+				// it. Without this, a helper that stalls pre-authentication or
+				// while waiting for the lock is never restarted at all.
+				if (now - this.lastFrameAtMs > this.timeouts.frameStallMs) {
+					this.logger.error(
+						'Helper went silent before production; ending it',
+						undefined,
+						{ port: this.config.port, state: this.state },
+					)
+					await this.endSession(this.state)
+				}
 				return
+			}
 		}
 	}
 
@@ -717,23 +802,65 @@ export class SrtpPortSupervisor {
 		const helper = this.helper
 		if (helper !== undefined && !exited(helper)) {
 			if (this.state === 'producing' || this.state === 'stopping') {
-				// Give the producer the chance to flush: stop, then end the process
-				// if the ack does not come.
-				this.writeCommand({ type: 'stop', v: SRTP_HELPER_PROTOCOL_VERSION })
-				const deadline = Date.now() + this.timeouts.stoppedAckMs
-				while (
-					this.helper !== undefined &&
-					!exited(this.helper) &&
-					Date.now() < deadline
-				) {
-					await sleep(200)
-				}
+				// Give the producer the chance to flush: stop, and end the process
+				// only if the ack does not come (see awaitStopAck for why the ack
+				// cannot take the queue like every other frame).
+				const acked = await this.awaitStopAck(
+					helper,
+					this.timeouts.stoppedAckMs,
+				)
+				// The acked frame never reaches handleFrame - this step is in
+				// flight in the queue it would be enqueued onto - so its last word
+				// on the floor is raised here, not dropped as a post-terminated
+				// frame would be.
+				if (acked?.index !== undefined) await this.raiseFloor(acked.index)
 			}
 			await endChildProcess(helper, { sigkillAfterMs: 5_000 })
 			this.helper = undefined
 		}
 		if (this.lockHeld) await this.releaseLock()
 		this.transition('terminated')
+	}
+
+	/**
+	 * Writes the stop command and resolves with the helper's `stopped` frame,
+	 * or undefined if neither the ack nor the helper's exit arrives in time.
+	 *
+	 * This runs inside the serialized queue, and the queue is exactly what an
+	 * ordinary frame takes to be handled - so the ack is delivered to the waiter
+	 * installed here by the stdout listener directly, and every other frame
+	 * still takes the queue as before. Without that shortcut, the ack can only
+	 * ever arrive after shutdown has already waited out the full timeout and
+	 * killed the helper, which made every graceful stop cost the whole ack
+	 * window (15 s in production) and threw away the final index report.
+	 */
+	private async awaitStopAck(
+		helper: HelperProcess,
+		timeoutMs: number,
+	): Promise<StoppedFrame | undefined> {
+		const acked = new Promise<StoppedFrame>((resolve) => {
+			this.stopAck = { session: helper, resolve }
+		})
+		// The helper ending also answers the question: there will be no further
+		// frame from it, and the caller ends an exited child quickly.
+		const ended = new Promise<undefined>((resolve) => {
+			const onExit = (): void => {
+				this.stopAck = undefined
+				resolve(undefined)
+			}
+			helper.on('exit', onExit)
+			helper.on('error', onExit)
+		})
+		try {
+			this.writeCommand({ type: 'stop', v: SRTP_HELPER_PROTOCOL_VERSION })
+			return await Promise.race([
+				acked,
+				ended,
+				sleep(timeoutMs).then(() => undefined),
+			])
+		} finally {
+			this.stopAck = undefined
+		}
 	}
 
 	private now(): number {

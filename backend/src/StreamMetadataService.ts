@@ -367,18 +367,31 @@ export class StreamMetadataService {
 	 *
 	 * Conditional, so that it only ever goes up: a write that would lower it - an
 	 * instance reporting less than another already recorded, or two writes arriving out
-	 * of order - fails the condition and is dropped. The one way down is a different key
-	 * or SSRC, which is a different index space; that write replaces the floor.
+	 * of order - fails the condition and is dropped.
 	 *
-	 * Best effort otherwise. A failed write leaves the floor where it was, which widens
-	 * the replay window by what went unrecorded rather than opening it; the producer
-	 * also keeps the highest index it has seen, so its own next start is unaffected.
+	 * The one way down is a different key, which is a different index space - but
+	 * only for a *newer* key: the write carries the provisioned key's generation
+	 * (bumped by every provisioning run, see SrtpPortKey), and identity
+	 * replacement requires a strictly larger one. A stale helper still running
+	 * the previous key can therefore keep raising the floor of the row it wrote
+	 * (harmless - the row is superseded the moment the new key's traffic
+	 * arrives) but can never overwrite the new key's floor and so reopen the
+	 * indexes the new key already accepted. Rows without a generation (written
+	 * before the fence) count as the lowest and are replaceable by any.
+	 *
+	 * Best effort otherwise, and the honest cost is a bounded replay window, not
+	 * a lost one: a failed write does not lose what the helper already accepted
+	 * - its own maximum stands in-process - but after a restart the persisted
+	 * floor can be behind it, and datagrams already accepted in that gap then
+	 * authenticate again until the floor catches up. Production is never stopped
+	 * over the write; see SrtpPortSupervisor.raiseFloor for the tradeoff.
 	 */
 	async raiseSrtpIndexFloor(
 		port: number,
 		index: number,
 		ssrc: number,
 		keyFingerprint: string,
+		generation: number,
 	): Promise<void> {
 		try {
 			await this.docClient.send(
@@ -386,13 +399,18 @@ export class StreamMetadataService {
 					TableName: this.tableName,
 					Key: { port },
 					UpdateExpression:
-						'SET srtpIndex = :index, srtpIndexSsrc = :ssrc, srtpIndexKeyFingerprint = :fingerprint, updatedAt = :now',
-					ConditionExpression:
-						'attribute_not_exists(srtpIndex) OR srtpIndex < :index OR srtpIndexSsrc <> :ssrc OR srtpIndexKeyFingerprint <> :fingerprint',
+						'SET srtpIndex = :index, srtpIndexSsrc = :ssrc, srtpIndexKeyFingerprint = :fingerprint, srtpKeyGeneration = :generation, updatedAt = :now',
+					ConditionExpression: [
+						'attribute_not_exists(srtpIndex)',
+						'attribute_not_exists(srtpKeyGeneration)',
+						'srtpKeyGeneration < :generation',
+						'(srtpKeyGeneration = :generation AND srtpIndexSsrc = :ssrc AND srtpIndexKeyFingerprint = :fingerprint AND srtpIndex < :index)',
+					].join(' OR '),
 					ExpressionAttributeValues: {
 						':index': index,
 						':ssrc': ssrc,
 						':fingerprint': keyFingerprint,
+						':generation': generation,
 						':now': new Date().toISOString(),
 					},
 				}),

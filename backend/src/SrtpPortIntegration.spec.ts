@@ -22,7 +22,10 @@ import { h264Payload, srtpPacket } from './testing/srtpSender.ts'
 const KEY = 'ab'.repeat(30)
 const SSRC = 42
 
-const indexAt = (roc: number, seq: number): number => (roc << 16) | seq
+// Arithmetic, not bitwise: the packet index is 48 bits, and `<<`/`|` coerce to
+// int32, so a rollover counter at or above 65536 silently truncates here - the
+// same trap the supervisor's floor-base computation had.
+const indexAt = (roc: number, seq: number): number => roc * 65536 + seq
 
 const waitFor = async (
 	condition: () => boolean,
@@ -523,20 +526,23 @@ void describe('srtp_port.py against real libsrtp', { skip: !hasSrtp }, () => {
 				await helper.waitFor((m) => m.t === 'producing')
 				// Traffic stops. The auth-loss window passes, the producing pipeline
 				// is given up and reported, and the process stays up, re-searching.
+				const stopped = await helper.waitFor((m) => m.t === 'stopped', 10_000)
 				const lost = await helper.waitFor(
 					(m) => m.t === 'auth' && m.status === 'lost',
 					10_000,
 				)
-				assert.ok(lost.t === 'auth')
-				// The stopped acknowledgement is waited for rather than found in
-				// what has arrived: the auth-loss report this wait matched can be
-				// an earlier one from the searching mode that preceded the grant
-				// (those have nothing producing to acknowledge), while the one that
-				// carries the stopped frame lands on the next tick.
-				const stopped = await helper.waitFor((m) => m.t === 'stopped', 10_000)
+				// Order is the guarantee: the stopped frame is the one the
+				// supervisor releases the port's lock on, and it must only be
+				// sent once nothing this process does can still reach Kinesis -
+				// so it precedes the auth-loss report, never the other way
+				// round. An auth lost arriving first would have the lock
+				// released while the producer could still be flushing its last
+				// fragment.
+				const stoppedAt = helper.messages.indexOf(stopped)
+				const lostAt = helper.messages.indexOf(lost)
 				assert.ok(
-					stopped.t === 'stopped',
-					'production was given up and reported',
+					stoppedAt < lostAt,
+					`the stopped frame must precede the auth-loss report (stopped at ${String(stoppedAt)}, lost at ${String(lostAt)})`,
 				)
 				// Traffic resumes above the floor: the same process re-confirms.
 				await sendBurst(helper, KEY, 0, 2000, 10)
