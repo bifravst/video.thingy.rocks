@@ -19,9 +19,9 @@ const SCRIPT = 'scripts/provision-srtp-key.sh'
 /**
  * Stands in for the AWS CLI: records its arguments, the request file's mode and
  * contents, and then takes as long as it is told to, so a test can signal the script
- * while it is waiting on the call. Answers `ssm get-parameter` with the generation the
- * test primes (`FAKE_AWS_GENERATION`), or not-found when unprimed - the port's first
- * provisioning.
+ * while it is waiting on the call. Answers `ssm get-parameter` with not-found (no
+ * script run makes one anymore) and `ssm put-parameter` with the version the test
+ * primes (`FAKE_AWS_VERSION`) - the atomic allocation SSM performs for real.
  */
 const FAKE_AWS = `#!/bin/bash
 printf '%s\\n' "$*" >> "$FAKE_AWS_LOG.argv"
@@ -34,11 +34,10 @@ for arg in "$@"; do
   esac
 done
 if [ "$1" = "ssm" ] && [ "$2" = "get-parameter" ]; then
-  if [ -n "\${FAKE_AWS_GENERATION:-}" ]; then
-    printf '%s\\n' "$FAKE_AWS_GENERATION"
-    exit 0
-  fi
   exit 1
+fi
+if [ "$1" = "ssm" ] && [ "$2" = "put-parameter" ]; then
+  printf '%s\\n' "\${FAKE_AWS_VERSION:-1}"
 fi
 sleep "\${FAKE_AWS_SLEEP:-0}"
 `
@@ -128,16 +127,13 @@ void describe('provision-srtp-key.sh', () => {
 		}
 		assert.strictEqual(request.Type, 'SecureString')
 		assert.strictEqual((JSON.parse(request.Value) as { key: string }).key, key)
-		// Every provisioning run stamps the key with a generation: the fence the
-		// replay floor's rotation condition compares against, so a later
-		// provisioning of the same port is always strictly newer than an
-		// earlier one (unix time is monotonic enough for that by construction).
-		const value = JSON.parse(request.Value) as { generation?: number }
+		// The value carries no generation: the parameter's SSM version is it,
+		// allocated atomically by SSM on the overwrite this request performs -
+		// no counter of ours, nothing to read first, nothing to race.
+		const value = JSON.parse(request.Value) as Record<string, unknown>
 		assert.ok(
-			typeof value.generation === 'number' &&
-				Number.isInteger(value.generation) &&
-				value.generation > 0,
-			'the parameter value must carry a positive integer generation',
+			!('generation' in value),
+			'the value must not carry a generation: the parameter version is it',
 		)
 
 		const argv = readFileSync(`${log}.argv`, 'utf8')
@@ -162,51 +158,34 @@ void describe('provision-srtp-key.sh', () => {
 	})
 
 	/**
-	 * The generation counter, not the clock: two provisions of the same port
-	 * within one second must get different generations, because the replay
-	 * floor's rotation fence only lets a strictly newer generation replace a
-	 * row's identity. Unix seconds gave both the same value, which left the
-	 * newer key unable to persist its floor - silently, since a key that
-	 * cannot write its floor still ingests.
+	 * The rotation generation is not allocated by this script at all: it is the
+	 * key parameter's own SSM version, which SSM increments atomically on every
+	 * overwrite. Two concurrent provisions of one port cannot share a
+	 * generation - the property no read-modify-write counter of ours could
+	 * promise, and the reason both earlier schemes (unix seconds, then a
+	 * per-port counter) were review findings.
 	 */
-	void it('gives a same-second re-provisioning a strictly newer generation', async () => {
-		const first = await start(randomBytes(30).toString('hex')).exited
-		assert.strictEqual(first.code, 0)
-		const request1 = JSON.parse(readFileSync(`${log}.payload`, 'utf8')) as {
-			Value: string
-		}
-		const gen1 = (JSON.parse(request1.Value) as { generation: number })
-			.generation
-
-		// The second run happens immediately - same unix second, most runs -
-		// and reads back the generation the first wrote.
-		const second = await start(randomBytes(30).toString('hex'), 0, {
-			FAKE_AWS_GENERATION: String(gen1),
+	void it('does not allocate a generation - the SSM parameter version is it', async () => {
+		const run = await start(randomBytes(30).toString('hex'), 0, {
+			FAKE_AWS_VERSION: '6',
 		}).exited
-		assert.strictEqual(second.code, 0)
-		const request2 = JSON.parse(readFileSync(`${log}.payload`, 'utf8')) as {
-			Value: string
-		}
-		const gen2 = (JSON.parse(request2.Value) as { generation: number })
-			.generation
-		assert.ok(
-			gen2 > gen1,
-			`the generation must advance within one second (${String(gen1)} -> ${String(gen2)})`,
-		)
-		// One higher, not merely different: the counter, never the clock.
-		assert.strictEqual(gen2, gen1 + 1)
+		assert.strictEqual(run.code, 0)
+		assert.match(run.stdout, /version 6 is this key's rotation generation/)
 
-		// And the counter is written before the key, so a run that fails in
-		// between skips a generation instead of repeating one.
 		const calls = readFileSync(`${log}.argv`, 'utf8').trim().split('\n')
-		const counterPut = calls.findIndex((line) =>
-			line.includes('/srtp/port/6000/generation --type String'),
+		const puts = calls.filter((line) => line.includes('put-parameter'))
+		assert.strictEqual(
+			puts.length,
+			1,
+			'exactly one write happens: the key parameter itself',
 		)
-		const keyPut = calls.findIndex((line) => line.includes('file://'))
-		assert.ok(counterPut >= 0, 'the generation parameter must be written')
 		assert.ok(
-			counterPut < keyPut,
-			'the generation counter must be written before the key parameter',
+			!calls.some((line) => line.includes('get-parameter')),
+			'nothing is read first - there is no counter to read',
+		)
+		assert.ok(
+			!calls.some((line) => line.includes('/generation')),
+			'there is no separate generation parameter',
 		)
 	})
 

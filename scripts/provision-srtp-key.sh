@@ -23,15 +23,15 @@
 # the backend and this script enforce; a different suite, e.g. aes-256-icm, needs a longer
 # key and would be rejected by backend/src/SrtpKeyStore.ts).
 #
-# Every run also bumps the port's `generation` - a separate, non-secret parameter - by
-# reading it and writing one higher (never lower than the current unix time, so a deleted
-# parameter heals instead of restarting below floor rows already written). The backend
-# uses it as the replay floor's rotation fence: a floor row may only be replaced by a
+# This script allocates no generation of its own: the key parameter's SSM version IS it.
+# SSM increments a parameter's version atomically, server-side, on every overwrite - so
+# two provisions of the same port, however concurrent, cannot share a generation, which
+# no read-modify-write counter of ours could promise (both earlier schemes were review
+# findings for exactly that). The backend derives the rotation generation from the
+# version at load time (see backend/src/SrtpKeyStore.ts, SRTP_GENERATION_BASE), and the
+# replay floor uses it as its rotation fence: a floor row may only be replaced by a
 # strictly newer generation, so a helper still running a previous key can never overwrite
-# the floor of the key that replaced it (see backend/src/StreamMetadataService.ts,
-# raiseSrtpIndexFloor). The counter is what makes "strictly newer" true - unix seconds
-# alone let two provisions of the same port within one second collide, which left the
-# newer key unable to persist its floor at all.
+# the floor of the key that replaced it.
 
 set -e
 
@@ -100,28 +100,6 @@ fi
 STACK_NAME="${STACK_NAME:-${STACK_PREFIX:-video}-streaming-2026-05}"
 REGION="${AWS_REGION:-eu-central-1}"
 PARAMETER_NAME="/${STACK_NAME}/srtp/port/${PORT}/key"
-GENERATION_PARAMETER_NAME="/${STACK_NAME}/srtp/port/${PORT}/generation"
-
-# The next generation for this port's key, from the one its parameter holds:
-# one higher than the last, and never lower than the current unix time. Reading
-# the parameter is not secret material - the generation is a counter - so the
-# CLI's stdout is fine here (unlike the key, which never leaves a 0600 request
-# file; see below). A missing parameter is the port's first provisioning.
-CURRENT_GENERATION=$(aws ssm get-parameter \
-  --region "$REGION" \
-  --name "$GENERATION_PARAMETER_NAME" \
-  --query 'Parameter.Value' \
-  --output text 2>/dev/null) || CURRENT_GENERATION=0
-if ! [[ "$CURRENT_GENERATION" =~ ^(0|[1-9][0-9]*)$ ]]; then
-  echo "Error: $GENERATION_PARAMETER_NAME does not hold a non-negative integer: $CURRENT_GENERATION"
-  exit 1
-fi
-NOW=$(date +%s)
-if [ "$((CURRENT_GENERATION + 1))" -lt "$NOW" ]; then
-  GENERATION=$NOW
-else
-  GENERATION=$((CURRENT_GENERATION + 1))
-fi
 
 # The whole request goes in a file so that neither the key nor the JSON wrapping it
 # appears in the AWS CLI's argument vector. mktemp creates it 0600, and the EXIT trap
@@ -146,23 +124,18 @@ trap 'exit 143' TERM
 # There is no KeyId, so SSM encrypts with the AWS managed key aws/ssm. The instance role
 # can decrypt that without a KMS grant; a customer managed key would need one (see the
 # SRTP key grant in cdk/StreamingStack.ts).
-# The generation counter is written BEFORE the key: a run that fails in between only
-# skips a generation (harmless), while the reverse order could repeat one across two
-# different keys - the collision the read above exists to prevent.
-aws ssm put-parameter \
-  --region "$REGION" \
-  --name "$GENERATION_PARAMETER_NAME" \
-  --type String \
-  --overwrite \
-  --value "$GENERATION"
-
-printf '{"Name":"%s","Type":"SecureString","Overwrite":true,"Value":"{\\"key\\":\\"%s\\",\\"ssrc\\":%s,\\"cipher\\":\\"%s\\",\\"auth\\":\\"%s\\",\\"generation\\":%s}"}' \
-  "$PARAMETER_NAME" "$HEX_KEY" "$SSRC" "$CIPHER" "$AUTH" "$GENERATION" >"$REQUEST_FILE"
+# The response's Version is the rotation generation the backend will derive from this
+# parameter (see the header) - captured only to show the operator what SSM allocated.
+printf '{"Name":"%s","Type":"SecureString","Overwrite":true,"Value":"{\\"key\\":\\"%s\\",\\"ssrc\\":%s,\\"cipher\\":\\"%s\\",\\"auth\\":\\"%s\\"}"}' \
+  "$PARAMETER_NAME" "$HEX_KEY" "$SSRC" "$CIPHER" "$AUTH" >"$REQUEST_FILE"
 
 echo "Provisioning SRTP key for port $PORT at $PARAMETER_NAME (region $REGION)..."
 
-aws ssm put-parameter \
+KEY_PARAMETER_VERSION=$(aws ssm put-parameter \
   --region "$REGION" \
-  --cli-input-json "file://$REQUEST_FILE"
+  --cli-input-json "file://$REQUEST_FILE" \
+  --query 'Version' \
+  --output text)
 
-echo "Done. Restart/redeploy the instance(s) so the backend picks up the new key."
+echo "Done. Parameter version ${KEY_PARAMETER_VERSION} is this key's rotation generation (allocated atomically by SSM)."
+echo "Restart/redeploy the instance(s) so the backend picks up the new key."
