@@ -172,7 +172,7 @@ initial ROC and sequence number** (a real encoder cannot do this, and it is the
 only way to exercise wrap, climb and rewind), carries real H.264 (a committed
 x264 fixture with a 1 s GOP, so recovery gaps are measurable in seconds), and
 asserts on the deployed system's own observables: KVS `PutMedia.IncomingBytes`,
-CloudWatch Logs marker lines, the DynamoDB lock table, and the unencrypted
-path's continued health. Every contested behavior from the review history —
-wrap, restart, hint climb, rewind rejection, forged traffic, isolation — is an
-executable case.
+CloudWatch Logs marker lines, the per-transport traffic metrics, the DynamoDB
+lock table, and the unencrypted path's continued health. Every contested
+behavior from the review history — wrap, restart, key rotation, the walked-past
+search, rewind rejection, forged traffic, isolation — is an executable case.
