@@ -95,6 +95,12 @@ class FakeHelper implements HelperProcess {
 		}
 	}
 
+	/** Fires the child's 'error' event without the child dying, as a failed
+	 * signal delivery does. */
+	emitError(): void {
+		for (const listener of [...this.errorListeners]) listener()
+	}
+
 	exit(code = 0): void {
 		if (this.exitCode !== null || this.signalCode !== null) return
 		this.exitCode = code
@@ -698,6 +704,29 @@ void describe('SrtpPortSupervisor', () => {
 			undefined,
 			'a carry from a different floor must not survive the floor moving',
 		)
+	})
+
+	void it('never releases the lock on an error event alone', async () => {
+		const { supervisor, helper, locks } = makeSupervisor()
+		supervisor.start()
+		await toSearching(supervisor, helper)
+		helper.emitFrame(authOkFirst())
+		await waitFor(() => supervisor.currentState === 'producing')
+		// The child errors while very much alive - a signal that could not be
+		// delivered, say. Releasing the lock here would hand the stream to
+		// another writer while this one may still be flushing: the child must
+		// be ended, its death verified, and only then the teardown.
+		helper.emitError()
+		await waitFor(
+			() => supervisor.currentState === 'cooldown',
+			5_000,
+			'the teardown after a verified end',
+		)
+		assert.ok(
+			helper.exitCode !== null || helper.signalCode !== null,
+			'the helper must actually be dead before the lock goes',
+		)
+		assert.strictEqual(locks.log.releases.length, 1)
 	})
 
 	void it('a late frame from a replaced session cannot act', async () => {

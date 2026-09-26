@@ -380,7 +380,16 @@ export class SrtpPortSupervisor {
 			void this.enqueue(async () => this.handleExit(session))
 		})
 		session.on('error', () => {
-			void this.enqueue(async () => this.handleExit(session))
+			// An 'error' is not proof of death (see ChildProcessExit): a signal
+			// that could not be delivered leaves the child alive, and possibly
+			// still writing to the stream this port's lock guards. End it for
+			// real - endChildProcess also settles the failed-spawn case, where
+			// no 'exit' is ever emitted - and only then treat it as gone; the
+			// lock is never released on an 'error' alone.
+			void this.enqueue(async () => {
+				await endChildProcess(session, { sigkillAfterMs: 5_000 })
+				await this.handleExit(session)
+			})
 		})
 		this.writeCommand(init)
 		this.transition('starting')
