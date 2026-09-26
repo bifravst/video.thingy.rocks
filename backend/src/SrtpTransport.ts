@@ -112,6 +112,15 @@ export const srtpTransportConfigFromEnv = (
 			`invalid SRTP port range ${String(start)}-${String(end)} (SRTP_PORT_RANGE_START/END)`,
 		)
 	}
+	// A UDP port is 1-65535: nothing outside that can ever bind, so an
+	// out-of-range configuration would otherwise only surface as parameter
+	// lookups and helper spawns that can never come up - and a wide one as a
+	// large port-list allocation and thousands of parameter reads at startup.
+	if (start < 1 || end > 65535) {
+		throw new Error(
+			`invalid SRTP port range ${String(start)}-${String(end)}: both ports must be within 1-65535 (SRTP_PORT_RANGE_START/END)`,
+		)
+	}
 	if (
 		start <= UNENCRYPTED_PORT_RANGE.end &&
 		end >= UNENCRYPTED_PORT_RANGE.start

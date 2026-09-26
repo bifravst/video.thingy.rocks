@@ -10,7 +10,11 @@ import type {
 	HelperProcess,
 	SrtpSupervisorState,
 } from './SrtpPortSupervisor.ts'
-import { SrtpTransport, type SrtpKeyStoreLike } from './SrtpTransport.ts'
+import {
+	SrtpTransport,
+	srtpTransportConfigFromEnv,
+	type SrtpKeyStoreLike,
+} from './SrtpTransport.ts'
 
 /**
  * The transport's supervisors are real, so they need a helper process shaped
@@ -244,6 +248,100 @@ void describe('SrtpTransport', () => {
 			seen[1],
 			firstSpawnToken,
 			'the respawn must get a fresh session token',
+		)
+	})
+})
+
+void describe('srtpTransportConfigFromEnv', () => {
+	void it('defaults to the SRTP port range when the prefix is set', () => {
+		assert.deepStrictEqual(
+			srtpTransportConfigFromEnv({
+				SRTP_KEY_PARAMETER_PREFIX: '/stack/srtp/port',
+			}),
+			{
+				keyParameterPrefix: '/stack/srtp/port',
+				portRange: { start: 6000, end: 6009 },
+			},
+		)
+	})
+
+	void it('is disabled without a prefix', () => {
+		assert.strictEqual(srtpTransportConfigFromEnv({}), undefined)
+	})
+
+	void it('rejects ports no UDP socket could bind', () => {
+		// Out of range on either side: the configuration would otherwise only
+		// fail much later, as parameter lookups and helper spawns that can
+		// never come up - and a wide range as a large allocation and thousands
+		// of parameter reads at startup.
+		for (const env of [
+			{ SRTP_KEY_PARAMETER_PREFIX: 'p', SRTP_PORT_RANGE_START: '0' },
+			{ SRTP_KEY_PARAMETER_PREFIX: 'p', SRTP_PORT_RANGE_START: '-1' },
+			{ SRTP_KEY_PARAMETER_PREFIX: 'p', SRTP_PORT_RANGE_END: '65536' },
+			{ SRTP_KEY_PARAMETER_PREFIX: 'p', SRTP_PORT_RANGE_END: '99999' },
+			{
+				SRTP_KEY_PARAMETER_PREFIX: 'p',
+				SRTP_PORT_RANGE_START: '70000',
+				SRTP_PORT_RANGE_END: '70009',
+			},
+		]) {
+			assert.throws(
+				() => srtpTransportConfigFromEnv(env),
+				/invalid SRTP port range/,
+				JSON.stringify(env),
+			)
+		}
+	})
+
+	void it('still rejects inverted ranges, non-integers and the unencrypted overlap', () => {
+		for (const env of [
+			{
+				SRTP_KEY_PARAMETER_PREFIX: 'p',
+				SRTP_PORT_RANGE_START: '6005',
+				SRTP_PORT_RANGE_END: '6000',
+			},
+			{ SRTP_KEY_PARAMETER_PREFIX: 'p', SRTP_PORT_RANGE_START: '1.5' },
+			{
+				SRTP_KEY_PARAMETER_PREFIX: 'p',
+				SRTP_PORT_RANGE_START: '5000',
+				SRTP_PORT_RANGE_END: '5010',
+			},
+			{
+				SRTP_KEY_PARAMETER_PREFIX: 'p',
+				SRTP_PORT_RANGE_START: '4000',
+				SRTP_PORT_RANGE_END: '5000',
+			},
+		]) {
+			assert.throws(
+				() => srtpTransportConfigFromEnv(env),
+				/invalid SRTP port range|overlaps the unencrypted/,
+				JSON.stringify(env),
+			)
+		}
+	})
+
+	void it('accepts the full legal port span around the unencrypted range', () => {
+		assert.deepStrictEqual(
+			srtpTransportConfigFromEnv({
+				SRTP_KEY_PARAMETER_PREFIX: 'p',
+				SRTP_PORT_RANGE_START: '1',
+				SRTP_PORT_RANGE_END: '4999',
+			}),
+			{
+				keyParameterPrefix: 'p',
+				portRange: { start: 1, end: 4999 },
+			},
+		)
+		assert.deepStrictEqual(
+			srtpTransportConfigFromEnv({
+				SRTP_KEY_PARAMETER_PREFIX: 'p',
+				SRTP_PORT_RANGE_START: '5010',
+				SRTP_PORT_RANGE_END: '65535',
+			}),
+			{
+				keyParameterPrefix: 'p',
+				portRange: { start: 5010, end: 65535 },
+			},
 		)
 	})
 })
