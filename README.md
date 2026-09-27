@@ -140,7 +140,7 @@ fragments come back, your stream works end to end.
 
 ```bash
 openssl rand -hex 30                       # 30 bytes: key + salt
-STACK_NAME=<stack> ./scripts/provision-srtp-key.sh <port> <ssrc>
+./scripts/provision-srtp-key.sh <port> <ssrc>
 # key read from stdin or a 0600 file - never an argument, never a log line
 #
 # <port>  the ingest port this key is for (6000-6009)
@@ -160,17 +160,14 @@ Manager (SSM), which is also how the e2e suite restarts them. One Run Command
 reaches the whole fleet, wherever its instances are:
 
 ```bash
-STACK=<stack-name>                     # e.g. video-streaming-2026-05
-REGION=eu-central-1
-
 # the fleet's Auto Scaling Group: a stack output (its name is generated, so
 # read it rather than guessing; the instances carry it as a tag)
 ASG=$(aws cloudformation describe-stacks \
-    --stack-name "$STACK" --region "$REGION" \
+    --stack-name "${STACK_NAME:-${STACK_PREFIX:-video}-streaming-2026-05}" --region "$AWS_REGION" \
     --query 'Stacks[0].Outputs[?OutputKey==`AutoScalingGroupName`].OutputValue' \
     --output text)
 
-aws ssm send-command --region "$REGION" \
+aws ssm send-command --region "$AWS_REGION" \
     --document-name AWS-RunShellScript \
     --comment "restart video-streaming.service (SRTP key rotation)" \
     --targets "Key=tag:aws:autoscaling:groupName,Values=$ASG" \
@@ -191,6 +188,25 @@ interactive shell on one instance, when wanted, is
 
 ## Testing your client
 
+Two values the commands in this section need:
+
+- **`<nlb-host>`** — the ingest endpoint: your stack's NLB DNS name, a stack
+  output (read it, don't guess it). The fixed IPv4 address (`NLBIPv4Address`)
+  works too.
+
+  ```bash
+  aws cloudformation describe-stacks \
+      --stack-name "${STACK_NAME:-${STACK_PREFIX:-video}-streaming-2026-05}" \
+      --region "$AWS_REGION" \
+      --query 'Stacks[0].Outputs[?OutputKey==`NLBDnsName`].OutputValue' --output text
+  ```
+
+- **the key** — the 60 hex characters provisioned for your port, as a _file_:
+  the one the webcam wrapper's `--provision` printed, or the one you made when
+  provisioning with `scripts/provision-srtp-key.sh` (an example path,
+  `/tmp/key`, is used below). It is read from `--key-file`, stdin, or a prompt —
+  never from the command line.
+
 ```bash
 python3 scripts/stream-testsrc-to-srtp.py <nlb-host> <port> --ssrc <ssrc> < /tmp/key
 ```
@@ -207,21 +223,26 @@ encoder, for watching the receiver behave under it (authentication, the counter
 search, media reaching Kinesis, recovery across restarts):
 
 ```bash
-# no key for the port yet? generate and provision one, and it tells you the
-# backend restart that has to follow (keys are loaded at service start).
-# <ssrc> is the decimal SSRC (e.g. 42) - the key is generated for you:
+# 1. No key for the port yet? Generate and provision one. <ssrc> is the decimal
+#    number the camera writes into every RTP header (e.g. 42) - the key is
+#    generated for you, and it prints where the key was saved and the backend
+#    restart that has to follow (keys are loaded at service start):
 ./scripts/stream-webcam-to-srtp.sh --provision <port> <ssrc>
 
-# stream your camera (default device /dev/video0; another with --device):
-./scripts/stream-webcam-to-srtp.sh <nlb-host> <port> --ssrc <ssrc> < /tmp/key
+# 2. Restart the backend as it says - see "Restarting the backend from your
+#    machine", above.
+
+# 3. Stream your camera (default device /dev/video0; another with --device),
+#    to the <nlb-host> from above, with the key file step 1 printed:
+./scripts/stream-webcam-to-srtp.sh <nlb-host> <port> --ssrc <ssrc> \
+    --key-file /tmp/srtp-webcam-key.XXXXXXXXXX
 ```
 
 The prerequisites are the same GStreamer stack as the reference sender
 (`--check` names anything missing — the camera element ships in a package the
 synthetic source already needs). Every run is a new session at ROC 0, so a
 second webcam session needs a fresh key exactly like the first one:
-`--provision` again, restart, stream. The restart `--provision` tells you about
-is _Restarting the backend from your machine_, above.
+`--provision` again, restart, stream.
 
 The repository's e2e suite (`backend/e2e`) exercises every behavior in the table
 above against a deployed stack, using a sender with arbitrary initial
