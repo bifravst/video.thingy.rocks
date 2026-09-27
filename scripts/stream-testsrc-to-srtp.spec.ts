@@ -220,19 +220,54 @@ void describe('stream-testsrc-to-srtp.py', () => {
 			: 'requires python3 GStreamer bindings'
 
 		/** The packages the sender says it needs, read from the script itself. */
-		const requiredPackages = (): string[] =>
+		const requiredPackages = (distro = 'apt'): string[] =>
 			JSON.parse(
 				spawnSync(
 					'python3',
 					[
 						'-c',
 						'import json, runpy, sys\n' +
-							"print(json.dumps(runpy.run_path(sys.argv[1], run_name='packages')['required_packages']()))",
+							"print(json.dumps(runpy.run_path(sys.argv[1], run_name='packages')" +
+							"['required_packages'](sys.argv[2] if len(sys.argv) > 2 else 'apt')))",
 						SENDER,
+						distro,
 					],
 					{ encoding: 'utf8', timeout: 30_000 },
 				).stdout,
 			) as string[]
+
+		/** The package manager the script detects on this machine. */
+		const detectedPackageManager = (): string =>
+			JSON.parse(
+				spawnSync(
+					'python3',
+					[
+						'-c',
+						'import json, runpy, sys\n' +
+							"print(json.dumps(runpy.run_path(sys.argv[1], run_name='packages')" +
+							"['package_manager']()))",
+						SENDER,
+					],
+					{ encoding: 'utf8', timeout: 30_000 },
+				).stdout,
+			) as string
+
+		/** The package manager the script identifies a set of os-release IDs as. */
+		const packageManagerFor = (ids: string[]): string =>
+			JSON.parse(
+				spawnSync(
+					'python3',
+					[
+						'-c',
+						'import json, runpy, sys\n' +
+							"print(json.dumps(runpy.run_path(sys.argv[1], run_name='packages')" +
+							"['package_manager'](set(sys.argv[2:]))))",
+						SENDER,
+						...ids,
+					],
+					{ encoding: 'utf8', timeout: 30_000 },
+				).stdout,
+			) as string
 
 		void it('has an install command in the guide naming every package it needs', () => {
 			const install = guide
@@ -250,6 +285,45 @@ void describe('stream-testsrc-to-srtp.py', () => {
 				[],
 				`the guide's install command is missing packages the sender needs: ${install}`,
 			)
+		})
+
+		void it('has an Arch install command naming every package it needs', () => {
+			// The same plugin set under pacman's names: --check reports the
+			// machine's distro, and the guide must carry both so neither
+			// distro's user is told to install the other's packages.
+			const install = guide
+				.split('\n')
+				.find((line) => line.trim().startsWith('sudo pacman -S'))
+			assert.ok(
+				install !== undefined,
+				'the guide should give an Arch install command',
+			)
+			const listed = install.trim().split(/\s+/).slice(3)
+			const needed = requiredPackages('pacman')
+			assert.ok(needed.length > 0)
+			assert.deepStrictEqual(
+				needed.filter((pkg) => !listed.includes(pkg)),
+				[],
+				`the guide's Arch install command is missing packages the sender needs: ${install}`,
+			)
+		})
+
+		void it('identifies Arch and its derivatives for pacman, everything else apt', () => {
+			for (const ids of [
+				['arch'],
+				['endeavouros', 'archlinux'],
+				['manjaro', 'arch'],
+				['cachyos', 'archlinux'],
+			]) {
+				assert.strictEqual(
+					packageManagerFor(ids),
+					'pacman',
+					JSON.stringify(ids),
+				)
+			}
+			for (const ids of [['ubuntu'], ['debian'], ['fedora'], []]) {
+				assert.strictEqual(packageManagerFor(ids), 'apt', JSON.stringify(ids))
+			}
 		})
 
 		void it('is checked in the guide with its own --check, not a separate list', () => {
@@ -306,15 +380,23 @@ void describe('stream-testsrc-to-srtp.py', () => {
 						'rtph264pay',
 						'srtpenc',
 						'udpsink',
+						'v4l2src',
 					]) {
 						assert.match(
 							result.stdout,
 							new RegExp(`missing: ${element} \\(ships in `),
 						)
 					}
+					// The install hint follows the machine's distro: apt names
+					// on Ubuntu/Debian, pacman's on Arch - never the wrong
+					// distro's package names on the other's machine.
+					const distro = detectedPackageManager()
+					assert.strictEqual(distro === 'apt' || distro === 'pacman', true)
 					assert.match(
 						result.stdout,
-						/install with: sudo apt install .*gstreamer1\.0-plugins-good/,
+						new RegExp(
+							`install with: ${distro === 'pacman' ? 'sudo pacman -S .*gst-plugins-good' : 'sudo apt install .*gstreamer1\\.0-plugins-good'}`,
+						),
 					)
 				} finally {
 					rmSync(registry, { recursive: true, force: true })
