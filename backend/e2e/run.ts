@@ -33,7 +33,11 @@ const selected =
 	only === undefined ? cases : cases.filter((c) => c.name.includes(only))
 assert.ok(selected.length > 0, `no case matches --only ${String(only)}`)
 
-const stackName = process.env.STREAMING_STACK_NAME ?? `video-streaming-2026-05`
+const stackName = process.env.STREAMING_STACK_NAME
+assert.ok(
+	stackName !== undefined && stackName.length > 0,
+	'STREAMING_STACK_NAME must explicitly name the stack to test',
+)
 const region =
 	process.env.AWS_REGION ?? process.env.AWS_DEFAULT_REGION ?? 'eu-central-1'
 
