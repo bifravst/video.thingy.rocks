@@ -535,13 +535,19 @@ export const waitForLogLines = async (
 }
 
 /**
- * waitForLogLines, but returning each event's own timestamp.
+ * waitForLogLines, but returning each event's own timestamp and log stream.
  *
  * A window that starts "now" can contain activity from a process that is about
  * to be replaced: the only boundary that is the new process's alone is the
  * timestamp of a line only it writes (its boot line), so a case that must prove
  * recovery anchors its windows to that timestamp instead of to a wall clock
  * taken before the restart.
+ *
+ * The stream is what makes that anchor survive a multi-instance fleet: every
+ * instance boots and writes its own boot line, tens of seconds apart through
+ * the deploy steps, and "the newest boot of all" is a window another instance
+ * may close after the flow-owning one has already authenticated. The stream
+ * correlates an event to the instance that wrote it.
  */
 export const waitForLogEvents = async (
 	region: string,
@@ -549,7 +555,7 @@ export const waitForLogEvents = async (
 	filter: string,
 	since: Date,
 	timeoutMs = 120_000,
-): Promise<{ message: string; timestamp: Date }[]> => {
+): Promise<{ message: string; timestamp: Date; logStream: string }[]> => {
 	const logs = new CloudWatchLogsClient({ region })
 	const deadline = Date.now() + timeoutMs
 	for (;;) {
@@ -558,7 +564,7 @@ export const waitForLogEvents = async (
 				logGroupName: logGroup,
 				startTime: Math.floor(since.getTime() / 1000),
 				endTime: Math.floor(Date.now() / 1000) + 1,
-				queryString: `fields @message, @timestamp | filter @message like /${filter}/ | sort @timestamp asc`,
+				queryString: `fields @message, @timestamp, @logStream | filter @message like /${filter}/ | sort @timestamp asc`,
 			}),
 		)
 		assert.ok(started.queryId !== undefined, 'no query id')
@@ -568,19 +574,24 @@ export const waitForLogEvents = async (
 				new GetQueryResultsCommand({ queryId: started.queryId }),
 			)
 			if (results.status === 'Running') continue
-			// Only @message and @timestamp: @ptr is a base64 event pointer, not a
-			// log line, and would make the result garbage.
-			const events: { message: string; timestamp: Date }[] = []
+			// Only @message, @timestamp and @logStream: @ptr is a base64 event
+			// pointer, not a log line, and would make the result garbage.
+			const events: {
+				message: string
+				timestamp: Date
+				logStream: string
+			}[] = []
 			for (const row of results.results ?? []) {
 				const message = row.find((f) => f.field === '@message')?.value ?? ''
 				const stamp = row.find((f) => f.field === '@timestamp')?.value
+				const stream = row.find((f) => f.field === '@logStream')?.value ?? ''
 				if (message.length === 0 || stamp === undefined) continue
 				const timestamp = new Date(stamp)
 				assert.ok(
 					!Number.isNaN(timestamp.getTime()),
 					`CloudWatch returned a timestamp it cannot parse: ${stamp}`,
 				)
-				events.push({ message, timestamp })
+				events.push({ message, timestamp, logStream: stream })
 			}
 			if (events.length > 0) return events
 			// The query completed with nothing: either the events have not been
@@ -593,6 +604,65 @@ export const waitForLogEvents = async (
 			}
 			break
 		}
+	}
+}
+
+/**
+ * Waits for an event that its own instance wrote after its own boot line.
+ *
+ * The fleet restarts as one SSM command, but the instances do not boot as one:
+ * the deploy steps (a code sync, a plugin build, an npm install) skew their
+ * boot lines by tens of seconds, so anchoring to the newest boot of all can
+ * close the window after the flow-owning instance has already authenticated -
+ * while anchoring to the oldest re-admits the other instance's old process,
+ * which is still alive and authenticating until its own restart lands.
+ *
+ * Correlating by log stream is exact in both directions: an event counts only
+ * when the stream that wrote it shows a boot line before it, which the old
+ * processes' lines (same stream, before the restart) never do.
+ */
+export const waitForEventAfterOwnBoot = async (
+	region: string,
+	logGroup: string,
+	options: {
+		bootFilter: string
+		eventFilter: string
+		since: Date
+		timeoutMs?: number
+	},
+): Promise<{ message: string; timestamp: Date; logStream: string }> => {
+	const deadline = Date.now() + (options.timeoutMs ?? 240_000)
+	for (;;) {
+		const [boots, events] = [
+			await waitForLogEvents(
+				region,
+				logGroup,
+				options.bootFilter,
+				options.since,
+				deadline - Date.now(),
+			).catch(() => []),
+			await waitForLogEvents(
+				region,
+				logGroup,
+				options.eventFilter,
+				options.since,
+				deadline - Date.now(),
+			).catch(() => []),
+		]
+		const correlated = events.find((event) =>
+			boots.some(
+				(boot) =>
+					boot.logStream === event.logStream &&
+					boot.timestamp <= event.timestamp,
+			),
+		)
+		if (correlated !== undefined) return correlated
+		if (Date.now() > deadline) {
+			throw new Error(
+				`no ${options.eventFilter} followed its own instance's boot line since ${options.since.toISOString()}`,
+			)
+		}
+		await sleep(5_000)
 	}
 }
 
@@ -858,18 +928,40 @@ export const readMedia = async (
 	const payload = result.Payload
 	if (payload === undefined) return 0
 	// Bounded on purpose: GetMedia streams continuously (it follows the live
-	// stream, not just the backog), so an unbounded read never ends. The
+	// stream, not just the backlog), so an unbounded read never ends. The
 	// assertion only needs some bytes back, not the whole archive.
+	//
+	// The deadline must bound the READ, not only the loop: a payload that
+	// stalls after a partial response never yields a next chunk, and a plain
+	// `for await` checks the clock only between chunks - it would hang the
+	// whole suite on a stalled stream. Each read is raced against the
+	// remaining time, and the payload is destroyed however the loop ends.
+	const stalled = Symbol('stalled')
+	const iterator = (payload as AsyncIterable<Uint8Array>)[
+		Symbol.asyncIterator
+	]()
 	const chunks: Buffer[] = []
 	let total = 0
 	const deadline = Date.now() + 30_000
-	for await (const chunk of payload as AsyncIterable<Uint8Array>) {
-		chunks.push(Buffer.from(chunk))
-		total += chunk.byteLength
-		if (total > 1_000_000 || Date.now() > deadline) break
-	}
-	if (typeof (payload as { destroy?: () => void }).destroy === 'function') {
-		;(payload as { destroy: () => void }).destroy()
+	try {
+		for (;;) {
+			const next = await Promise.race([
+				iterator.next(),
+				sleep(Math.max(0, deadline - Date.now())).then(
+					(): typeof stalled => stalled,
+				),
+			])
+			if (next === stalled) break
+			if (next.done === true) break
+			const chunk = next.value
+			chunks.push(Buffer.from(chunk))
+			total += chunk.byteLength
+			if (total > 1_000_000) break
+		}
+	} finally {
+		if (typeof (payload as { destroy?: () => void }).destroy === 'function') {
+			;(payload as { destroy: () => void }).destroy()
+		}
 	}
 	return Buffer.concat(chunks).length
 }

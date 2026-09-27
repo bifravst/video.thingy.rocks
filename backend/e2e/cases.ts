@@ -9,7 +9,7 @@ import {
 	readMedia,
 	restartBackend,
 	seedSrtpIndexFloor,
-	waitForLogEvents,
+	waitForEventAfterOwnBoot,
 	waitForLogLines,
 	waitForSrtpIndexFloorFor,
 	waitForStreamIngestion,
@@ -287,13 +287,14 @@ export const cases: E2eCase[] = [
 			return { keyHex }
 		},
 		run: async (ctx: CaseContext, key: { keyHex: string }): Promise<void> => {
-			// One rollover below 65536, crossing it - the upper end of the 48-bit
-			// packet index space - within the first seconds: the first sequence
-			// wrap of a 15 fps stream is ~9 s away, and the one after that a full
-			// 65536 packets (~72 min) later, so the case has to sit at 65535 to
-			// see the crossing at all. The floor row it seeds carries an index at
-			// 65535 * 65536, which no 32-bit arithmetic in the receiver can afford
-			// to misread. Only a synthetic sender can sit here at all.
+			// One rollover below 65536, crossing it - the point where the 48-bit
+			// packet index first leaves the 32-bit range - within the first
+			// seconds: the first sequence wrap of a 15 fps stream is ~9 s away,
+			// and the one after that a full 65536 packets (~72 min) later, so
+			// the case has to sit at 65535 to see the crossing at all. The floor
+			// row it seeds carries an index at 65535 * 65536, which no 32-bit
+			// arithmetic in the receiver can afford to misread. Only a
+			// synthetic sender can sit here at all.
 			await seedSrtpIndexFloor(ctx.config.region, ctx.config.tableName, 6003, {
 				keyHex: key.keyHex,
 				ssrc: 1013,
@@ -506,34 +507,34 @@ export const cases: E2eCase[] = [
 			const restartSince = new Date()
 			await restartBackend(ctx.config.region, ctx.instances, ctx.codeBucket)
 
-			// Anchor both assertions to the restarted process, not to the clock:
-			// the old process authenticated this very sender during the five
-			// seconds before the restart, so a window taken from wall-clock
-			// `since` can match the OLD process's lines and the pre-restart
-			// media, and the case can pass without proving any recovery at all.
-			// The boot line is the one line only the new process writes.
-			step('waiting for the restarted service to come up (its own boot line)')
-			const boots = await waitForLogEvents(
+			// Anchor both assertions to the restarted instance that owns the
+			// sender's flow, not to the clock. The fleet restarts as one SSM
+			// command but boots as several moments - the deploy steps skew the
+			// instances' boot lines by tens of seconds - so "the newest boot of
+			// all" can close the window after the flow-owning instance has
+			// already re-authenticated, and "the oldest" re-admits another
+			// instance's old process, still alive until its own restart lands.
+			// The correlation is per log stream: the authentication counts
+			// only when its own instance's boot line precedes it on the same
+			// stream, which the pre-restart lines never satisfy.
+			step(
+				'waiting for the restarted instance that owns the flow to re-authenticate the sender',
+			)
+			const recovered = await waitForEventAfterOwnBoot(
 				ctx.config.region,
 				ctx.config.logGroup,
-				'SRTP transport started',
-				restartSince,
-				300_000,
+				{
+					bootFilter: 'SRTP transport started',
+					eventFilter: 'SRTP traffic authenticated.*"port":6006',
+					since: restartSince,
+				},
 			)
-			const postRestart = boots[boots.length - 1]?.timestamp as Date
+			const postRestart = recovered.timestamp
 
-			// Re-authenticated after the restart (a new first authentication for
-			// the port, in this process's lifetime) and media resumed. The
-			// ingestion window is ceiling-aligned: only bytes in minutes after
-			// the boot count, never the pre-restart minute's earlier upload.
-			const lines = await waitForLogLines(
-				ctx.config.region,
-				ctx.config.logGroup,
-				`SRTP traffic authenticated.*"port":6006`,
-				postRestart,
-				240_000,
-			)
-			assert.ok(lines.length > 0)
+			// Media resumed, in minutes the restarted process's authentication
+			// can account for: the window is ceiling-aligned so only bytes
+			// after the recovery count, never the pre-restart minute's earlier
+			// upload.
 			await waitForStreamIngestion(
 				ctx.config.region,
 				streamNameFor(ctx.config, 6006),
