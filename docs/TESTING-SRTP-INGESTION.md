@@ -87,6 +87,13 @@ GStreamer stack it drives (checked with its own
 sudo apt install python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-plugins-base gstreamer1.0-plugins-ugly gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
 ```
 
+On Arch Linux, the same plugin set under its own names (`--check` reports
+whichever applies):
+
+```bash
+sudo pacman -S python-gobject gstreamer gst-plugins-base gst-plugins-ugly gst-plugins-good gst-plugins-bad
+```
+
 Then:
 
 ```bash

@@ -59,30 +59,71 @@ DEFAULT_SSRC = "3735928559"
 #: How long a clean end of stream gets after Ctrl+C before the pipeline is torn down.
 EOS_GRACE_MS = 3000
 
-#: Elements the pipeline needs, and the Ubuntu/Debian package each one ships in. They
-#: are spread across four plugin packages, and a missing one otherwise fails as an
-#: opaque link error. This table is the one list of what the sender needs: --check
-#: reports against it, and the guide's install command is checked against it, because
-#: a second copy of the list in the guide is how the two came to disagree.
+#: Elements the pipeline needs, and the package each one ships in, per package
+#: manager: Ubuntu/Debian's apt, and Arch's pacman. The plugin sets are the
+#: same, only the names differ; --check and the failure hints report the
+#: machine's detected distro, and the guide documents both.
 REQUIRED_ELEMENTS = {
-    "videotestsrc": "gstreamer1.0-plugins-base",
-    "videoconvert": "gstreamer1.0-plugins-base",
-    "x264enc": "gstreamer1.0-plugins-ugly",
-    "rtph264pay": "gstreamer1.0-plugins-good",
-    "srtpenc": "gstreamer1.0-plugins-bad",
-    "udpsink": "gstreamer1.0-plugins-good",
+    "videotestsrc": ("gstreamer1.0-plugins-base", "gst-plugins-base"),
+    "videoconvert": ("gstreamer1.0-plugins-base", "gst-plugins-base"),
+    "x264enc": ("gstreamer1.0-plugins-ugly", "gst-plugins-ugly"),
+    "rtph264pay": ("gstreamer1.0-plugins-good", "gst-plugins-good"),
+    "srtpenc": ("gstreamer1.0-plugins-bad", "gst-plugins-bad"),
+    "udpsink": ("gstreamer1.0-plugins-good", "gst-plugins-good"),
     # Only needed by --source webcam, but it ships in a package the test source
     # needs anyway, so --check simply requires it and the guide's install
-    # command is unchanged.
-    "v4l2src": "gstreamer1.0-plugins-good",
+    # commands are unchanged.
+    "v4l2src": ("gstreamer1.0-plugins-good", "gst-plugins-good"),
 }
-#: What the GStreamer Python bindings themselves come in.
-BINDINGS_PACKAGES = ("python3-gi", "gir1.2-gstreamer-1.0")
+#: The GStreamer Python bindings per package manager. Arch needs no separate
+#: typelib package name: the gstreamer core package ships the typelib, and
+#: gst-plugins-base depends on it.
+BINDINGS_PACKAGES = (
+    ("python3-gi", "gir1.2-gstreamer-1.0"),
+    ("python-gobject", "gstreamer"),
+)
+#: The install command per package manager, as the hints print it.
+PACKAGE_MANAGERS = {
+    "apt": "sudo apt install",
+    "pacman": "sudo pacman -S",
+}
+#: Index of each package manager's column in the tables above.
+APT, PACMAN = 0, 1
+DISTRO_INDEX = {"apt": APT, "pacman": PACMAN}
 
 
-def required_packages() -> list[str]:
-    """Every package the sender needs, bindings first, each once."""
-    return [*BINDINGS_PACKAGES, *dict.fromkeys(REQUIRED_ELEMENTS.values())]
+def package_manager(ids: set[str] | None = None) -> str:
+    """The package manager this machine's distro uses, from /etc/os-release.
+
+    `ids` overrides the read (for tests). Arch and its derivatives identify as
+    arch or archlinux in ID/ID_LIKE; everything else gets apt names, which is
+    what the guide documents first.
+    """
+    if ids is None:
+        try:
+            with open("/etc/os-release", encoding="utf-8") as handle:
+                release = {
+                    key: value.strip().strip('"')
+                    for key, value in (
+                        line.split("=", 1) for line in handle if "=" in line
+                    )
+                }
+        except OSError:
+            release = {}
+        ids = {
+            release.get("ID", "").lower(),
+            *release.get("ID_LIKE", "").lower().split(),
+        }
+    return "pacman" if ids & {"arch", "archlinux"} else "apt"
+
+
+def required_packages(distro: str = "apt") -> list[str]:
+    """Every package the sender needs for a distro, bindings first, each once."""
+    i = DISTRO_INDEX[distro]
+    return [
+        *BINDINGS_PACKAGES[i],
+        *dict.fromkeys(pkgs[i] for pkgs in REQUIRED_ELEMENTS.values()),
+    ]
 
 
 def fail(message: str, code: int = 2) -> NoReturn:
@@ -179,33 +220,43 @@ def load_gstreamer() -> Any:
         gi.require_version("Gst", "1.0")
         from gi.repository import Gst
     except (ImportError, ValueError):
+        apt_hint = f"{PACKAGE_MANAGERS['apt']} {' '.join(BINDINGS_PACKAGES[APT])}"
+        pacman_hint = (
+            f"{PACKAGE_MANAGERS['pacman']} {' '.join(BINDINGS_PACKAGES[PACMAN])}"
+        )
         fail(
             "the GStreamer Python bindings are not installed "
-            f"(Ubuntu/Debian: {' '.join(BINDINGS_PACKAGES)})",
+            f"(Ubuntu/Debian: {apt_hint}; Arch: {pacman_hint})",
             1,
         )
     Gst.init(None)
     return Gst
 
 
-def missing_elements(gst: Any) -> dict[str, str]:
-    """The required elements this machine lacks, each with the package it ships in."""
+def missing_elements(gst: Any, distro: str = "apt") -> dict[str, str]:
+    """The required elements this machine lacks, each with the package it
+    ships in for the given distro."""
+    index = DISTRO_INDEX[distro]
     return {
-        element: package
-        for element, package in REQUIRED_ELEMENTS.items()
+        element: packages[index]
+        for element, packages in REQUIRED_ELEMENTS.items()
         if gst.ElementFactory.find(element) is None
     }
 
 
 def check() -> int:
     """--check: whether this machine can run the sender, and what to install if not."""
-    missing = missing_elements(load_gstreamer())
+    distro = package_manager()
+    missing = missing_elements(load_gstreamer(), distro)
     if not missing:
         print("ok")
         return 0
     for element, package in missing.items():
         print(f"missing: {element} (ships in {package})")
-    print(f"install with: sudo apt install {' '.join(dict.fromkeys(missing.values()))}")
+    print(
+        f"install with: {PACKAGE_MANAGERS[distro]} "
+        f"{' '.join(dict.fromkeys(missing.values()))}"
+    )
     return 1
 
 
@@ -221,7 +272,7 @@ def main(argv: list[str]) -> int:
     Gst = load_gstreamer()
     from gi.repository import GLib
 
-    for element, package in missing_elements(Gst).items():
+    for element, package in missing_elements(Gst, package_manager()).items():
         fail(f"GStreamer element '{element}' not found (ships in {package})", 1)
 
     # Built without any of the caller's input. Host, port, SSRC and the webcam
