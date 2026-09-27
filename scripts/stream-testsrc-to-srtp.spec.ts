@@ -161,6 +161,24 @@ void describe('stream-testsrc-to-srtp.py', () => {
 			assert.match(stderr, /exactly 60 hex characters/)
 		})
 
+		void it('rejects an unknown source', () => {
+			const { status, stderr } = run(
+				['127.0.0.1', '6000', '--source', 'screen'],
+				{ input: `${freshKey()}\n` },
+			)
+			assert.notStrictEqual(status, 0)
+			assert.match(stderr, /invalid choice.*screen|usage:/i)
+		})
+
+		void it('rejects a webcam device that does not exist', () => {
+			const { status, stderr } = run(
+				['127.0.0.1', '6000', '--source', 'webcam', '--device', '/dev/nope'],
+				{ input: `${freshKey()}\n` },
+			)
+			assert.notStrictEqual(status, 0)
+			assert.match(stderr, /no such webcam device: \/dev\/nope/)
+		})
+
 		void it('reads the key file it is pointed at', () => {
 			const path = join(dir, 'short.txt')
 			writeFileSync(path, 'abc\n', { mode: 0o600 })
