@@ -96,6 +96,15 @@ STACK_NAME=<stack> ./scripts/provision-srtp-key.sh 6000 42 < /tmp/key
 python3 scripts/stream-testsrc-to-srtp.py <nlb-dns> 6000 --ssrc 42 < /tmp/key
 ```
 
+Or your webcam instead of the synthetic source - real video data to watch the
+stack behave under:
+
+```bash
+./scripts/stream-webcam-to-srtp.sh <nlb-dns> 6000 --ssrc 42 < /tmp/key
+# with no key provisioned yet, this sets one up first and says what to do:
+./scripts/stream-webcam-to-srtp.sh --provision 6000 42
+```
+
 Each run of the sender is a new session at rollover 0, so rotate the key between
 runs against anything that matters (see above).
 

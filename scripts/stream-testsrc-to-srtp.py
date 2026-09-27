@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Streams a synthetic test video as SRTP-encrypted RTP/H.264 to an SRTP ingest port.
+"""Streams video as SRTP-encrypted RTP/H.264 to an SRTP ingest port.
 
 Usage:
     printf '%s\\n' "$KEY" | ./scripts/stream-testsrc-to-srtp.py <host> <port> [--ssrc N]
     ./scripts/stream-testsrc-to-srtp.py <host> <port> --key-file key.txt [--ssrc N]
     ./scripts/stream-testsrc-to-srtp.py <host> <port> [--ssrc N]    # prompts, no echo
+    ./scripts/stream-testsrc-to-srtp.py <host> <port> --source webcam [--device /dev/video0] [--ssrc N]
     ./scripts/stream-testsrc-to-srtp.py --check    # can this machine run it?
 
 <port> is an SRTP ingest port (6000-6009) and --ssrc the SSRC provisioned for it,
 3735928559 by default. The key is the 60 hex characters provisioned for the port with
 scripts/provision-srtp-key.sh, read from --key-file, from stdin, or from a prompt.
+
+--source webcam captures a local V4L2 device instead of the synthetic test source -
+real video data from a real camera, for watching the deployed stack behave under it
+(scripts/stream-webcam-to-srtp.sh wraps this mode).
 
 The key is never an argument, to this script or to anything it runs. A process's
 argument vector is readable by every local user through /proc/<pid>/cmdline for as
@@ -66,6 +71,10 @@ REQUIRED_ELEMENTS = {
     "rtph264pay": "gstreamer1.0-plugins-good",
     "srtpenc": "gstreamer1.0-plugins-bad",
     "udpsink": "gstreamer1.0-plugins-good",
+    # Only needed by --source webcam, but it ships in a package the test source
+    # needs anyway, so --check simply requires it and the guide's install
+    # command is unchanged.
+    "v4l2src": "gstreamer1.0-plugins-good",
 }
 #: What the GStreamer Python bindings themselves come in.
 BINDINGS_PACKAGES = ("python3-gi", "gir1.2-gstreamer-1.0")
@@ -110,7 +119,7 @@ def check_environment(argv: list[str]) -> None:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stream a synthetic test video as SRTP to an SRTP ingest port.",
+        description="Stream video as SRTP to an SRTP ingest port.",
         epilog="The key is read from --key-file, from stdin, or from a prompt - "
         "never from the command line.",
     )
@@ -118,12 +127,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("port", help="SRTP ingest port, 6000-6009")
     parser.add_argument("--ssrc", default=DEFAULT_SSRC, help="SSRC provisioned for the port")
     parser.add_argument("--key-file", help="file whose first line is the key")
+    parser.add_argument(
+        "--source",
+        choices=("testsrc", "webcam"),
+        default="testsrc",
+        help="the synthetic test source, or a local webcam (V4L2)",
+    )
+    parser.add_argument(
+        "--device",
+        default="/dev/video0",
+        help="the webcam device to capture (with --source webcam)",
+    )
     args = parser.parse_args(argv)
 
     if not PORT.match(args.port):
         fail("port must be one of 6000-6009, in canonical decimal form (no leading zeros)")
     if not SSRC.match(args.ssrc) or len(args.ssrc) > 10 or int(args.ssrc) > UINT32_MAX:
         fail("ssrc must be a canonical decimal uint32 (0-4294967295, no leading zeros)")
+    if args.source == "webcam" and not os.path.exists(args.device):
+        fail(
+            f"no such webcam device: {args.device} (list yours with 'ls /dev/video*', "
+            "and pass it with --device)"
+        )
     return args
 
 
@@ -199,16 +224,28 @@ def main(argv: list[str]) -> int:
     for element, package in missing_elements(Gst).items():
         fail(f"GStreamer element '{element}' not found (ships in {package})", 1)
 
-    # Built without any of the caller's input. Host, port and SSRC are set as
-    # properties below rather than interpolated here, so nothing typed on the command
-    # line can add elements to the pipeline - and the key is not in this string at all.
+    # Built without any of the caller's input. Host, port, SSRC and the webcam
+    # device are set as properties below rather than interpolated here, so
+    # nothing typed on the command line can add elements to the pipeline - and
+    # the key is not in this string at all. --source is a fixed choice, which
+    # is what lets it select the string at all.
+    source = (
+        "videotestsrc is-live=true"
+        if args.source == "testsrc"
+        else "v4l2src name=cam"
+    )
     pipeline = Gst.parse_launch(
-        "videotestsrc is-live=true ! videoconvert "
-        "! x264enc tune=zerolatency speed-preset=ultrafast "
+        f"{source} ! videoconvert "
+        # key-int-max=30 bounds the GOP to about a second, so the receiver
+        # resumes at the next keyframe after any gap - the same shape the
+        # committed e2e fixture has, for the same reason.
+        "! x264enc tune=zerolatency speed-preset=ultrafast key-int-max=30 "
         "! rtph264pay name=pay config-interval=1 pt=96 "
         "! srtpenc name=enc ! udpsink name=sink"
     )
     pipeline.get_by_name("pay").set_property("ssrc", int(args.ssrc))
+    if args.source == "webcam":
+        pipeline.get_by_name("cam").set_property("device", args.device)
     sink = pipeline.get_by_name("sink")
     sink.set_property("host", args.host)
     sink.set_property("port", int(args.port))
@@ -260,10 +297,15 @@ def main(argv: list[str]) -> int:
     for signum in (signal.SIGINT, signal.SIGTERM):
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, signum, end_stream, signum)
 
+    video = (
+        "640x480 @ 30fps (videotestsrc)"
+        if args.source == "testsrc"
+        else f"webcam ({args.device})"
+    )
     print(
         "\nStreaming configuration:\n"
         f"  Target: {args.host}:{args.port}\n"
-        "  Video:  640x480 @ 30fps (videotestsrc)\n"
+        f"  Video:  {video}\n"
         "  Codec:  H.264 over RTP (RFC 6184), SRTP-encrypted\n"
         f"  SSRC:   {args.ssrc}\n"
         "\nPress Ctrl+C to stop streaming\n",
