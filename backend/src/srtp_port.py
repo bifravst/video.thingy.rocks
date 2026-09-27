@@ -584,12 +584,24 @@ class SrtpPort:
     def _record_authenticated(self, seq: int | None) -> bool:
         """Decides whether one packet libsrtp authenticated is accepted.
 
-        Accepted means above the floor. A packet at or below it authenticated only
-        because libsrtp's replay window starts empty in every new process, and after
-        every remove-key: it is a copy of something this port already accepted, or a
-        sender reusing its packet index under this key. It is dropped before the
-        depayloader, and it counts for nothing - not as authenticated, not towards
-        confirming a candidate, and not as the traffic that keeps the stream alive.
+        Accepted means above the session's admission floor. A packet at or
+        below it authenticated only because libsrtp's replay window starts
+        empty in every new process, and after every remove-key: it is a copy
+        of something a PREVIOUS session of this port accepted, or a sender
+        reusing its packet index under this key. It is dropped before the
+        depayloader, and it counts for nothing - not as authenticated, not
+        towards confirming a candidate, and not as the traffic that keeps the
+        stream alive.
+
+        The floor does NOT rise with what this session accepts. Ratcheting it
+        to the running maximum rejected ordinary reordering: arrival order
+        100, 102, 101 raised the floor to 102 and dropped the legitimate 101
+        that libsrtp had just accepted inside its replay window - UDP reorder
+        is a network condition, not a rewind. In-session duplicates need no
+        floor of ours: libsrtp's own window refuses anything it has seen, and
+        anything older than the window's start, so a ratchet past it could
+        only ever drop packets that were valid. The floor moves once, when a
+        session is rebuilt (_reset_session), to everything accepted so far.
         """
         if seq is None:
             # Too short to carry a sequence number, so its index cannot be shown to be
@@ -625,10 +637,6 @@ class SrtpPort:
             c.last_auth_ms = now_ms()
             if c.highest_index is None or index > c.highest_index:
                 c.highest_index = index
-            # The floor rises with what this session accepts, so a duplicate from
-            # further back than libsrtp's replay window is refused in-session too.
-            if self.floor is None or index > self.floor:
-                self.floor = index
             return True
 
     def _on_access_unit(
@@ -852,6 +860,16 @@ class SrtpPort:
         confirmed counter when production is granted on the heels of a
         confirmation.
         """
+        # This is the one place the admission floor moves: a rebuild ends the
+        # session whose reordering the fixed floor allowed through, so
+        # everything accepted so far becomes the boundary the next session may
+        # not go under. Within a session it stays where the session started -
+        # see _record_authenticated for why moving it there dropped legitimate
+        # reordering.
+        with self.counters.lock:
+            highest = self.counters.highest_index
+        if highest is not None and (self.floor is None or highest > self.floor):
+            self.floor = highest
         base = 0 if self.floor is None else self.floor >> 16
         self.candidates = Search(base, self.carried_search_from, self.args.floor_every)
         self.candidate = seed if seed is not None else next(self.candidates)
@@ -1129,8 +1147,8 @@ class SrtpPort:
                 t="warning",
                 element="srtpdec",
                 message=(
-                    f"dropped {stale} authenticated datagrams at or below the highest"
-                    " packet index already accepted under this key: a replay, or a"
+                    f"dropped {stale} authenticated datagrams at or below this"
+                    " session's replay floor: a recording of earlier traffic, or a"
                     " sender that restarted its packet index without a new key"
                 ),
             )
