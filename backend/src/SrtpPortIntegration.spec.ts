@@ -291,6 +291,43 @@ void describe('srtp_port.py against real libsrtp', { skip: !hasSrtp }, () => {
 				await helper.stop()
 			}
 		})
+
+		void it('accepts a reordered packet within the session', async () => {
+			const helper = await startHelper({ key: KEY, ssrc: SSRC })
+			try {
+				await sendBurst(helper, KEY, 0, 1000, 1)
+				await helper.waitFor(
+					(m) => m.t === 'auth' && m.status === 'ok' && m.first,
+				)
+				// The authenticated arrival order 1002, 1004, 1003: the late
+				// 1003 is within libsrtp's replay window and unseen, so libsrtp
+				// accepts it - and the admission floor must not have ratcheted
+				// to 1004 mid-session and dropped it as stale. UDP reordering is
+				// a network condition, not a rewind: the floor moves only when a
+				// session is rebuilt.
+				await sendBurst(helper, KEY, 0, 1002, 1)
+				await sendBurst(helper, KEY, 0, 1004, 1)
+				await sendBurst(helper, KEY, 0, 1003, 1)
+				const stats = await helper.waitFor(
+					(m) => m.t === 'stats' && m.authenticated >= 4,
+					10_000,
+				)
+				assert.ok(
+					stats.t === 'stats' && stats.authenticated >= 4,
+					`all four packets must be accepted (authenticated: ${String(stats.t === 'stats' ? stats.authenticated : '?')})`,
+				)
+				// Nothing was dropped as below-floor, either: the reorder was
+				// admitted, not classified stale.
+				assert.ok(
+					!helper.messages.some(
+						(m) => m.t === 'warning' && m.message?.includes('replay floor'),
+					),
+					'a legitimate reorder must never be reported as a floor drop',
+				)
+			} finally {
+				await helper.stop()
+			}
+		})
 	})
 
 	void describe('the replay floor', () => {
@@ -327,9 +364,7 @@ void describe('srtp_port.py against real libsrtp', { skip: !hasSrtp }, () => {
 						)
 					}
 					const stale = second.messages.find(
-						(m) =>
-							m.t === 'warning' &&
-							m.message.includes('at or below the highest'),
+						(m) => m.t === 'warning' && m.message.includes('replay floor'),
 					)
 					assert.ok(stale, 'the stale drops are reported, counted not repeated')
 				} finally {
