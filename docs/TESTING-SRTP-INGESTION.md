@@ -124,8 +124,8 @@ number**, and asserts on the stack's own observables - the KVS `PutMedia`
 metric, `GetMedia` fragments read back, the application log, the per-transport
 traffic metrics, and the lock table.
 
-The stack it runs against is named, never guessed: pass the deployed stack's
-name unless it is the default one.
+The stack it runs against is named, never guessed: `STREAMING_STACK_NAME` is
+required, and the run exits before touching anything if it is not set.
 
 The suite deploys the backend code to the fleet **from the stack's code
 bucket** - it pulls what `npm run cdk:prod:deploy` last put there, so a code
