@@ -106,7 +106,7 @@ increasing for the lifetime of a key**:
   indistinguishable from a keystream-reusing attack, and the receiver refuses
   it: every packet at or below the floor is dropped and counted. The log will
   show
-  `dropped N authenticated datagrams at or below the highest packet index already accepted under this key`.
+  `dropped N authenticated datagrams at or below this session's replay floor`.
 
 If your device must restart its numbering — after a reboot, a firmware update,
 or a session reset — ask for a **fresh key** (`scripts/provision-srtp-key.sh`,
@@ -163,6 +163,27 @@ A GStreamer reference sender with the same requirements as above (see
 `scripts/stream-testsrc-to-srtp.py --check` for the element/package
 prerequisites). Note that each run of it starts a new session at ROC 0 — rotate
 the key between runs, exactly as the hard rule requires.
+
+### Streaming your webcam instead
+
+The same sender, wrapped for a local camera — real video data from a real
+encoder, for watching the receiver behave under it (authentication, the counter
+search, media reaching Kinesis, recovery across restarts):
+
+```bash
+# no key for the port yet? generate and provision one, and it tells you the
+# backend restart that has to follow (keys are loaded at service start):
+./scripts/stream-webcam-to-srtp.sh --provision <port> <ssrc>
+
+# stream your camera (default device /dev/video0; another with --device):
+./scripts/stream-webcam-to-srtp.sh <nlb-host> <port> --ssrc <ssrc> < /tmp/key
+```
+
+The prerequisites are the same GStreamer stack as the reference sender
+(`--check` names anything missing — the camera element ships in a package the
+synthetic source already needs). Every run is a new session at ROC 0, so a
+second webcam session needs a fresh key exactly like the first one:
+`--provision` again, restart, stream.
 
 The repository's e2e suite (`backend/e2e`) exercises every behavior in the table
 above against a deployed stack, using a sender with arbitrary initial
