@@ -83,6 +83,18 @@ const readyFrame = {
 	port: 6000,
 } as const
 
+/** A stats frame carrying a cumulative input-byte counter. */
+const statsFrame = (inputBytes: number) =>
+	({
+		t: 'stats',
+		inputs: inputBytes,
+		inputBytes,
+		authenticated: 1,
+		aus: 0,
+		roc: 0,
+		drops: 0,
+	}) as const
+
 const key: SrtpPortKey = {
 	keyHex: 'ab'.repeat(30),
 	ssrc: 42,
@@ -139,9 +151,16 @@ const makeTransport = (config: {
 		credentials: { accessKeyId: string; sessionToken?: string },
 	) => HelperProcess
 	onTransition?: (from: SrtpSupervisorState, to: SrtpSupervisorState) => void
-}): { transport: SrtpTransport; serving: boolean[]; children: FakeChild[] } => {
+}): {
+	transport: SrtpTransport
+	serving: boolean[]
+	children: FakeChild[]
+	/** The bytes the transport reported, in report order. */
+	received: number[]
+} => {
 	const children: FakeChild[] = []
 	const serving: boolean[] = []
+	const received: number[] = []
 	const transport = new SrtpTransport({
 		keyParameterPrefix: '/test-stack/srtp/port',
 		portRange: { start: 6000, end: 6000 },
@@ -155,14 +174,16 @@ const makeTransport = (config: {
 			setServing: (_transport, isServing) => {
 				serving.push(isServing)
 			},
-			recordReceived: () => {},
+			recordReceived: (_transport, bytes) => {
+				received.push(bytes)
+			},
 		},
 		credentialProvider: config.credentialProvider,
 		spawnProcess: (port, _init, _key, credentials) =>
 			config.spawnProcess(port, credentials),
 	})
 	active.push(transport)
-	return { transport, serving, children }
+	return { transport, serving, children, received }
 }
 
 void describe('SrtpTransport', () => {
@@ -204,6 +225,49 @@ void describe('SrtpTransport', () => {
 		await waitFor(
 			() => serving.at(-1) === false,
 			'not serving once every port gave up',
+		)
+	})
+
+	void it('counts a respawned helper first sample in full, not minus the dead one', async () => {
+		const { transport, children, received } = makeTransport({
+			credentialProvider: async () => ({
+				accessKeyId: 'key-1',
+				secretAccessKey: 'secret',
+			}),
+			spawnProcess: () => {
+				const child = new FakeChild()
+				children.push(child)
+				return child
+			},
+		})
+		assert.strictEqual(await transport.start(), true)
+		await waitFor(() => children.length === 1, 'the first helper spawn')
+		const first = children[0]
+		assert.ok(first !== undefined)
+		first.emitFrame(readyFrame)
+		// An old session's cumulative counter: the baseline it leaves is what
+		// a respawn must not subtract from the next process's traffic.
+		first.emitFrame(statsFrame(8_000))
+		await waitFor(() => received.length === 1, 'the first sample reported')
+		assert.strictEqual(received[0], 8_000)
+
+		// The helper dies and is replaced. The new process counts inputBytes
+		// from zero, and its first sample can already exceed the dead one's
+		// last value - the socket buffer was filling while it started - which
+		// makes the reset indistinguishable from continued counting. The
+		// baseline is cleared on every spawn, so the sample counts in full;
+		// left alone, the delta under-reports by exactly the old baseline.
+		first.exit(1)
+		await waitFor(() => children.length === 2, 'the respawn')
+		const second = children[1]
+		assert.ok(second !== undefined)
+		second.emitFrame(readyFrame)
+		second.emitFrame(statsFrame(50_000))
+		await waitFor(() => received.length === 2, 'the respawned sample reported')
+		assert.strictEqual(
+			received[1],
+			50_000,
+			"the first sample of a new helper must count in full, not minus the dead process's baseline",
 		)
 	})
 
