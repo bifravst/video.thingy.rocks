@@ -10,14 +10,14 @@
 #
 #   <host>  the ingest endpoint, the NLB DNS name of the stack
 #   <port>  an SRTP ingest port, 6000-6009
+#   <ssrc>  N is the SSRC provisioned for the port: the plain decimal number
+#           (e.g. 42) the camera writes into every RTP header - not the key,
+#           which is read from --key-file, stdin, or a prompt, never from the
+#           command line, where every local user could read it from /proc.
 #
-# The key is the 60 hex characters provisioned for the port, read from
-# --key-file, from stdin, or from an interactive prompt - never from the
-# command line, where every local user could read it from /proc for as long as
-# the stream runs.
-#
-# No key provisioned for the port yet? This generates one, provisions it, and
-# tells you what to do next:
+# No key provisioned for the port yet? This generates one (openssl), provisions
+# it with scripts/provision-srtp-key.sh, saves it to a 0600 file, and tells you
+# the backend restart that has to follow - you only supply the port and the SSRC:
 #
 #   ./scripts/stream-webcam-to-srtp.sh --provision <port> <ssrc>
 #
@@ -30,10 +30,30 @@ set -e
 
 cd "$(dirname "$0")/.."
 
+# Nothing key-shaped belongs in an argument vector, where every local user can
+# read it from /proc for as long as anything runs. Everything passed to this
+# script is checked before any of it can reach another process's argv - the
+# receiver and the reference sender apply the same rule to their own.
+for arg in "$@"; do
+  if [[ "$arg" =~ ^[0-9a-fA-F]{40,}$ ]]; then
+    echo "Error: that looks like an SRTP key (${arg:0:4}...), and a key never belongs"
+    echo "on the command line - any local user could read it from /proc."
+    echo ""
+    echo "If it was meant as the SSRC: the SSRC is the plain decimal number the"
+    echo "camera writes into every RTP header (e.g. 42), and --provision generates"
+    echo "the key itself - there is nothing to paste. To stream with an existing"
+    echo "key, pass it on stdin or with --key-file, never as an argument."
+    exit 1
+  fi
+done
+
 case "${1:-}" in
   --provision)
     if [ $# -ne 3 ]; then
       echo "Usage: $0 --provision <port> <ssrc>"
+      echo ""
+      echo "<ssrc> is the decimal number the camera writes into every RTP header,"
+      echo "e.g. 42 - the key is generated for you."
       exit 1
     fi
     KEY_FILE=$(mktemp "${TMPDIR:-/tmp}/srtp-webcam-key.XXXXXXXXXX")
@@ -53,7 +73,7 @@ case "${1:-}" in
     exit 0
     ;;
   -h|--help)
-    sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+    awk 'NR>1 && /^set -e$/ {exit} NR>1 {sub(/^# ?/, ""); print}' "$0"
     exit 0
     ;;
 esac
