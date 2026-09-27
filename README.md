@@ -153,6 +153,42 @@ start**: rotating a key means reprovisioning and restarting the service. There
 is no in-band key change, ever — if your threat model requires frequent
 rotation, plan for the restart.
 
+### Restarting the backend from your machine
+
+The instances have no SSH access — they are reachable through AWS Systems
+Manager (SSM), which is also how the e2e suite restarts them. One Run Command
+reaches the whole fleet, wherever its instances are:
+
+```bash
+STACK=<stack-name>                     # e.g. video-streaming-2026-05
+REGION=eu-central-1
+
+# the fleet's Auto Scaling Group: a stack output (its name is generated, so
+# read it rather than guessing; the instances carry it as a tag)
+ASG=$(aws cloudformation describe-stacks \
+    --stack-name "$STACK" --region "$REGION" \
+    --query 'Stacks[0].Outputs[?OutputKey==`AutoScalingGroupName`].OutputValue' \
+    --output text)
+
+aws ssm send-command --region "$REGION" \
+    --document-name AWS-RunShellScript \
+    --comment "restart video-streaming.service (SRTP key rotation)" \
+    --targets "Key=tag:aws:autoscaling:groupName,Values=$ASG" \
+    --parameters 'commands=["systemctl restart video-streaming.service"]'
+```
+
+Run Command executes as root on each instance — no `sudo` needed — and returns
+immediately; `aws ssm list-command-invocations --command-id <id> --details`
+shows its progress. Your credentials need `ssm:SendCommand`, the same permission
+the e2e suite's requirements list.
+
+The restart takes a few seconds per instance, and a camera that keeps sending
+through it is picked back up within a keyframe of the port's new process
+starting — the restart recovery this design exists for, watchable live. An
+interactive shell on one instance, when wanted, is
+`aws ssm start-session --target <instance-id>` (needs the
+[session-manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)).
+
 ## Testing your client
 
 ```bash
@@ -184,7 +220,8 @@ The prerequisites are the same GStreamer stack as the reference sender
 (`--check` names anything missing — the camera element ships in a package the
 synthetic source already needs). Every run is a new session at ROC 0, so a
 second webcam session needs a fresh key exactly like the first one:
-`--provision` again, restart, stream.
+`--provision` again, restart, stream. The restart `--provision` tells you about
+is _Restarting the backend from your machine_, above.
 
 The repository's e2e suite (`backend/e2e`) exercises every behavior in the table
 above against a deployed stack, using a sender with arbitrary initial
