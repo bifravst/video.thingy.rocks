@@ -351,10 +351,21 @@ export class SrtpTransport {
 			locks: config.locks,
 			floors: config.floors,
 			logger,
-			onTransition: (from, to) => this.onSupervisorTransition(port, from, to),
+			onTransition: (from, to) => {
+				// Every helper spawn passes through 'starting': a new process
+				// counts inputBytes from zero, so the metric's per-port baseline
+				// goes with it. Left alone, a replacement helper whose first
+				// sample exceeds the previous process's last value looks like
+				// continued counting, and the dead process's baseline is
+				// subtracted from live traffic - under-reporting the interval.
+				if (to === 'starting') lastInputBytes.delete(port)
+				this.onSupervisorTransition(port, from, to)
+			},
 			onStats: (p, stats) => {
-				// inputBytes is cumulative per helper session; the metric wants the
-				// interval's delta.
+				// inputBytes is cumulative per helper process; the metric wants
+				// the interval's delta. The baseline is cleared on every spawn
+				// (see onTransition), so the first sample of a new helper counts
+				// as traffic in full; within a process the counter only rises.
 				const last = lastInputBytes.get(p) ?? 0
 				const delta =
 					stats.inputBytes >= last ? stats.inputBytes - last : stats.inputBytes
