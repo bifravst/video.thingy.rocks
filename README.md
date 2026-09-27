@@ -172,7 +172,8 @@ search, media reaching Kinesis, recovery across restarts):
 
 ```bash
 # no key for the port yet? generate and provision one, and it tells you the
-# backend restart that has to follow (keys are loaded at service start):
+# backend restart that has to follow (keys are loaded at service start).
+# <ssrc> is the decimal SSRC (e.g. 42) - the key is generated for you:
 ./scripts/stream-webcam-to-srtp.sh --provision <port> <ssrc>
 
 # stream your camera (default device /dev/video0; another with --device):
