@@ -44,7 +44,10 @@ export type SrtpTransportConfig = {
 	>
 	floors: Pick<
 		StreamMetadataService,
-		'getSrtpIndexFloor' | 'raiseSrtpIndexFloor'
+		| 'getSrtpIndexFloor'
+		| 'raiseSrtpIndexFloor'
+		| 'getSrtpFloorEpoch'
+		| 'resetSrtpIndexFloor'
 	>
 	/** The traffic metrics the transport feeds; structural so tests can fake it. */
 	metrics: Pick<TrafficMetrics, 'setServing' | 'recordReceived'>
@@ -216,6 +219,7 @@ export class SrtpTransport {
 	private readonly config: SrtpTransportConfig
 	private readonly logger: Logger
 	private supervisors: SrtpPortSupervisor[] = []
+	private readonly keys = new Map<number, SrtpPortKey>()
 	/** Ports whose helper has been ready at least once (reached `searching`). */
 	private readonly portsEverReady = new Set<number>()
 	private started = false
@@ -269,10 +273,13 @@ export class SrtpTransport {
 				return false
 			}
 
+			for (const port of keyedPorts) {
+				this.keys.set(port, keyStore.getKeyForPort(port) as SrtpPortKey)
+			}
 			this.supervisors = keyedPorts.map((port) =>
 				this.createSupervisor(
 					port,
-					keyStore.getKeyForPort(port) as SrtpPortKey,
+					this.keys.get(port) as SrtpPortKey,
 					credentials,
 				),
 			)
@@ -386,6 +393,40 @@ export class SrtpTransport {
 		})
 	}
 
+	/** The key a port runs under, if it has one; what a floor reset is verified against. */
+	keyForPort(port: number): SrtpPortKey | undefined {
+		return this.keys.get(port)
+	}
+
+	/**
+	 * Resets a port's replay floor (see StreamMetadataService.resetSrtpIndexFloor).
+	 *
+	 * The floor is shared state, so every instance's helper for the port has to
+	 * drop the one it holds: this instance's does at once, the others on their next
+	 * tick. Until then a sender restarting its numbering can still be refused by an
+	 * instance that has not caught up.
+	 */
+	async resetFloor(
+		port: number,
+		reset: { requestedAtMs: number; floor: number },
+	): Promise<'reset' | 'stale'> {
+		const key = this.keys.get(port)
+		if (key === undefined) return 'stale'
+		const outcome = await this.config.floors.resetSrtpIndexFloor(port, {
+			requestedAtMs: reset.requestedAtMs,
+			floor: reset.floor,
+			ssrc: key.ssrc,
+			keyFingerprint: key.keyFingerprint,
+			generation: key.generation,
+		})
+		if (outcome === 'reset') {
+			await this.supervisors
+				.find((supervisor) => supervisor.port === port)
+				?.checkFloorReset()
+		}
+		return outcome
+	}
+
 	/** Stops every port's supervision and waits for it to hold nothing. */
 	async stop(): Promise<void> {
 		this.config.metrics.setServing(SRTP_TRANSPORT, false)
@@ -394,6 +435,7 @@ export class SrtpTransport {
 		)
 		const results = await Promise.allSettled(stopping)
 		this.supervisors = []
+		this.keys.clear()
 		const errors = results
 			.filter((r): r is PromiseRejectedResult => r.status === 'rejected')
 			.map((r) => String(r.reason))

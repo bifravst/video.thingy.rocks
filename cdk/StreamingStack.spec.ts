@@ -113,9 +113,9 @@ void describe('StreamingStack', () => {
 			const synthesised = template()
 			synthesised.resourceCountIs(
 				'AWS::ElasticLoadBalancingV2::TargetGroup',
-				20,
+				21,
 			)
-			synthesised.resourceCountIs('AWS::ElasticLoadBalancingV2::Listener', 20)
+			synthesised.resourceCountIs('AWS::ElasticLoadBalancingV2::Listener', 21)
 		})
 
 		// Every target group health-checks 9999, SRTP included: with ELB health checks
@@ -129,7 +129,7 @@ void describe('StreamingStack', () => {
 			const ports = Object.values(groups).map(
 				(group) => group.Properties?.HealthCheckPort,
 			)
-			assert.strictEqual(ports.length, 20)
+			assert.strictEqual(ports.length, 21)
 			assert.deepStrictEqual([...new Set(ports)], ['9999'])
 		})
 
@@ -147,7 +147,7 @@ void describe('StreamingStack', () => {
 				'AWS::AutoScaling::AutoScalingGroup',
 			)
 			const arns = Object.values(groups)[0]?.Properties?.TargetGroupARNs
-			assert.strictEqual((arns as unknown[]).length, 20)
+			assert.strictEqual((arns as unknown[]).length, 21)
 		})
 	})
 
@@ -173,12 +173,15 @@ void describe('StreamingStack', () => {
 			}
 		})
 
-		// One health port, so there is nothing else to open.
-		void it('opens only the one TCP health port', () => {
+		// The health port, and the floor reset API: nothing else speaks TCP.
+		void it('opens only the TCP health port and the floor reset API', () => {
 			const tcpPorts = ingressRules()
 				.filter((rule) => rule.IpProtocol === 'tcp')
 				.map((rule) => rule.FromPort)
-			assert.deepStrictEqual([...new Set(tcpPorts)], [9999])
+			assert.deepStrictEqual(
+				[...new Set(tcpPorts)].sort((a, b) => (a ?? 0) - (b ?? 0)),
+				[8080, 9999],
+			)
 		})
 	})
 

@@ -155,7 +155,10 @@ const makeFloors = () => {
 		/** Fail the next read; an unreadable floor must not look like a missing one. */
 		failNextRead: false,
 		raised: [] as number[],
+		/** The epoch each raise was fenced with. */
+		raisedEpochs: [] as (number | undefined)[],
 		floor: undefined as number | undefined,
+		epoch: undefined as number | undefined,
 	}
 	return {
 		log,
@@ -168,9 +171,18 @@ const makeFloors = () => {
 				}
 				return log.floor
 			},
-			raiseSrtpIndexFloor: async (_port: number, index: number) => {
+			raiseSrtpIndexFloor: async (
+				_port: number,
+				index: number,
+				_ssrc: number,
+				_fingerprint: string,
+				_generation: number,
+				epoch?: number,
+			) => {
 				log.raised.push(index)
+				log.raisedEpochs.push(epoch)
 			},
+			getSrtpFloorEpoch: async () => log.epoch,
 		},
 	}
 }
@@ -429,6 +441,63 @@ void describe('SrtpPortSupervisor', () => {
 		assert.strictEqual(locks.log.releases.length, 0)
 	})
 
+	void it('a reset floor replaces the running helper, which then starts on the new floor', async () => {
+		const { supervisor, helper, locks, floors, spawned } = makeSupervisor()
+		floors.log.floor = 500
+		floors.log.epoch = 1000
+		supervisor.start()
+		await toSearching(supervisor, helper)
+		helper.emitFrame(authOkFirst())
+		await waitFor(() => supervisor.currentState === 'producing')
+		// Someone with the key reset the floor, on this or another instance.
+		floors.log.floor = undefined
+		floors.log.epoch = 2000
+		await waitFor(() => spawned.length === 2, 5_000, 'the replacement helper')
+		assert.ok(
+			helper.exitCode !== null || helper.signalCode !== null,
+			'the helper that holds the old floor must be ended',
+		)
+		assert.strictEqual(locks.log.releases.length, 1)
+		const init = spawned[1]?.commands().find((c) => c.type === 'init')
+		assert.ok(
+			init !== undefined && !('floor' in init),
+			'no floor after a reset',
+		)
+	})
+
+	void it('asked directly, the supervisor checks for a reset without waiting for its tick', async () => {
+		const { supervisor, helper, floors, spawned } = makeSupervisor()
+		supervisor.start()
+		await toSearching(supervisor, helper)
+		floors.log.epoch = 3000
+		await supervisor.checkFloorReset()
+		assert.strictEqual(spawned.length, 2)
+	})
+
+	void it("fences a dying helper's last word with the epoch it started under", async () => {
+		const { supervisor, helper, floors } = makeSupervisor()
+		floors.log.epoch = 1000
+		supervisor.start()
+		await toSearching(supervisor, helper)
+		floors.log.epoch = 2000
+		await supervisor.checkFloorReset()
+		// The old helper reports after its replacement exists.
+		helper.emitFrame({ t: 'index', index: 777 })
+		await waitFor(() => floors.log.raised.includes(777), 5_000, 'the raise')
+		assert.deepStrictEqual(floors.log.raisedEpochs.at(-1), 1000)
+	})
+
+	void it('keeps its helper when the reset check cannot read', async () => {
+		const { supervisor, helper, floors, spawned } = makeSupervisor()
+		supervisor.start()
+		await toSearching(supervisor, helper)
+		floors.floors.getSrtpFloorEpoch = async () => {
+			throw new Error('dynamodb unavailable')
+		}
+		await supervisor.checkFloorReset()
+		assert.strictEqual(spawned.length, 1)
+	})
+
 	void it('a helper exit releases the lock and restarts the session', async () => {
 		const { supervisor, helper, locks, spawned } = makeSupervisor()
 		supervisor.start()
@@ -622,6 +691,7 @@ void describe('SrtpPortSupervisor', () => {
 					})
 				},
 				raiseSrtpIndexFloor: async () => {},
+				getSrtpFloorEpoch: async () => undefined,
 			},
 		})
 		supervisor.start()

@@ -38,6 +38,14 @@ export type StreamMetadata = {
 	 * SSRC, and the SSRC alone cannot tell the new key's index space from the old one's.
 	 */
 	srtpIndexKeyFingerprint?: string
+	/**
+	 * When the floor was last reset by the key holder (the request's timestamp, in
+	 * unix ms), or absent if it never was. Doubles as the reset's replay guard - a
+	 * reset only lands with a strictly larger one - and as the fence for floor
+	 * raises: a helper that started before a reset carries the old epoch, so it
+	 * cannot write its stale maximum back over the reset floor.
+	 */
+	srtpFloorEpoch?: number
 	createdAt: string
 	updatedAt: string
 }
@@ -363,6 +371,80 @@ export class StreamMetadataService {
 	}
 
 	/**
+	 * Reads the floor's reset epoch for a port; undefined if it was never reset.
+	 * Strongly consistent and throws on failure, like getSrtpIndexFloor.
+	 */
+	async getSrtpFloorEpoch(port: number): Promise<number | undefined> {
+		const result = await this.docClient.send(
+			new GetCommand({
+				TableName: this.tableName,
+				Key: { port },
+				ConsistentRead: true,
+				ProjectionExpression: 'srtpFloorEpoch',
+			}),
+		)
+		const epoch = (result.Item as StreamMetadata | undefined)?.srtpFloorEpoch
+		return typeof epoch === 'number' && Number.isSafeInteger(epoch)
+			? epoch
+			: undefined
+	}
+
+	/**
+	 * Resets the replay floor for a port, on the say-so of someone who proved they
+	 * hold the key (the caller authenticates; this only persists).
+	 *
+	 * A sender that restarts its numbering would otherwise be dropped for ever, as
+	 * a replay, by the floor its earlier session left behind. `floor` is the new
+	 * one, and is required: a reset to nothing would admit every index, a recording
+	 * of earlier traffic included.
+	 *
+	 * `requestedAtMs` is the signed request's timestamp and becomes the row's
+	 * epoch. It must be strictly larger than the current one, which makes every
+	 * signed request good for exactly one reset: a captured request replayed later
+	 * - the way to reopen a recording to replay - fails the condition. It also must
+	 * not come from a key older than the one the row was reached under.
+	 *
+	 * Returns 'stale' when the condition refuses it, and throws when the write fails.
+	 */
+	async resetSrtpIndexFloor(
+		port: number,
+		reset: {
+			requestedAtMs: number
+			floor: number
+			ssrc: number
+			keyFingerprint: string
+			generation: number
+		},
+	): Promise<'reset' | 'stale'> {
+		const values: Record<string, unknown> = {
+			':epoch': reset.requestedAtMs,
+			':index': reset.floor,
+			':ssrc': reset.ssrc,
+			':fingerprint': reset.keyFingerprint,
+			':generation': reset.generation,
+			':now': new Date().toISOString(),
+		}
+		const update =
+			'SET srtpFloorEpoch = :epoch, srtpIndex = :index, srtpIndexSsrc = :ssrc, srtpIndexKeyFingerprint = :fingerprint, srtpKeyGeneration = :generation, updatedAt = :now'
+		try {
+			await this.docClient.send(
+				new UpdateCommand({
+					TableName: this.tableName,
+					Key: { port },
+					UpdateExpression: update,
+					ConditionExpression:
+						'(attribute_not_exists(srtpFloorEpoch) OR srtpFloorEpoch < :epoch) AND (attribute_not_exists(srtpKeyGeneration) OR srtpKeyGeneration <= :generation)',
+					ExpressionAttributeValues: values,
+				}),
+			)
+			return 'reset'
+		} catch (error) {
+			if (isConditionalCheckFailed(error)) return 'stale'
+			throw error
+		}
+	}
+
+	/**
 	 * Raises the replay floor for a port to an index authentication has accepted.
 	 *
 	 * Conditional, so that it only ever goes up: a write that would lower it - an
@@ -393,6 +475,7 @@ export class StreamMetadataService {
 		ssrc: number,
 		keyFingerprint: string,
 		generation: number,
+		epoch?: number,
 	): Promise<void> {
 		try {
 			await this.docClient.send(
@@ -401,18 +484,25 @@ export class StreamMetadataService {
 					Key: { port },
 					UpdateExpression:
 						'SET srtpIndex = :index, srtpIndexSsrc = :ssrc, srtpIndexKeyFingerprint = :fingerprint, srtpKeyGeneration = :generation, updatedAt = :now',
-					ConditionExpression: [
+					// The epoch fence comes first: a helper that started before a reset
+					// holds the old epoch and may not write over the reset floor.
+					ConditionExpression: `${
+						epoch === undefined
+							? 'attribute_not_exists(srtpFloorEpoch)'
+							: 'srtpFloorEpoch = :epoch'
+					} AND (${[
 						'attribute_not_exists(srtpIndex)',
 						'attribute_not_exists(srtpKeyGeneration)',
 						'srtpKeyGeneration < :generation',
 						'(srtpKeyGeneration = :generation AND srtpIndexSsrc = :ssrc AND srtpIndexKeyFingerprint = :fingerprint AND srtpIndex < :index)',
-					].join(' OR '),
+					].join(' OR ')})`,
 					ExpressionAttributeValues: {
 						':index': index,
 						':ssrc': ssrc,
 						':fingerprint': keyFingerprint,
 						':generation': generation,
 						':now': new Date().toISOString(),
+						...(epoch === undefined ? {} : { ':epoch': epoch }),
 					},
 				}),
 			)

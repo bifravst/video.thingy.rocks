@@ -175,6 +175,20 @@ export class StreamingStack extends Stack {
 			'Allow NLB TCP health checks on port 9999 (IPv6)',
 		)
 
+		// The SRTP floor reset API (backend/src/SrtpFloorResetServer.ts). Open to the
+		// world like the ingest ports: a request is authenticated by an HMAC under
+		// the port's SRTP key, not by where it comes from.
+		this.udpSecurityGroup.addIngressRule(
+			ec2.Peer.anyIpv4(),
+			ec2.Port.tcp(8080),
+			'Allow the SRTP floor reset API on TCP 8080',
+		)
+		this.udpSecurityGroup.addIngressRule(
+			ec2.Peer.anyIpv6(),
+			ec2.Port.tcp(8080),
+			'Allow the SRTP floor reset API on TCP 8080 (IPv6)',
+		)
+
 		// Allow HTTPS egress for AWS service communication
 		this.udpSecurityGroup.addEgressRule(
 			ec2.Peer.anyIpv4(),
@@ -456,6 +470,39 @@ export class StreamingStack extends Stack {
 			// Attaching to the ASG is what registers and deregisters instances.
 			this.autoScalingGroup.attachToNetworkTargetGroup(targetGroup)
 		}
+
+		// The floor reset API. Any instance may serve a request - the floor is shared
+		// state in DynamoDB and every instance's helper follows it - so there is no
+		// stickiness. Same health check port as every other target group (see
+		// createTargetGroup for why).
+		const floorResetTargetGroup = new elbv2.NetworkTargetGroup(
+			this,
+			'SrtpFloorResetTargetGroup',
+			{
+				vpc: this.vpc,
+				port: 8080,
+				protocol: elbv2.Protocol.TCP,
+				targetType: elbv2.TargetType.INSTANCE,
+				ipAddressType: elbv2.TargetGroupIpAddressType.IPV6,
+				healthCheck: {
+					protocol: elbv2.Protocol.TCP,
+					port: '9999',
+					healthyThresholdCount: 2,
+					unhealthyThresholdCount: 2,
+					interval: Duration.seconds(10),
+					timeout: Duration.seconds(10),
+				},
+				deregistrationDelay: Duration.seconds(30),
+			},
+		)
+		this.networkLoadBalancer.addListener('SrtpFloorResetListener', {
+			port: 8080,
+			protocol: elbv2.Protocol.TCP,
+			defaultAction: elbv2.NetworkListenerAction.forward([
+				floorResetTargetGroup,
+			]),
+		})
+		this.autoScalingGroup.attachToNetworkTargetGroup(floorResetTargetGroup)
 
 		// Use ELB health check so ASG only considers instances ready when they pass NLB
 		// target group health checks. Prevents terminating old instances before new ones
