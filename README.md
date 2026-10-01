@@ -109,9 +109,46 @@ increasing for the lifetime of a key**:
   `dropped N authenticated datagrams at or below this session's replay floor`.
 
 If your device must restart its numbering — after a reboot, a firmware update,
-or a session reset — ask for a **fresh key** (`scripts/provision-srtp-key.sh`,
-plus a service restart). A new key starts a clean index space at ROC 0 and is
-confirmed on the first packet. This is the only recovery from a rewind.
+or a session reset — either ask for a **fresh key**
+(`scripts/provision-srtp-key.sh`, plus a service restart), which starts a clean
+index space at ROC 0 confirmed on the first packet, or **reset the floor** as
+described next.
+
+#### Resetting the floor
+
+Streaming a second time on the same port after the first session ended needs the
+floor to go back, or the new session is dropped as a replay of the old one. Call
+this before you send, as part of your own session setup:
+
+    POST http://<nlb-host>:8080/srtp/<port>/floor-reset
+    x-timestamp: <unix ms, within a minute of the server's clock>
+    x-signature: <hex HMAC-SHA256, see below>
+    {"floor": <packet index>}          (required)
+
+`floor` is required (an integer, 0 to 2^48-1): it is the new floor, and packets
+at or below it are dropped. A reset to "no floor" is refused with `400`, because
+it would admit a replay of any earlier recording. The signature is how you prove
+you hold the port's key without sending it: derive
+`k = HMAC-SHA256(key bytes, "video.thingy.rocks/srtp-floor-reset/v1")`, then
+sign `"<port>\n<timestamp>\n<floor>"` with `k` (reference: `signFloorReset` in
+`backend/src/SrtpFloorResetServer.ts`; `scripts/reset-srtp-floor.ts` is a
+ready-made caller). Each timestamp works once: replaying a request gets `409`.
+`401` is any authentication failure, including a port that has no key.
+
+Things to know:
+
+- **The reset takes effect within ~10 seconds.** The instance that serves the
+  request replaces its helper at once; the others notice on their next check.
+  Wait for it before you send, or your first seconds may be dropped.
+- **This is not a way around the hard rule above.** Restarting your numbering
+  under the same key reuses the AES-CM keystream for every index you send twice,
+  which leaks the XOR of the two plaintexts. The reset lets you do it; it does
+  not make it safe. Prefer to carry on counting — pass your last index as
+  `floor` and carry on counting from it — and a fresh key when you must start
+  over.
+- The request is plain HTTP and carries nothing secret, but it also resets
+  protection against replaying a recording of your earlier session: the
+  timestamp bounds that to one use per request, not to your own packets.
 
 Also: use a **stable SSRC** for your port — the Synchronization Source
 identifier from _Stream format_ above. The static-key receiver is pinned to the

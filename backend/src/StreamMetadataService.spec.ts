@@ -239,7 +239,7 @@ void describe('StreamMetadataService SRTP replay floor', () => {
 		assert.deepStrictEqual(input?.Key, { port: 6000 })
 		assert.strictEqual(
 			input?.ConditionExpression,
-			'attribute_not_exists(srtpIndex) OR attribute_not_exists(srtpKeyGeneration) OR srtpKeyGeneration < :generation OR (srtpKeyGeneration = :generation AND srtpIndexSsrc = :ssrc AND srtpIndexKeyFingerprint = :fingerprint AND srtpIndex < :index)',
+			'attribute_not_exists(srtpFloorEpoch) AND (attribute_not_exists(srtpIndex) OR attribute_not_exists(srtpKeyGeneration) OR srtpKeyGeneration < :generation OR (srtpKeyGeneration = :generation AND srtpIndexSsrc = :ssrc AND srtpIndexKeyFingerprint = :fingerprint AND srtpIndex < :index))',
 		)
 		const values = input?.ExpressionAttributeValues ?? {}
 		assert.strictEqual(values[':index'], 9 as unknown as string)
@@ -251,6 +251,93 @@ void describe('StreamMetadataService SRTP replay floor', () => {
 		assert.match(
 			String(input?.UpdateExpression ?? ''),
 			/srtpKeyGeneration = :generation/,
+		)
+	})
+
+	void it('fences a raise by the epoch the helper started under', async () => {
+		const { subject, sent } = service()
+		await subject.raiseSrtpIndexFloor(6000, 9, 42, FINGERPRINT, 7, 1234)
+		const input = sent[0]?.input
+		assert.match(
+			String(input?.ConditionExpression),
+			/^srtpFloorEpoch = :epoch AND /,
+		)
+		assert.strictEqual(
+			input?.ExpressionAttributeValues?.[':epoch'],
+			1234 as unknown as string,
+		)
+	})
+
+	void it('resets the floor, once per timestamp', async () => {
+		const { subject, sent } = service()
+		const outcome = await subject.resetSrtpIndexFloor(6000, {
+			requestedAtMs: 5000,
+			floor: 100,
+			ssrc: 42,
+			keyFingerprint: FINGERPRINT,
+			generation: 7,
+		})
+		assert.strictEqual(outcome, 'reset')
+		const input = sent[0]?.input
+		assert.match(
+			String(input?.ConditionExpression),
+			/srtpFloorEpoch < :epoch\)/,
+		)
+		assert.strictEqual(
+			input?.ExpressionAttributeValues?.[':epoch'],
+			5000 as unknown as string,
+		)
+	})
+
+	void it('resets the floor to a given value under the current key', async () => {
+		const { subject, sent } = service()
+		await subject.resetSrtpIndexFloor(6000, {
+			requestedAtMs: 5000,
+			floor: 100,
+			ssrc: 42,
+			keyFingerprint: FINGERPRINT,
+			generation: 7,
+		})
+		const input = sent[0]?.input
+		assert.match(String(input?.UpdateExpression), /srtpIndex = :index/)
+		assert.strictEqual(
+			input?.ExpressionAttributeValues?.[':index'],
+			100 as unknown as string,
+		)
+		assert.strictEqual(
+			input?.ExpressionAttributeValues?.[':ssrc'],
+			42 as unknown as string,
+		)
+	})
+
+	void it('reports a replayed or older reset as stale, and a failed write as an error', async () => {
+		const reset = {
+			requestedAtMs: 5000,
+			floor: 100,
+			ssrc: 42,
+			keyFingerprint: FINGERPRINT,
+			generation: 7,
+		}
+		assert.strictEqual(
+			await service(['conditional']).subject.resetSrtpIndexFloor(6000, reset),
+			'stale',
+		)
+		await assert.rejects(
+			async () => service(['error']).subject.resetSrtpIndexFloor(6000, reset),
+			/throughput exceeded/,
+		)
+	})
+
+	void it('reads the reset epoch', async () => {
+		assert.strictEqual(
+			await service([], { srtpFloorEpoch: 5000 }).subject.getSrtpFloorEpoch(
+				6000,
+			),
+			5000,
+		)
+		assert.strictEqual(
+			await service().subject.getSrtpFloorEpoch(6000),
+			undefined,
 		)
 	})
 

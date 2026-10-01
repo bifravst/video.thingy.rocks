@@ -90,7 +90,14 @@ export type SrtpFloorStore = {
 		ssrc: number,
 		keyFingerprint: string,
 		generation: number,
+		epoch?: number,
 	): Promise<void>
+	/**
+	 * When the floor was last reset by the key holder, if ever. A helper started
+	 * under another epoch holds a floor that no longer stands (see
+	 * StreamMetadataService.resetSrtpIndexFloor).
+	 */
+	getSrtpFloorEpoch(port: number): Promise<number | undefined>
 }
 
 export type SrtpPortSupervisorTimeouts = {
@@ -185,6 +192,15 @@ export class SrtpPortSupervisor {
 	/** The floor base of the session this helper is running, to validate carries against. */
 	private sessionFloorBase = 0
 	/**
+	 * The floor epoch each helper was started under. Per session, not per
+	 * supervisor: a dying helper's last word on the floor must be fenced by the
+	 * epoch it knew, not the one of the helper that replaced it.
+	 */
+	private readonly sessionEpochs = new WeakMap<
+		HelperProcess,
+		{ epoch: number | undefined }
+	>()
+	/**
 	 * The ack waiter for a stop written by shutdown, installed by awaitStopAck
 	 * and resolved by the stdout listener outside the serialized queue.
 	 */
@@ -275,7 +291,13 @@ export class SrtpPortSupervisor {
 		this.fatalReason = undefined
 		if (this.isGivenUp()) return
 		let floor: number | undefined
+		let epoch: number | undefined
 		try {
+			// The epoch is read before the floor: a reset landing between the two
+			// leaves a helper that holds the new floor under the old epoch, which
+			// the next check restarts once more - the other order would leave the
+			// old floor under the new epoch, and nothing would ever notice.
+			epoch = await this.config.floors.getSrtpFloorEpoch(this.config.port)
 			// A floor that cannot be read must not look like a missing one: undefined
 			// means "nothing was ever accepted", which admits everything.
 			floor = await this.config.floors.getSrtpIndexFloor(
@@ -333,6 +355,7 @@ export class SrtpPortSupervisor {
 			return
 		}
 		this.helper = session
+		this.sessionEpochs.set(session, { epoch })
 		this.protocol = new SrtpHelperProtocol()
 		this.startedAtMs = Date.now()
 		this.lastFrameAtMs = Date.now()
@@ -421,7 +444,7 @@ export class SrtpPortSupervisor {
 			// and the write can only make it higher - and carry its search position,
 			// but it cannot act: no promoting, no stopping, no lease.
 			if (message.t === 'index') {
-				await this.raiseFloor(message.index)
+				await this.raiseFloor(message.index, session)
 				return
 			}
 			if (
@@ -499,7 +522,9 @@ export class SrtpPortSupervisor {
 			case 'stopped': {
 				// The helper's producing pipeline is provably down; the index is its
 				// last word on the floor.
-				if (message.index !== undefined) await this.raiseFloor(message.index)
+				if (message.index !== undefined) {
+					await this.raiseFloor(message.index, session)
+				}
 				if (this.state === 'stopping') {
 					if (this.releaseAfterStop) {
 						await this.releaseLock()
@@ -527,7 +552,7 @@ export class SrtpPortSupervisor {
 				this.logger.info('SRTP producer started', { port: this.config.port })
 				return
 			case 'index':
-				await this.raiseFloor(message.index)
+				await this.raiseFloor(message.index, session)
 				return
 			case 'stats': {
 				this.config.onStats?.(this.config.port, {
@@ -685,7 +710,10 @@ export class SrtpPortSupervisor {
 		}
 	}
 
-	private async raiseFloor(index: number): Promise<void> {
+	private async raiseFloor(
+		index: number,
+		session: HelperProcess,
+	): Promise<void> {
 		// Deliberately best effort, and the honest cost is narrower than it looks:
 		// a failed write does not lose what the helper already accepted - its own
 		// maximum stands in-process - but after a restart the persisted floor can
@@ -700,7 +728,64 @@ export class SrtpPortSupervisor {
 			this.config.key.ssrc,
 			this.config.key.keyFingerprint,
 			this.config.key.generation,
+			this.sessionEpochs.get(session)?.epoch,
 		)
+	}
+
+	/**
+	 * Asks now whether the floor was reset since the running helper started, and
+	 * restarts the helper on a fresh floor if so. The instance that served the
+	 * reset calls this; every other instance finds out on its next tick.
+	 */
+	async checkFloorReset(): Promise<void> {
+		return this.enqueue(async () => {
+			await this.handleFloorReset()
+		})
+	}
+
+	/**
+	 * A reset leaves every running helper with a floor that no longer stands: it
+	 * would drop the very traffic the reset was asked for. Each is replaced, which
+	 * also gives up the lock and the far-climb position that belonged to the old
+	 * floor. Returns whether it did.
+	 */
+	private async handleFloorReset(): Promise<boolean> {
+		const helper = this.helper
+		const session =
+			helper === undefined ? undefined : this.sessionEpochs.get(helper)
+		if (session === undefined) return false
+		if (
+			this.state !== 'starting' &&
+			this.state !== 'searching' &&
+			this.state !== 'acquiring' &&
+			this.state !== 'producing'
+		) {
+			return false
+		}
+		let epoch: number | undefined
+		try {
+			epoch = await this.config.floors.getSrtpFloorEpoch(this.config.port)
+		} catch (err) {
+			// The helper keeps the floor it has, which is the safe side of a failed read.
+			this.logger.warn('Could not check the SRTP floor for a reset', {
+				port: this.config.port,
+				error: err instanceof Error ? err.message : String(err),
+			})
+			return false
+		}
+		// The read was awaited: the helper may have been replaced meanwhile.
+		if (this.helper !== helper || epoch === session.epoch) return false
+		this.logger.info('The SRTP floor was reset; restarting the helper', {
+			port: this.config.port,
+		})
+		this.searchFromCarry = undefined
+		await this.endSession(this.state)
+		// Not a failure, so no backoff: start on the new floor straight away.
+		this.backoffMs = this.timeouts.restartMs
+		if ((this.state as SrtpSupervisorState) === 'cooldown') {
+			await this.spawnSession()
+		}
+		return true
 	}
 
 	private async handleExit(session: HelperProcess): Promise<void> {
@@ -747,6 +832,7 @@ export class SrtpPortSupervisor {
 		) {
 			return
 		}
+		if (await this.handleFloorReset()) return
 		const now = this.now()
 		switch (this.state) {
 			case 'starting':
@@ -822,7 +908,9 @@ export class SrtpPortSupervisor {
 				// flight in the queue it would be enqueued onto - so its last word
 				// on the floor is raised here, not dropped as a post-terminated
 				// frame would be.
-				if (acked?.index !== undefined) await this.raiseFloor(acked.index)
+				if (acked?.index !== undefined) {
+					await this.raiseFloor(acked.index, helper)
+				}
 			}
 			await endChildProcess(helper, { sigkillAfterMs: 5_000 })
 			this.helper = undefined

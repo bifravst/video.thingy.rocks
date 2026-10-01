@@ -2,6 +2,7 @@ import { fromNodeProviderChain } from '@aws-sdk/credential-providers'
 import { HealthServer } from './HealthServer.ts'
 import { resolveInstanceId } from './InstanceId.ts'
 import { KinesisIngestionPipeline } from './KinesisIngestionPipeline.ts'
+import { SrtpFloorResetServer } from './SrtpFloorResetServer.ts'
 import { SrtpTransport, srtpTransportConfigFromEnv } from './SrtpTransport.ts'
 import { StreamMetadataService } from './StreamMetadataService.ts'
 import { StreamStateManager } from './StreamStateManager.ts'
@@ -293,6 +294,7 @@ const healthServer = new HealthServer()
  * ever leave its own ports unwatched.
  */
 let srtpTransport: SrtpTransport | undefined
+let floorResetServer: SrtpFloorResetServer | undefined
 let trafficMetrics: TrafficMetrics | undefined
 
 /** The SRTP configuration, or undefined when SRTP is not enabled or cannot be. */
@@ -327,6 +329,10 @@ const shutdown = async (): Promise<void> => {
 	// The SRTP transport stops its producers (flushing what they hold), releases
 	// its locks and ends its helpers, and only then returns - nothing of it may
 	// outlive this process or keep writing to its streams.
+	if (floorResetServer !== undefined) {
+		await floorResetServer.stop()
+		floorResetServer = undefined
+	}
 	if (srtpTransport !== undefined) {
 		await srtpTransport.stop()
 		srtpTransport = undefined
@@ -420,7 +426,20 @@ const start = async (): Promise<void> => {
 				metrics: trafficMetrics,
 			})
 			try {
-				await srtpTransport.start()
+				if (await srtpTransport.start()) {
+					// Contained on its own: a port the API cannot bind must not
+					// take down the transport that is already ingesting.
+					try {
+						const server = new SrtpFloorResetServer(srtpTransport)
+						await server.start()
+						floorResetServer = server
+					} catch (err) {
+						console.error(
+							'[Main] SRTP floor reset API could not start; continuing without it:',
+							err,
+						)
+					}
+				}
 			} catch (err) {
 				console.error(
 					'[Main] SRTP transport could not start; continuing without it:',

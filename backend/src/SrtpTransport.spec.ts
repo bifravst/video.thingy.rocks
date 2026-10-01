@@ -119,7 +119,13 @@ const locks = {
 const floors = {
 	getSrtpIndexFloor: async () => undefined,
 	raiseSrtpIndexFloor: async () => {},
+	getSrtpFloorEpoch: async () => undefined,
+	resetSrtpIndexFloor: async (port: number, reset: unknown) => {
+		resetCalls.push({ port, reset })
+		return 'reset' as const
+	},
 }
+const resetCalls: { port: number; reset: unknown }[] = []
 
 const waitFor = async (
 	condition: () => boolean,
@@ -187,6 +193,40 @@ const makeTransport = (config: {
 }
 
 void describe('SrtpTransport', () => {
+	void it("resets a keyed port's floor under that port's key, and no other", async () => {
+		const { transport } = makeTransport({
+			credentialProvider: async () => ({
+				accessKeyId: 'key-1',
+				secretAccessKey: 'secret',
+			}),
+			spawnProcess: () => new FakeChild(),
+		})
+		await transport.start()
+		assert.strictEqual(transport.keyForPort(6000), key)
+		assert.strictEqual(transport.keyForPort(6001), undefined)
+		resetCalls.length = 0
+		assert.strictEqual(
+			await transport.resetFloor(6000, { requestedAtMs: 5, floor: 9 }),
+			'reset',
+		)
+		assert.deepStrictEqual(resetCalls, [
+			{
+				port: 6000,
+				reset: {
+					requestedAtMs: 5,
+					floor: 9,
+					ssrc: key.ssrc,
+					keyFingerprint: key.keyFingerprint,
+					generation: key.generation,
+				},
+			},
+		])
+		assert.strictEqual(
+			await transport.resetFloor(6001, { requestedAtMs: 5, floor: 9 }),
+			'stale',
+		)
+	})
+
 	void it('reports serving from helper readiness, not from startup having been queued', async () => {
 		const { transport, serving, children } = makeTransport({
 			credentialProvider: async () => ({
