@@ -37,7 +37,7 @@
     "@types/command-line-args": "5.2.3",
     "@types/node": "26.6.3",
     "@typescript/native": "npm:typescript@7.0.2",
-    "aws-cdk-lib": "2.271.0",
+    "aws-cdk-lib": "2.272.0",
     "chalk": "6.0.1",
     "check-node-version": "4.2.1",
     "command-line-args": "6.0.2",
