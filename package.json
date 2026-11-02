@@ -42,7 +42,7 @@
     "check-node-version": "4.2.1",
     "command-line-args": "6.0.2",
     "commitlint": "21.2.4",
-    "eslint": "10.13.0",
+    "eslint": "10.14.0",
     "fast-check": "4.10.2",
     "husky": "9.1.7",
     "lint-staged": "17.6.0",
